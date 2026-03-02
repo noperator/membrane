@@ -1,6 +1,8 @@
 package cagent
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -28,10 +30,14 @@ func hasSysbox() bool {
 
 // buildArgs constructs the full argument list for docker run.
 // passthrough args are appended after the image name as the container command.
-func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string) ([]string, error) {
+// Returns the args, the generated container name, and any error.
+func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string) ([]string, string, error) {
 	sysbox := hasSysbox()
 
-	args := []string{"run", "-it", "--rm", "--init"}
+	var suffix [8]byte
+	_, _ = rand.Read(suffix[:])
+	containerName := "cagent-" + hex.EncodeToString(suffix[:])
+	args := []string{"run", "-it", "--rm", "--init", "--name", containerName}
 
 	if sysbox {
 		args = append(args, "--runtime=sysbox-runc", "-e", "CAGENT_DIND=1")
@@ -62,7 +68,7 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 	// firewall.sh expects it.
 	domainsFile, err := writeDomains(cfg.Domains)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	args = append(args, "-v", domainsFile+":/usr/local/etc/domains.txt:ro")
 
@@ -79,7 +85,7 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 	// Passthrough args (non-flag arguments to cagent binary).
 	args = append(args, passthrough...)
 
-	return args, nil
+	return args, containerName, nil
 }
 
 // writeDomains writes the domains list to a temp file and returns its path.

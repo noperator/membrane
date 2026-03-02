@@ -1,0 +1,211 @@
+// Tracer implementation inspired by the dyana project:
+// https://github.com/dreadnode/dyana/blob/main/dyana/tracer/tracee.py
+
+package cagent
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// Tracer manages a Tracee eBPF sidecar container that traces the agent
+// container and writes matching events to a JSONL file.
+type Tracer struct {
+	containerName string // tracee-<suffix>
+	traceFile     string // path to output JSONL file
+	cmd           *exec.Cmd
+	stdout        io.ReadCloser
+	containerID   string           // agent container ID for filtering; set once before streaming starts
+	buffered      <-chan string     // lines read between ready signal and StartStreaming
+	done          chan struct{}     // closed when the streaming goroutine exits
+}
+
+// traceeEvents is the default set of events to trace.
+var traceeEvents = []string{
+	"security_file_open",
+	"sched_process_exec",
+	"security_socket_*",
+	"net_packet_dns",
+	"signatures",
+}
+
+// NewTracer creates a Tracer that will trace the given agent container name
+// and write events to traceFile.
+func NewTracer(agentContainerName, traceFile string) *Tracer {
+	// Reuse the hex suffix from the agent container name (cagent-<hex>).
+	suffix := strings.TrimPrefix(agentContainerName, "cagent-")
+	return &Tracer{
+		containerName: "tracee-" + suffix,
+		traceFile:     traceFile,
+		done:          make(chan struct{}),
+	}
+}
+
+// Start launches the Tracee container and blocks until Tracee signals ready
+// or the 30-second timeout expires.
+func (t *Tracer) Start() error {
+	if err := exec.Command("docker", "image", "inspect", "aquasec/tracee:latest").Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "cagent: pulling tracee image...")
+		if out, err := exec.Command("docker", "pull", "aquasec/tracee:latest").CombinedOutput(); err != nil {
+			return fmt.Errorf("pull tracee image: %w\n%s", err, out)
+		}
+	}
+
+	args := []string{
+		"run", "--rm",
+		"--name", t.containerName,
+		"--privileged",
+		"--pid=host",
+		"--cgroupns=host",
+		"-v", "/etc/os-release:/etc/os-release-host:ro",
+		"-e", "LIBBPFGO_OSRELEASE_FILE=/etc/os-release-host",
+		"--entrypoint", "/tracee/tracee",
+		"aquasec/tracee:latest",
+		"--output", "json",
+		"--log", "debug",
+		"--scope", "container=new",
+		"--events", strings.Join(traceeEvents, ","),
+	}
+
+	t.cmd = exec.Command("docker", args...)
+
+	// Merge stdout and stderr into a single reader via an io.Pipe.
+	// Tracee writes the ready signal and log lines to stderr, and JSON
+	// events to stdout. We need both in one stream.
+	pr, pw := io.Pipe()
+	t.cmd.Stdout = pw
+	t.cmd.Stderr = pw
+	t.stdout = pr
+
+	if err := t.cmd.Start(); err != nil {
+		return fmt.Errorf("start tracee: %w", err)
+	}
+
+	// Close the pipe writer when the process exits so the reader gets EOF.
+	go func() {
+		_ = t.cmd.Wait()
+		pw.Close()
+	}()
+
+	// Wait for the "is ready callback" line or an error/timeout.
+	readyCh := make(chan error, 1)
+	buffered := make(chan string, 256) // buffer lines read before ready
+
+	go func() {
+		scanner := bufio.NewScanner(t.stdout)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "is ready callback") {
+				readyCh <- nil
+				// Drain remaining lines into the buffered channel so
+				// the streaming goroutine can pick them up.
+				for scanner.Scan() {
+					buffered <- scanner.Text()
+				}
+				close(buffered)
+				return
+			}
+			if strings.Contains(line, `"L":"FATAL"`) || strings.Contains(line, `"L":"ERROR"`) {
+				readyCh <- fmt.Errorf("tracee error during startup: %s", line)
+				close(buffered)
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			readyCh <- fmt.Errorf("reading tracee output: %w", err)
+		} else {
+			readyCh <- fmt.Errorf("tracee exited before becoming ready")
+		}
+		close(buffered)
+	}()
+
+	select {
+	case err := <-readyCh:
+		if err != nil {
+			_ = t.cmd.Process.Kill()
+			return err
+		}
+	case <-time.After(30 * time.Second):
+		_ = t.cmd.Process.Kill()
+		return fmt.Errorf("tracee did not become ready within 30 seconds")
+	}
+
+	t.buffered = buffered
+	return nil
+}
+
+// StartStreaming sets the agent container ID and starts the background
+// goroutine that filters and writes events. Call after Start() returns
+// and the container ID is known.
+func (t *Tracer) StartStreaming(containerID string) {
+	t.containerID = containerID
+	go t.streamEvents()
+}
+
+// streamEvents reads lines from the buffered channel (lines already read
+// after the ready signal), then continues reading from stdout until EOF.
+// JSON events whose containerId matches the agent container are written
+// to the trace file.
+func (t *Tracer) streamEvents() {
+	defer close(t.done)
+
+	var f *os.File
+	if t.traceFile != "" {
+		var err error
+		f, err = os.Create(t.traceFile)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+	}
+
+	process := func(line string) {
+		if !strings.HasPrefix(line, "{") {
+			return
+		}
+		var ev struct {
+			ContainerID string `json:"containerId"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			return
+		}
+		if ev.ContainerID != t.containerID {
+			return
+		}
+		// TODO: this is where you would add hooks to act on events in real time,
+		// e.g. killing the agent container if a suspicious event is detected.
+		if f != nil {
+			fmt.Fprintln(f, line)
+		}
+	}
+
+	// Process any lines buffered during the ready-wait phase.
+	for line := range t.buffered {
+		process(line)
+	}
+
+	// Continue reading from stdout until the Tracee container exits.
+	scanner := bufio.NewScanner(t.stdout)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		process(scanner.Text())
+	}
+}
+
+// Stop sends docker stop to the Tracee container and waits for the
+// streaming goroutine to finish.
+// NOTE: SIGKILL cannot be caught; the tracee container may need manual
+// cleanup via: docker stop tracee-<id>
+func (t *Tracer) Stop() {
+	_ = exec.Command("docker", "stop", "-t", "2", t.containerName).Run()
+	if t.containerID != "" {
+		<-t.done
+	}
+}

@@ -1,14 +1,20 @@
 package cagent
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 )
 
 // Run is the main entry point called from cmd/cagent/main.go.
 // passthrough args are forwarded as the container command.
-func Run(noUpdate bool, passthrough []string) error {
+func Run(noUpdate bool, trace bool, traceLog string, passthrough []string) error {
 	repoDir, err := ensureRepo()
 	if err != nil {
 		return err
@@ -51,11 +57,85 @@ func Run(noUpdate bool, passthrough []string) error {
 		return err
 	}
 
-	args, err := buildArgs(workspaceDir, m, cfg, passthrough)
+	args, containerName, err := buildArgs(workspaceDir, m, cfg, passthrough)
 	if err != nil {
 		return err
 	}
-	return execDocker(args)
+
+	// Normalize trace flags: --trace-log implies --trace.
+	if traceLog != "" {
+		trace = true
+	}
+
+	if !trace {
+		return execDocker(args)
+	}
+
+	// -- Traced run: Tracee sidecar → agent container → cleanup --
+
+	// Resolve trace log path: "default" → ~/.cagent/trace/<name>.jsonl,
+	// explicit path → use as-is, "" → no file logging.
+	var traceLogFile string
+	if traceLog == "file" {
+		traceLogFile = filepath.Join(cagentDir, "trace", containerName+".jsonl")
+	} else if traceLog != "" {
+		traceLogFile = traceLog
+	}
+	if traceLogFile != "" {
+		if err := os.MkdirAll(filepath.Dir(traceLogFile), 0o755); err != nil {
+			return fmt.Errorf("create trace dir: %w", err)
+		}
+	}
+
+	tracer := NewTracer(containerName, traceLogFile)
+	if err := tracer.Start(); err != nil {
+		return fmt.Errorf("tracee failed to start: %w\nRe-run without --trace to start without tracing", err)
+	}
+	defer tracer.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		<-sigs
+		cancel()
+	}()
+
+	// Run the agent container in a goroutine so we can resolve its
+	// container ID and set up event filtering while it runs.
+	agentErr := make(chan error, 1)
+	go func() { agentErr <- execDocker(args) }()
+
+	// Retry docker inspect until the container exists (up to ~5s).
+	var cid string
+	for i := 0; i < 10; i++ {
+		out, err := exec.Command("docker", "inspect", "-f", "{{.Id}}", containerName).Output()
+		if err == nil {
+			cid = strings.TrimSpace(string(out))
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if cid == "" {
+		return fmt.Errorf("could not resolve container ID for %s", containerName)
+	}
+
+	tracer.StartStreaming(cid)
+
+	// Wait for the agent container to exit or a signal to arrive.
+	var result error
+	select {
+	case result = <-agentErr:
+	case <-ctx.Done():
+		// Signal received; stop the agent container so execDocker unblocks
+		// and restores the terminal. Tracee cleaned up by deferred tracer.Stop().
+		fmt.Fprintln(os.Stderr, "\r\ncagent: stopping...")
+		_ = exec.Command("docker", "stop", "-t", "2", containerName).Run()
+		<-agentErr
+	}
+	return result
 }
 
 func checkAndUpdate(repoDir string) error {
