@@ -11,9 +11,9 @@ Locks down the network and filesystem so an agent is free to explore the mounted
 
 ## Description
 
-AI coding agents are powerful but difficult to constrain. cagent runs the agent inside a Docker container with two hard constraints:
+cagent runs your AI agent inside a Docker container with two hard constraints:
 
-- **Network:** An nftables firewall allows outbound traffic only to an explicit domain allowlist. Domains are resolved at startup and refreshed every 60 seconds. Everything else is dropped.
+- **Network:** An nftables firewall allows outbound traffic only to an explicit domain allowlist. Domains are resolved at startup and refreshed continuously. Everything else is dropped.
 - **Filesystem:** The workspace is mounted into the container, but sensitive files and directories can be hidden entirely (shadowed with an empty placeholder) or made read-only. This prevents the agent from reading secrets, corrupting `.git` history, or modifying its own configuration.
 
 The agent runs as an unprivileged user. CAP_NET_ADMIN and CAP_NET_RAW are dropped after firewall setup so no process inside the container (including privileged inner containers) can modify the firewall rules or craft raw packets to bypass them.
@@ -144,6 +144,10 @@ This project is an experimental work in progress. There are likely more opportun
 
 - [ ] pass via config via CLI (in addition to file)
 - [ ] allow reading from host stdin (to be used in pipeline)
+- [ ] monitor agent with eBPF
+- [ ] support Docker-in-Docker on macOS
+- [ ] whitelist IPs
+- [ ] set custom DNS resolver
 
 <details><summary>Completed</summary>
 
