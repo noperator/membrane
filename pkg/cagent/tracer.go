@@ -5,6 +5,7 @@ package cagent
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -159,17 +160,33 @@ func (t *Tracer) streamEvents() {
 	var f *os.File
 	if t.traceFile != "" {
 		var err error
-		f, err = os.Create(t.traceFile)
+		f, err = os.Create(strings.TrimSuffix(t.traceFile, ".gz"))
 		if err != nil {
 			return
 		}
 		defer f.Close()
 	}
 
+	agentStarted := false
+
 	process := func(line string) {
 		if !strings.HasPrefix(line, "{") {
 			return
 		}
+
+		if !agentStarted {
+			var meta struct {
+				EventName   string `json:"eventName"`
+				ProcessName string `json:"processName"`
+			}
+			if json.Unmarshal([]byte(line), &meta) == nil &&
+				meta.EventName == "sched_process_exec" &&
+				meta.ProcessName == "gosu" {
+				agentStarted = true
+			}
+			return
+		}
+
 		var ev struct {
 			ContainerID string `json:"containerId"`
 		}
@@ -208,4 +225,27 @@ func (t *Tracer) Stop() {
 	if t.containerID != "" {
 		<-t.done
 	}
+	if t.traceFile != "" {
+		if err := gzipFile(t.traceFile); err == nil {
+			os.Remove(strings.TrimSuffix(t.traceFile, ".gz"))
+		}
+	}
+}
+
+func gzipFile(dst string) error {
+	src := strings.TrimSuffix(dst, ".gz")
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	gz := gzip.NewWriter(out)
+	defer gz.Close()
+	_, err = io.Copy(gz, in)
+	return err
 }

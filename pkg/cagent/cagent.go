@@ -62,34 +62,24 @@ func Run(noUpdate bool, trace bool, traceLog string, passthrough []string) error
 		return err
 	}
 
-	// Normalize trace flags: --trace-log implies --trace.
-	if traceLog != "" {
-		trace = true
-	}
-
 	if !trace {
 		return execDocker(args)
 	}
 
 	// -- Traced run: Tracee sidecar → agent container → cleanup --
 
-	// Resolve trace log path: "default" → ~/.cagent/trace/<name>.jsonl,
-	// explicit path → use as-is, "" → no file logging.
-	var traceLogFile string
-	if traceLog == "file" {
-		traceLogFile = filepath.Join(cagentDir, "trace", containerName+".jsonl")
-	} else if traceLog != "" {
-		traceLogFile = traceLog
+	// Resolve trace log path.
+	traceLogFile := traceLog
+	if traceLogFile == "" {
+		traceLogFile = filepath.Join(cagentDir, "trace", containerName+".jsonl.gz")
 	}
-	if traceLogFile != "" {
-		if err := os.MkdirAll(filepath.Dir(traceLogFile), 0o755); err != nil {
-			return fmt.Errorf("create trace dir: %w", err)
-		}
+	if err := os.MkdirAll(filepath.Dir(traceLogFile), 0o755); err != nil {
+		return fmt.Errorf("create trace dir: %w", err)
 	}
 
 	tracer := NewTracer(containerName, traceLogFile)
 	if err := tracer.Start(); err != nil {
-		return fmt.Errorf("tracee failed to start: %w\nRe-run without --trace to start without tracing", err)
+		return fmt.Errorf("tracee failed to start: %w\nRe-run with --no-trace to start without tracing", err)
 	}
 	defer tracer.Stop()
 

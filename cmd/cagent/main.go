@@ -13,10 +13,8 @@ import (
 
 func main() {
 	noUpdate := flag.Bool("no-update", false, "skip checking for updates")
-	trace := flag.Bool("trace", false, "enable Tracee eBPF sidecar")
-	var traceLog stringOptFlag
-	flag.Var(&traceLog, "trace-log", "write trace events to a file; defaults to ~/.cagent/trace/<id>.jsonl")
-	flag.Lookup("trace-log").NoOptDefVal = "file"
+	noTrace := flag.Bool("no-trace", false, "disable Tracee eBPF sidecar")
+	traceLog := flag.String("trace-log", "", "path for trace log file (default: ~/.cagent/trace/<id>.jsonl.gz)")
 	var reset stringFlag
 	flag.Var(&reset, "reset", "remove cagent state and exit (c=containers, i=image, v=volume, d=directory)")
 	flag.Lookup("reset").NoOptDefVal = "civd"
@@ -48,7 +46,7 @@ func main() {
 		return
 	}
 
-	if err := cagent.Run(*noUpdate, *trace, traceLog.val, flag.Args()); err != nil {
+	if err := cagent.Run(*noUpdate, !*noTrace, *traceLog, flag.Args()); err != nil {
 		var exitErr *cagent.ExitError
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.Code)
@@ -75,9 +73,3 @@ func (f *stringFlag) String() string { return f.val }
 func (f *stringFlag) Set(v string) error { f.val = v; return nil }
 func (f *stringFlag) Type() string { return "" }
 
-// stringOptFlag implements pflag.Value for optional-value string flags.
-type stringOptFlag struct{ val string }
-
-func (f *stringOptFlag) String() string { return f.val }
-func (f *stringOptFlag) Set(v string) error { f.val = v; return nil }
-func (f *stringOptFlag) Type() string { return "" }

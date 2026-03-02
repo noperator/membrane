@@ -46,10 +46,10 @@ cagent -h
 Usage: cagent [options] [-- command...]
 
 Options:
+      --no-trace           disable Tracee eBPF sidecar
       --no-update          skip checking for updates
       --reset[=civd]       remove cagent state and exit (c=containers, i=image, v=volume, d=directory)
-      --trace              enable Tracee eBPF sidecar
-      --trace-log[=file]   write trace events to a file; defaults to ~/.cagent/trace/<id>.jsonl
+      --trace-log string   path for trace log file (default: ~/.cagent/trace/<id>.jsonl.gz)
 ```
 
 Optionally pass a specific command to be executed, using `--` to separate cagent options from the command to run inside the container.
@@ -86,7 +86,7 @@ cagent --reset=ci    # containers and image only
 
 ### Trace execution
 
-Use `--trace-log` to record an eBPF trace of everything the agent does. In this example, I just tell Claude to go download the homepage of my blog. 
+By default, cagent records a eBPF trace of everything the agent does. In this example, I just tell Claude to go download the homepage of my blog. 
 
 ```bash
 cagent --trace-log=blog.jsonl -- \
