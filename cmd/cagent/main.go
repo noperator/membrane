@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -41,6 +42,10 @@ func main() {
 	}
 
 	if err := cagent.Run(*noUpdate, flag.Args()); err != nil {
+		var exitErr *cagent.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.Code)
+		}
 		fmt.Fprintf(os.Stderr, "cagent: %v\n", err)
 		os.Exit(1)
 	}
