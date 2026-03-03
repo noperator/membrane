@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark-3.png">
-    <img alt="logo" src="img/logo-light-3.png" width="500px">
+    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark-4.png">
+    <img alt="logo" src="img/logo-light-4.png" width="500px">
   </picture>
   <br>
   Selectively permeable boundary for AI agents.
@@ -248,6 +248,10 @@ domains:
 extra_args:
   - -e
   - MY_API_KEY=abc123
+  - -v
+  - /home/user/.aws:/home/agent/.aws:ro
+  - -e
+  - AWS_PROFILE=myprofile
 ```
 
 See [`config-default.yaml`](config-default.yaml) for the full default config including the built-in domain allowlist.
