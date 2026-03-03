@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark-2.png">
-    <img alt="logo" src="img/logo-light-2.png" width="500px">
+    <source media="(prefers-color-scheme: dark)" srcset="img/logo-dark-3.png">
+    <img alt="logo" src="img/logo-light-3.png" width="500px">
   </picture>
   <br>
   Selectively permeable boundary for AI agents.
