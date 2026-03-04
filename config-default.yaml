@@ -93,3 +93,6 @@ hostnames:
   - bedrock.us-west-1.amazonaws.com
   - bedrock-runtime.us-west-2.amazonaws.com
   - bedrock.us-west-2.amazonaws.com
+
+# Raw arguments appended to `docker run`.
+args:

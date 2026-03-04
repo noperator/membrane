@@ -242,9 +242,7 @@ readonly:
 hostnames:
   - internal.mycompany.com
 
-# Raw arguments appended to `docker run`. Useful for passing environment
-# variables, additional mounts, or port mappings. Supports `~/` and `$HOME/`
-# expansion.
+# Raw arguments appended to `docker run`.
 args:
   - -e
   - MY_API_KEY=abc123

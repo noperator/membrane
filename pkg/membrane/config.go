@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -70,19 +69,7 @@ func loadConfigFile(path string) (*config, error) {
 }
 
 func expandArgs(args []string) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
 	for i, arg := range args {
-		if strings.HasPrefix(arg, "~/") {
-			args[i] = filepath.Join(home, arg[2:])
-		} else if strings.HasPrefix(arg, "$HOME/") {
-			args[i] = filepath.Join(home, arg[6:])
-		} else if arg == "~" {
-			args[i] = home
-		} else if arg == "$HOME" {
-			args[i] = home
-		}
+		args[i] = os.ExpandEnv(arg)
 	}
 }
