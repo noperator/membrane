@@ -5,12 +5,11 @@ IFS=$'\n\t'
 
 HOSTNAMES_FILE="$1"
 
-# Resolve all hostnames in parallel using 8.8.4.4 (distinct from container's
-# 8.8.8.8 so firewall queries can be filtered out of the tcpdump log)
+# Resolve all hostnames in parallel using the configured resolver
 resolve_all_hostnames() {
     local hostnames_file="$1"
     grep -vE '^#|^\s*$' "$hostnames_file" | xargs -P 20 -I {} sh -c '
-        dig +short "{}" A @8.8.4.4 2>/dev/null
+        dig +short "{}" A @'"$MEMBRANE_RESOLVER"' 2>/dev/null
     ' | grep -E '^[1-9][0-9]*\.[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/$/\/32/'
 }
 

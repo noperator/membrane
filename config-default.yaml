@@ -1,3 +1,7 @@
+# resolver is the DNS resolver used by both the firewall and the
+# container. Defaults to 8.8.8.8 if not set.
+resolver:
+
 # Patterns to hide from the agent (shadowed with empty file/dir).
 ignore:
   - "*.bak"

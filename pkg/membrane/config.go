@@ -9,6 +9,7 @@ import (
 )
 
 type config struct {
+	Resolver  string   `yaml:"resolver"`
 	Ignore    []string `yaml:"ignore"`
 	Readonly  []string `yaml:"readonly"`
 	Args      []string `yaml:"args"`
@@ -50,6 +51,10 @@ func loadConfig(workspaceDir string) (*config, error) {
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
 		base.Args = append(base.Args, workspace.Args...)
 		base.Hostnames = append(base.Hostnames, workspace.Hostnames...)
+	}
+
+	if base.Resolver == "" {
+		base.Resolver = "8.8.8.8"
 	}
 
 	expandArgs(base.Args)

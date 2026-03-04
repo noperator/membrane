@@ -224,6 +224,10 @@ Configuration is YAML and works at two levels:
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
+# resolver is the DNS resolver used by both the firewall and the
+# container. Defaults to 8.8.8.8 if not set.
+resolver:
+
 # Patterns matched against filenames or relative paths. Matching files and
 # directories are shadowed with an empty placeholder inside the container. The
 # agent can see that they exist but cannot read their contents.
