@@ -58,6 +58,11 @@ func Run(noUpdate bool, trace bool, traceLog string, passthrough []string, cli C
 		return fmt.Errorf("get working directory: %w", err)
 	}
 
+	workspaceDir, err = filepath.EvalSymlinks(workspaceDir)
+	if err != nil {
+		return fmt.Errorf("resolve workspace symlinks: %w", err)
+	}
+
 	cfg, err := loadConfig(workspaceDir)
 	if err != nil {
 		return err
