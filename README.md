@@ -13,15 +13,13 @@ Membrane is a lightweight, agent-agnostic, cross-platform sandbox that gives you
 
 ### Features
 
-| | Membrane | Others |
-|---|---|---|
-| **Network** | Approved hostnames are whitelisted, DNS-resolved at startup, and refreshed continuously | Generally unsupported, or requires manual iptables rules that are easy to misconfigure |
-| **Filesystem** | Sensitive files shadowed with empty placeholders so the agent sees they exist but cannot read them; other paths mounted read-only | No granular controls on top of bind mounts |
-| **Observability** | eBPF traces *everything* that crosses the boundary: processes, DNS queries, file opens, network connections | No runtime visibility into what the agent is actually doing |
-| **Nested containers** | Docker-in-Docker via Sysbox, no privileged mode or hypervisor required | Requires `--privileged` (unsafe) or full microVM |
-| **Agent compatibility** | Wraps any process, agent-agnostic by design | Tightly coupled to a specific agent (Claude Code, Codex, etc.) |
-| **OS support** | Linux and macOS via Docker; strong enforcement on both platforms | Enforcement mechanisms are often platform-specific: nftables and Landlock are Linux-only, Seatbelt is macOS-only |
-| **Overhead** | Container-based, near-zero startup overhead on top of Docker | MicroVM-based tools require a separate kernel and hypervisor |
+- **Network egress filtering**: Approved hostnames are whitelisted, DNS-resolved at startup, and refreshed continuously.<br><sub>&emsp;*Most tools don't filter the network at all, or require manual iptables rules that are easy to misconfigure.*</sub>
+- **Filesystem isolation**: Sensitive files can be masked and made invisible to the agent, or mounted read-only.<br><sub>&emsp;*Most tools offer no granular filesystem controls on top of bind mounts.*</sub>
+- **Observability**: eBPF traces everything that crosses the boundary—processes, DNS queries, file opens, network connections.<br><sub>&emsp;*Most tools offer no runtime visibility into what the agent is actually doing.*</sub>
+- **Nested containers**: Docker-in-Docker via unprivileged Sysbox containers.<br><sub>&emsp;*Most tools require `--privileged` (unsafe) or a separate hypervisor.*</sub>
+- **Agent-agnostic**: Wraps any process or command, not coupled to a specific agent.<br><sub>&emsp;*Most tools are tightly coupled to a specific agent (Claude Code, Codex, etc.).*</sub>
+- **Cross-platform**: Linux and macOS via Docker; strong enforcement on both platforms.<br><sub>&emsp;*Most tools rely on OS-specific primitives: Landlock and bubblewrap (Linux), Seatbelt and Apple Containers (macOS).*</sub>
+- **Lightweight**: Container-based, near-zero startup overhead on top of Docker.<br><sub>&emsp;*Most tools that offer kernel-level isolation do so at the expense of requiring a full hypervisor.*</sub>
 
 ## Getting started
 
