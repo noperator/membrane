@@ -9,9 +9,9 @@ readonly:
   - .env
   - .membrane.yaml
 
-# Domains the agent is allowed to reach.
+# Hostnames the agent is allowed to reach.
 # Workspace .membrane.yaml can add more (additive, not replacing).
-domains:
+hostnames:
   # Anthropic
   - api.anthropic.com
   - sentry.io

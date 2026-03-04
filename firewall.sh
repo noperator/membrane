@@ -3,13 +3,13 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-DOMAINS_FILE="$1"
+HOSTNAMES_FILE="$1"
 
-# Resolve all domains in parallel using 8.8.4.4 (distinct from container's
+# Resolve all hostnames in parallel using 8.8.4.4 (distinct from container's
 # 8.8.8.8 so firewall queries can be filtered out of the tcpdump log)
-resolve_all_domains() {
-    local domains_file="$1"
-    grep -vE '^#|^\s*$' "$domains_file" | xargs -P 20 -I {} sh -c '
+resolve_all_hostnames() {
+    local hostnames_file="$1"
+    grep -vE '^#|^\s*$' "$hostnames_file" | xargs -P 20 -I {} sh -c '
         dig +short "{}" A @8.8.4.4 2>/dev/null
     ' | grep -E '^[1-9][0-9]*\.[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/$/\/32/'
 }
@@ -41,8 +41,8 @@ trap "rm -f $IP_LIST" EXIT
 # Add GitHub CIDRs (filter out IPv6 and bogus)
 echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep -v ':' | grep -v '^0\.' >>"$IP_LIST"
 
-# Resolve all domains in parallel
-resolve_all_domains "$DOMAINS_FILE" >>"$IP_LIST"
+# Resolve all hostnames in parallel
+resolve_all_hostnames "$HOSTNAMES_FILE" >>"$IP_LIST"
 
 # Use aggregate to merge overlapping ranges and deduplicate
 ALL_IPS=$(aggregate -q <"$IP_LIST" | tr '\n' ',' | sed 's/,$//')
@@ -55,7 +55,7 @@ cat >"$NFT_RULES" <<EOF
 table ip membrane
 delete table ip membrane
 table ip membrane {
-    set allowed-domains {
+    set allowed-hostnames {
         type ipv4_addr
         flags interval
         elements = { $ALL_IPS }
@@ -74,7 +74,7 @@ table ip membrane {
         ct state established,related accept
         tcp flags syn tcp option maxseg size set rt mtu
         udp dport 53 accept
-        ip daddr @allowed-domains accept
+        ip daddr @allowed-hostnames accept
         log prefix "[membrane BLOCKED] " limit rate 5/second
         reject with icmp admin-prohibited
     }
@@ -86,7 +86,7 @@ table ip membrane {
         ip daddr $HOST_NETWORK accept
         udp dport 53 accept
         tcp dport 22 accept
-        ip daddr @allowed-domains accept
+        ip daddr @allowed-hostnames accept
         log prefix "[membrane BLOCKED] " limit rate 5/second
         reject with icmp type admin-prohibited
     }
@@ -99,7 +99,7 @@ if ! nft -f "$NFT_RULES"; then
     exit 1
 fi
 
-# Start updater loop in background to periodically refresh allowed-domains set
+# Start updater loop in background to periodically refresh allowed-hostnames set
 UPDATE_INTERVAL="${FIREWALL_UPDATE_INTERVAL:-60}"
 (
     while true; do
@@ -115,8 +115,8 @@ UPDATE_INTERVAL="${FIREWALL_UPDATE_INTERVAL:-60}"
             echo "$(date): Warning: Failed to fetch GitHub IP ranges, skipping GitHub update"
         fi
 
-        # Resolve all domains
-        resolve_all_domains "$DOMAINS_FILE" >>"$IP_LIST"
+        # Resolve all hostnames
+        resolve_all_hostnames "$HOSTNAMES_FILE" >>"$IP_LIST"
 
         # Merge overlapping ranges and deduplicate
         ALL_IPS=$(aggregate -q <"$IP_LIST" 2>/dev/null || cat "$IP_LIST")
@@ -132,13 +132,13 @@ UPDATE_INTERVAL="${FIREWALL_UPDATE_INTERVAL:-60}"
 
         # Update the set atomically (single transaction, no gap in coverage)
         if ! nft -f - <<NFTEOF; then
-flush set ip membrane allowed-domains
-add element ip membrane allowed-domains { $ELEMENTS }
+flush set ip membrane allowed-hostnames
+add element ip membrane allowed-hostnames { $ELEMENTS }
 NFTEOF
-            echo "$(date): ERROR: Failed to update allowed-domains set"
+            echo "$(date): ERROR: Failed to update allowed-hostnames set"
         else
             TOTAL_RANGES=$(echo "$ALL_IPS" | tr ',' '\n' | wc -l | tr -d ' ')
-            echo "$(date): Updated allowed-domains set with $TOTAL_RANGES ranges"
+            echo "$(date): Updated allowed-hostnames set with $TOTAL_RANGES ranges"
         fi
     done
 ) >>/var/log/firewall-updater.log 2>&1 &

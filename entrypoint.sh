@@ -25,7 +25,7 @@ if (( 16#$bnd & (1 << 12) )); then
     tcpdump -i any -ln port 53 2>/dev/null >> "$DNS_LOG" &
 
     # Run firewall setup (also starts updater loop in background)
-    /usr/local/bin/firewall.sh /usr/local/etc/domains.txt
+    /usr/local/bin/firewall.sh /usr/local/etc/hostnames.txt
 
     # Drop CAP_NET_ADMIN and CAP_NET_RAW, then re-exec — will enter post-drop phase
     exec capsh --drop=cap_net_admin,cap_net_raw,cap_setpcap,cap_setfcap -- -c 'exec /usr/local/bin/entrypoint.sh "$@"' -- "$@"

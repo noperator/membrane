@@ -13,7 +13,7 @@ type config struct {
 	Ignore    []string `yaml:"ignore"`
 	Readonly  []string `yaml:"readonly"`
 	ExtraArgs []string `yaml:"extra_args"`
-	Domains   []string `yaml:"domains"`
+	Hostnames []string `yaml:"hostnames"`
 }
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
@@ -50,7 +50,7 @@ func loadConfig(workspaceDir string) (*config, error) {
 		base.Ignore = append(base.Ignore, workspace.Ignore...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
 		base.ExtraArgs = append(base.ExtraArgs, workspace.ExtraArgs...)
-		base.Domains = append(base.Domains, workspace.Domains...)
+		base.Hostnames = append(base.Hostnames, workspace.Hostnames...)
 	}
 
 	expandArgs(base.ExtraArgs)

@@ -220,7 +220,7 @@ conn  claude: AF_INET 34.149.66.137:443
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline domains, ignore patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline hostnames, ignore patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
@@ -239,7 +239,7 @@ readonly:
 
 # Hostnames the agent is allowed to reach. The firewall resolves these to IPs at
 # startup and refreshes every 60s. Anything not on the list is dropped.
-domains:
+hostnames:
   - internal.mycompany.com
 
 # Raw arguments appended to `docker run`. Useful for passing environment
@@ -254,14 +254,14 @@ extra_args:
   - AWS_PROFILE=myprofile
 ```
 
-See [`config-default.yaml`](config-default.yaml) for the full default config including the built-in domain allowlist.
+See [`config-default.yaml`](config-default.yaml) for the full default config including the built-in hostname allowlist.
 
 
 ### Troubleshooting
 
 This project is an experimental work in progress. There are likely more opportunities to lock this down further. A few common issues:
 
-- **Network not working:** The firewall resolves domains to IPs at startup. If a CDN rotates IPs, the connection may fail until the next refresh (every 60s). Check `/var/log/firewall-updater.log` inside the container for refresh status.
+- **Network not working:** The firewall resolves hostnames to IPs at startup. If a CDN rotates IPs, the connection may fail until the next refresh (every 60s). Check `/var/log/firewall-updater.log` inside the container for refresh status.
 
 - **Docker-in-Docker not working:** Sysbox must be installed on the host. membrane detects it automatically; if it's not present, Docker-in-Docker is silently disabled.
 
@@ -282,12 +282,13 @@ This project is an experimental work in progress. There are likely more opportun
 - [ ] whitelist IPs
 - [ ] set custom DNS resolver
 - [ ] support Docker checkpoint
+- [ ] whitelist HTTPS paths/endpoints
 
 <details><summary>Completed</summary>
 
 - [x] mount agent home dir as ~/.membrane/home on host
 - [x] monitor agent with eBPF
-- [x] specify domains at runtime
+- [x] specify hostnames at runtime
 - [x] git-aware read-only mounts
 - [x] refresh firewall after init
 - [x] quiet down logging a bit

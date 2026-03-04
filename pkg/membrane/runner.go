@@ -73,13 +73,13 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 	}
 	args = append(args, "-v", agentHome+":/home/agent")
 
-	// Write merged domains list to a temp file and mount it where
+	// Write merged hostnames list to a temp file and mount it where
 	// firewall.sh expects it.
-	domainsFile, err := writeDomains(cfg.Domains)
+	hostnamesFile, err := writeHostnames(cfg.Hostnames)
 	if err != nil {
 		return nil, "", err
 	}
-	args = append(args, "-v", domainsFile+":/usr/local/etc/domains.txt:ro")
+	args = append(args, "-v", hostnamesFile+":/usr/local/etc/hostnames.txt:ro")
 
 	// Extra args from config.
 	args = append(args, cfg.ExtraArgs...)
@@ -97,19 +97,19 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 	return args, containerName, nil
 }
 
-// writeDomains writes the domains list to a temp file and returns its path.
+// writeHostnames writes the hostnames list to a temp file and returns its path.
 // The file is not cleaned up — syscall.Exec replaces this process and the
 // OS handles /tmp cleanup.
-func writeDomains(domains []string) (string, error) {
-	if len(domains) == 0 {
-		return "", fmt.Errorf("domains list is empty — add domains to ~/.membrane/config.yaml")
+func writeHostnames(hostnames []string) (string, error) {
+	if len(hostnames) == 0 {
+		return "", fmt.Errorf("hostnames list is empty — add hostnames to ~/.membrane/config.yaml")
 	}
-	f, err := os.CreateTemp("", "membrane-domains-")
+	f, err := os.CreateTemp("", "membrane-hostnames-")
 	if err != nil {
-		return "", fmt.Errorf("create domains temp file: %w", err)
+		return "", fmt.Errorf("create hostnames temp file: %w", err)
 	}
 	defer f.Close()
-	for _, d := range domains {
+	for _, d := range hostnames {
 		fmt.Fprintln(f, d)
 	}
 	return f.Name(), nil
