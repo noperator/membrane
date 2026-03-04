@@ -82,7 +82,7 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 	args = append(args, "-v", hostnamesFile+":/usr/local/etc/hostnames.txt:ro")
 
 	// Extra args from config.
-	args = append(args, cfg.ExtraArgs...)
+	args = append(args, cfg.Args...)
 
 	if title := os.Getenv("MEMBRANE_TITLE"); title != "" {
 		args = append(args, "-e", "MEMBRANE_TITLE="+title)

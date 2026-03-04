@@ -245,7 +245,7 @@ hostnames:
 # Raw arguments appended to `docker run`. Useful for passing environment
 # variables, additional mounts, or port mappings. Supports `~/` and `$HOME/`
 # expansion.
-extra_args:
+args:
   - -e
   - MY_API_KEY=abc123
   - -v

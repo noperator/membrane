@@ -12,7 +12,7 @@ import (
 type config struct {
 	Ignore    []string `yaml:"ignore"`
 	Readonly  []string `yaml:"readonly"`
-	ExtraArgs []string `yaml:"extra_args"`
+	Args      []string `yaml:"args"`
 	Hostnames []string `yaml:"hostnames"`
 }
 
@@ -49,11 +49,11 @@ func loadConfig(workspaceDir string) (*config, error) {
 	if !workspaceMissing {
 		base.Ignore = append(base.Ignore, workspace.Ignore...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
-		base.ExtraArgs = append(base.ExtraArgs, workspace.ExtraArgs...)
+		base.Args = append(base.Args, workspace.Args...)
 		base.Hostnames = append(base.Hostnames, workspace.Hostnames...)
 	}
 
-	expandArgs(base.ExtraArgs)
+	expandArgs(base.Args)
 	return &base, nil
 }
 
