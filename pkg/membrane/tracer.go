@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // Tracer manages a Tracee eBPF sidecar container that traces the agent
@@ -130,18 +132,25 @@ func (t *Tracer) Start() error {
 		close(buffered)
 	}()
 
-	s := newSpinner()
-	s.Start("Setting up sandbox...")
+	var s *spinner
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		s = newSpinner()
+		s.Start("Setting up sandbox...")
+	}
 
 	select {
 	case err := <-readyCh:
-		s.Stop()
+		if s != nil {
+			s.Stop()
+		}
 		if err != nil {
 			_ = t.cmd.Process.Kill()
 			return err
 		}
 	case <-time.After(30 * time.Second):
-		s.Stop()
+		if s != nil {
+			s.Stop()
+		}
 		_ = t.cmd.Process.Kill()
 		return fmt.Errorf("tracee did not become ready within 30 seconds")
 	}
@@ -229,8 +238,11 @@ func (t *Tracer) streamEvents() {
 // NOTE: SIGKILL cannot be caught; the tracee container may need manual
 // cleanup via: docker stop tracee-<id>
 func (t *Tracer) Stop() {
-	s := newSpinner()
-	s.Start("Tearing down sandbox...")
+	var s *spinner
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		s = newSpinner()
+		s.Start("Tearing down sandbox...")
+	}
 
 	_ = exec.Command("docker", "stop", "-t", "2", t.containerName).Run()
 	if t.containerID != "" {
@@ -242,7 +254,9 @@ func (t *Tracer) Stop() {
 		}
 	}
 
-	s.Stop()
+	if s != nil {
+		s.Stop()
+	}
 }
 
 func gzipFile(dst string) error {

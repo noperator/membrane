@@ -20,6 +20,7 @@ Membrane is a lightweight, agent-agnostic, cross-platform sandbox that gives you
 - **Agent-agnostic**: Wraps any process or command, not coupled to a specific agent.<br><sub>&emsp;*Most tools are tightly coupled to a specific agent (Claude Code, Codex, etc.).*</sub>
 - **Cross-platform**: Linux and macOS via Docker; strong enforcement on both platforms.<br><sub>&emsp;*Most tools rely on OS-specific primitives: Landlock and bubblewrap (Linux), Seatbelt and Apple Containers (macOS).*</sub>
 - **Lightweight**: Container-based, near-zero startup overhead on top of Docker.<br><sub>&emsp;*Most tools that offer kernel-level isolation do so at the expense of requiring a full hypervisor.*</sub>
+- **Unix-native**: Use with shell pipelines, GNU parallel, or script it however you want.<br><sub>&emsp;*Most tools target IDE-attached environments that are awkward to drive programmatically.*</sub>
 
 ## Getting started
 
@@ -68,6 +69,25 @@ membrane
 # Run a specific command
 membrane -- claude -p "just say hello"
 membrane -- bash -c "echo hello"
+```
+
+#### Non-interactive mode
+
+When stdin is not a terminal, membrane automatically skips PTY allocation and wires stdin/stdout/stderr directly. This lets you pipe input, capture output, and use membrane in scripts or tools like GNU parallel.
+
+```bash
+# Pipe input
+echo 'Today is my birthday, but no one noticed.' | membrane -- claude -p 'Tell me something nice.'
+
+Happy birthday! 🎂
+
+# Capture output to a file
+echo 'target char count: 20' |
+    membrane -- claude -p 'Output something that matches the exact target character count and nothing more.' |
+    tee /dev/stderr | tr -d '\n' | wc -c
+
+This is twenty chars
+      20
 ```
 
 <details><summary>Advanced usage</summary>
@@ -304,7 +324,6 @@ This project is an experimental work in progress. There are likely more opportun
 
 ### To-do
 
-- [ ] allow reading from host stdin (to be used in pipeline)
 - [ ] support Docker-in-Docker on macOS
 - [ ] support Docker checkpoint
 - [ ] whitelist HTTPS paths/endpoints
@@ -321,5 +340,6 @@ This project is an experimental work in progress. There are likely more opportun
 - [x] refresh firewall after init
 - [x] quiet down logging a bit
 - [x] make ignore/readonly configurable
+- [x] allow reading from host stdin (to be used in pipeline)
 
 </details>

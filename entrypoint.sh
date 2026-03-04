@@ -58,7 +58,7 @@ usermod -u "$WORKSPACE_UID" agent >/dev/null 2>&1 || true
 groupmod -g "$WORKSPACE_GID" agent >/dev/null 2>&1 || true
 
 if [ -n "$MEMBRANE_TITLE" ]; then
-    echo -ne "\e]2;${MEMBRANE_TITLE}\007" > /dev/tty 2>/dev/null || true
+    { echo -ne "\e]2;${MEMBRANE_TITLE}\007" > /dev/tty; } 2>/dev/null || true
 fi
 
 cd /workspace
