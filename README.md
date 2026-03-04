@@ -51,6 +51,14 @@ Options:
       --no-update          skip checking for updates
       --reset[=cid]        remove membrane state and exit (c=containers, i=image, d=directory)
       --trace-log string   path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)
+
+Config:
+  -a, --arg stringArray        extra docker run argument (repeatable)
+  -c, --cidr stringArray       allowed IP or CIDR range (repeatable)
+  -n, --hostname stringArray   allowed hostname (repeatable)
+  -i, --ignore stringArray     ignore pattern (repeatable)
+  -r, --readonly stringArray   readonly pattern (repeatable)
+      --resolver string        DNS resolver (overrides config file)
 ```
 
 Optionally pass a specific command to be executed, using `--` to separate membrane options from the command to run inside the container.
@@ -220,48 +228,70 @@ conn  claude: AF_INET 34.149.66.137:443
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline domains, ignore patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline hostnames, ignore patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# Patterns matched against filenames or relative paths. Matching files and
-# directories are shadowed with an empty placeholder inside the container. The
-# agent can see that they exist but cannot read their contents.
+# `resolver` is the DNS resolver used by both the firewall and the
+# container. Defaults to 8.8.8.8 if not set.
+resolver: 1.1.1.1
+
+# `ignore` lists patterns matched against filenames or relative paths.
+# Matching files and directories are shadowed with an empty placeholder
+# inside the container — the agent can see they exist but cannot read
+# their contents.
 ignore:
   - secrets/
   - "*.pem"
 
-# Patterns mounted into the container as read-only. Use this for things like
-# `.git` (so the agent can read history but can't rewrite it) or `.env` files
-# (visible but not writable).
+# `readonly` lists patterns mounted into the container as read-only. Use
+# this for things like .git (so the agent can read history but not
+# rewrite it) or credential files that should be visible but not
+# writable.
 readonly:
   - config/
 
-# Hostnames the agent is allowed to reach. The firewall resolves these to IPs at
-# startup and refreshes every 60s. Anything not on the list is dropped.
-domains:
+# `hostnames` lists hostnames the agent is allowed to reach. The firewall
+# resolves these to IPs at startup and refreshes continuously. Anything
+# not listed is dropped.
+hostnames:
   - internal.mycompany.com
 
-# Raw arguments appended to `docker run`. Useful for passing environment
-# variables, additional mounts, or port mappings. Supports `~/` and `$HOME/`
-# expansion.
-extra_args:
+# `cidrs` lists IP addresses or CIDR ranges added directly to the firewall
+# allowlist without DNS resolution. Bare IPs are treated as /32.
+cidrs:
+  - 192.168.2.1
+  - 192.168.3.0/24
+
+# `args` lists raw arguments appended to the `docker run` command that
+# launches the agent container. Use this to pass environment variables,
+# additional mounts, port mappings, or anything else accepted by
+# `docker run`. Environment variables are expanded ($VAR, ${VAR})
+# anywhere in a value, including mid-string (e.g. MY_PATH=$HOME/mydir).
+# Shell command substitution ($(...)) is not supported — set secrets in
+# your shell environment first and reference them here. Values are
+# passed directly to `docker run` without shell interpretation. Do not
+# add shell-style quoting around values — quotes are treated as literal
+# characters. Each flag and its argument must be separate list items.
+args:
   - -e
   - MY_API_KEY=abc123
+  - -e
+  - "MY_VALUE=my value with space"
   - -v
-  - /home/user/.aws:/home/agent/.aws:ro
+  - $HOME/.aws:/home/agent/.aws:ro
   - -e
   - AWS_PROFILE=myprofile
 ```
 
-See [`config-default.yaml`](config-default.yaml) for the full default config including the built-in domain allowlist.
+See [`config-default.yaml`](config-default.yaml) for the full default config including the built-in hostname allowlist.
 
 
 ### Troubleshooting
 
 This project is an experimental work in progress. There are likely more opportunities to lock this down further. A few common issues:
 
-- **Network not working:** The firewall resolves domains to IPs at startup. If a CDN rotates IPs, the connection may fail until the next refresh (every 60s). Check `/var/log/firewall-updater.log` inside the container for refresh status.
+- **Network not working:** The firewall resolves hostnames to IPs at startup. If a CDN rotates IPs, the connection may fail until the next refresh (every 60s). Check `/var/log/firewall-updater.log` inside the container for refresh status.
 
 - **Docker-in-Docker not working:** Sysbox must be installed on the host. membrane detects it automatically; if it's not present, Docker-in-Docker is silently disabled.
 
@@ -276,18 +306,19 @@ This project is an experimental work in progress. There are likely more opportun
 
 ### To-do
 
-- [ ] pass via config via CLI (in addition to file)
 - [ ] allow reading from host stdin (to be used in pipeline)
 - [ ] support Docker-in-Docker on macOS
-- [ ] whitelist IPs
-- [ ] set custom DNS resolver
 - [ ] support Docker checkpoint
+- [ ] whitelist HTTPS paths/endpoints
 
 <details><summary>Completed</summary>
 
+- [x] pass via config via CLI (in addition to file)
+- [x] whitelist IPs
+- [x] set custom DNS resolver
 - [x] mount agent home dir as ~/.membrane/home on host
 - [x] monitor agent with eBPF
-- [x] specify domains at runtime
+- [x] specify hostnames at runtime
 - [x] git-aware read-only mounts
 - [x] refresh firewall after init
 - [x] quiet down logging a bit

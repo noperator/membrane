@@ -4,16 +4,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type config struct {
+	Resolver  string   `yaml:"resolver"`
 	Ignore    []string `yaml:"ignore"`
 	Readonly  []string `yaml:"readonly"`
-	ExtraArgs []string `yaml:"extra_args"`
-	Domains   []string `yaml:"domains"`
+	Args      []string `yaml:"args"`
+	Hostnames []string `yaml:"hostnames"`
+	Cidrs     []string `yaml:"cidrs"`
 }
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
@@ -49,11 +50,16 @@ func loadConfig(workspaceDir string) (*config, error) {
 	if !workspaceMissing {
 		base.Ignore = append(base.Ignore, workspace.Ignore...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
-		base.ExtraArgs = append(base.ExtraArgs, workspace.ExtraArgs...)
-		base.Domains = append(base.Domains, workspace.Domains...)
+		base.Args = append(base.Args, workspace.Args...)
+		base.Hostnames = append(base.Hostnames, workspace.Hostnames...)
+		base.Cidrs = append(base.Cidrs, workspace.Cidrs...)
 	}
 
-	expandArgs(base.ExtraArgs)
+	if base.Resolver == "" {
+		base.Resolver = "8.8.8.8"
+	}
+
+	expandArgs(base.Args)
 	return &base, nil
 }
 
@@ -70,19 +76,7 @@ func loadConfigFile(path string) (*config, error) {
 }
 
 func expandArgs(args []string) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
 	for i, arg := range args {
-		if strings.HasPrefix(arg, "~/") {
-			args[i] = filepath.Join(home, arg[2:])
-		} else if strings.HasPrefix(arg, "$HOME/") {
-			args[i] = filepath.Join(home, arg[6:])
-		} else if arg == "~" {
-			args[i] = home
-		} else if arg == "$HOME" {
-			args[i] = home
-		}
+		args[i] = os.ExpandEnv(arg)
 	}
 }

@@ -12,9 +12,20 @@ import (
 	"time"
 )
 
+// CLIOverrides holds config values passed via CLI flags. List fields are
+// appended to the merged file config; scalar fields replace it.
+type CLIOverrides struct {
+	Ignore    []string
+	Readonly  []string
+	Hostnames []string
+	Cidrs     []string
+	Args      []string
+	Resolver  string
+}
+
 // Run is the main entry point called from cmd/membrane/main.go.
 // passthrough args are forwarded as the container command.
-func Run(noUpdate bool, trace bool, traceLog string, passthrough []string) error {
+func Run(noUpdate bool, trace bool, traceLog string, passthrough []string, cli CLIOverrides) error {
 	repoDir, err := ensureRepo()
 	if err != nil {
 		return err
@@ -47,9 +58,23 @@ func Run(noUpdate bool, trace bool, traceLog string, passthrough []string) error
 		return fmt.Errorf("get working directory: %w", err)
 	}
 
+	workspaceDir, err = filepath.EvalSymlinks(workspaceDir)
+	if err != nil {
+		return fmt.Errorf("resolve workspace symlinks: %w", err)
+	}
+
 	cfg, err := loadConfig(workspaceDir)
 	if err != nil {
 		return err
+	}
+
+	cfg.Ignore = append(cfg.Ignore, cli.Ignore...)
+	cfg.Readonly = append(cfg.Readonly, cli.Readonly...)
+	cfg.Hostnames = append(cfg.Hostnames, cli.Hostnames...)
+	cfg.Cidrs = append(cfg.Cidrs, cli.Cidrs...)
+	cfg.Args = append(cfg.Args, cli.Args...)
+	if cli.Resolver != "" {
+		cfg.Resolver = cli.Resolver
 	}
 
 	m, err := scan(workspaceDir, cfg)

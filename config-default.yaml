@@ -1,17 +1,32 @@
-# Patterns to hide from the agent (shadowed with empty file/dir).
+# Workspace .membrane.yaml entries are appended to the global list, not
+# replaced. This applies to all list keys: ignore, readonly, hostnames,
+# cidrs, and args.
+
+# `resolver` is the DNS resolver used by both the firewall and the
+# container. Defaults to 8.8.8.8 if not set.
+resolver:
+
+# `ignore` lists patterns matched against filenames or relative paths.
+# Matching files and directories are shadowed with an empty placeholder
+# inside the container — the agent can see they exist but cannot read
+# their contents.
 ignore:
   - "*.bak"
   - "*.tmp"
 
-# Patterns to mount read-only.
+# `readonly` lists patterns mounted into the container as read-only. Use
+# this for things like .git (so the agent can read history but not
+# rewrite it) or credential files that should be visible but not
+# writable.
 readonly:
   - .git
   - .env
   - .membrane.yaml
 
-# Domains the agent is allowed to reach.
-# Workspace .membrane.yaml can add more (additive, not replacing).
-domains:
+# `hostnames` lists hostnames the agent is allowed to reach. The firewall
+# resolves these to IPs at startup and refreshes continuously. Anything
+# not listed is dropped.
+hostnames:
   # Anthropic
   - api.anthropic.com
   - sentry.io
@@ -93,3 +108,19 @@ domains:
   - bedrock.us-west-1.amazonaws.com
   - bedrock-runtime.us-west-2.amazonaws.com
   - bedrock.us-west-2.amazonaws.com
+
+# `cidrs` lists IP addresses or CIDR ranges added directly to the firewall
+# allowlist without DNS resolution. Bare IPs are treated as /32.
+cidrs:
+
+# `args` lists raw arguments appended to the `docker run` command that
+# launches the agent container. Use this to pass environment variables,
+# additional mounts, port mappings, or anything else accepted by
+# `docker run`. Environment variables are expanded ($VAR, ${VAR})
+# anywhere in a value, including mid-string (e.g. MY_PATH=$HOME/mydir).
+# Shell command substitution ($(...)) is not supported — set secrets in
+# your shell environment first and reference them here. Values are
+# passed directly to `docker run` without shell interpretation. Do not
+# add shell-style quoting around values — quotes are treated as literal
+# characters. Each flag and its argument must be separate list items.
+args:
