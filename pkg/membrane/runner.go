@@ -130,23 +130,62 @@ func (e *ExitError) Error() string {
 	return fmt.Sprintf("docker exited with code %d", e.Code)
 }
 
-// execDocker runs docker as a child process with a PTY, proxies the
-// terminal, forwards signals, and returns the child's exit code.
+// execDocker runs docker as a child process, proxies the terminal,
+// forwards signals, and returns the child's exit code.
+//
+// When stdin is a terminal the child gets a PTY (interactive mode).
+// Otherwise stdin/stdout/stderr are wired directly so that output can
+// be captured by scripts and tools like GNU parallel.
 func execDocker(args []string) error {
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
 		return fmt.Errorf("docker not found in PATH: %w", err)
 	}
 
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+
+	if !interactive {
+		// Strip -t from docker args; a TTY cannot be allocated without
+		// a terminal on the host side.
+		for i, a := range args {
+			if a == "-it" {
+				args[i] = "-i"
+				break
+			}
+		}
+
+		cmd := exec.Command(dockerPath, args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("start docker: %w", err)
+		}
+
+		// Forward SIGINT, SIGTERM, and SIGHUP to the child process.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		defer signal.Stop(sigCh)
+		go func() {
+			for sig := range sigCh {
+				_ = cmd.Process.Signal(sig)
+			}
+		}()
+
+		if err := cmd.Wait(); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return &ExitError{Code: exitErr.ExitCode()}
+			}
+			return fmt.Errorf("docker run: %w", err)
+		}
+		return nil
+	}
+
+	// Interactive path: allocate a PTY.
 	cmd := exec.Command(dockerPath, args...)
 
-	// membrane is assumed to always run interactively. If non-interactive support
-	// is needed in the future (e.g. piped stdin via `echo data | membrane -- ...`),
-	// detect with term.IsTerminal(int(os.Stdin.Fd())) and branch: skip the PTY,
-	// set cmd.Stdin/Stdout/Stderr = os.Stdin/Out/Err directly, and handle signals
-	// the same way.
-	//
-	// Allocate a PTY and start the child process.
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return fmt.Errorf("start docker: %w", err)
