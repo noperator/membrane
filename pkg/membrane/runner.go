@@ -83,6 +83,10 @@ func buildArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string
 
 	args = append(args, "-e", "MEMBRANE_RESOLVER="+cfg.Resolver)
 
+	if len(cfg.Cidrs) > 0 {
+		args = append(args, "-e", "MEMBRANE_CIDRS="+strings.Join(cfg.Cidrs, ","))
+	}
+
 	// Extra args from config.
 	args = append(args, cfg.Args...)
 

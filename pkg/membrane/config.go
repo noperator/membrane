@@ -14,6 +14,7 @@ type config struct {
 	Readonly  []string `yaml:"readonly"`
 	Args      []string `yaml:"args"`
 	Hostnames []string `yaml:"hostnames"`
+	Cidrs     []string `yaml:"cidrs"`
 }
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
@@ -51,6 +52,7 @@ func loadConfig(workspaceDir string) (*config, error) {
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
 		base.Args = append(base.Args, workspace.Args...)
 		base.Hostnames = append(base.Hostnames, workspace.Hostnames...)
+		base.Cidrs = append(base.Cidrs, workspace.Cidrs...)
 	}
 
 	if base.Resolver == "" {

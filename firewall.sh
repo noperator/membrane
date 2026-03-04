@@ -40,6 +40,14 @@ trap "rm -f $IP_LIST" EXIT
 # Add GitHub CIDRs (filter out IPv6 and bogus)
 echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep -v ':' | grep -v '^0\.' >>"$IP_LIST"
 
+# Add user-specified CIDRs
+if [ -n "${MEMBRANE_CIDRS:-}" ]; then
+    echo "$MEMBRANE_CIDRS" | tr ',' '\n' | while read -r cidr; do
+        [[ "$cidr" == */* ]] || cidr="${cidr}/32"
+        echo "$cidr"
+    done >> "$IP_LIST"
+fi
+
 # Resolve all hostnames in parallel
 resolve_all_hostnames "$HOSTNAMES_FILE" >>"$IP_LIST"
 
@@ -112,6 +120,14 @@ UPDATE_INTERVAL="${FIREWALL_UPDATE_INTERVAL:-60}"
             echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep -v ':' | grep -v '^0\.' >>"$IP_LIST"
         else
             echo "$(date): Warning: Failed to fetch GitHub IP ranges, skipping GitHub update"
+        fi
+
+        # Add user-specified CIDRs
+        if [ -n "${MEMBRANE_CIDRS:-}" ]; then
+            echo "$MEMBRANE_CIDRS" | tr ',' '\n' | while read -r cidr; do
+                [[ "$cidr" == */* ]] || cidr="${cidr}/32"
+                echo "$cidr"
+            done >> "$IP_LIST"
         fi
 
         # Resolve all hostnames

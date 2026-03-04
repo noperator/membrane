@@ -246,6 +246,10 @@ readonly:
 hostnames:
   - internal.mycompany.com
 
+# cidrs lists IP addresses or CIDR ranges that are added directly to the
+# firewall allowlist without DNS resolution. Bare IPs are treated as /32.
+cidrs:
+
 # Raw arguments appended to `docker run`.
 args:
   - -e
