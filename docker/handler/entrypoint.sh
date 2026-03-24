@@ -47,6 +47,8 @@ rm -f "$IP_LIST"
 
 [ -n "$ALL_IPS" ] || { echo "ERROR: no IPs resolved — check hostnames file"; exit 1; }
 
+MITMPROXY_PORT=8080
+
 # Set up nftables
 nft -f - <<EOF
 table ip membrane
@@ -56,6 +58,12 @@ table ip membrane {
         type ipv4_addr
         flags interval
         elements = { $ALL_IPS }
+    }
+
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "$INTERNAL_IF" ip daddr @allowed tcp dport 80 redirect to :$MITMPROXY_PORT
+        iifname "$INTERNAL_IF" ip daddr @allowed tcp dport 443 redirect to :$MITMPROXY_PORT
     }
 
     chain postrouting {
@@ -76,6 +84,35 @@ table ip membrane {
 EOF
 
 echo "Firewall rules loaded ($(echo "$ALL_IPS" | tr ',' '\n' | wc -l) ranges)."
+
+# Generate ephemeral CA keypair
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+    -keyout /tmp/ca.key -out /membrane-ca/ca.crt \
+    -days 1 -nodes -subj "/CN=membrane-ca" 2>/dev/null
+
+# Place CA into mitmproxy confdir
+mkdir -p /tmp/mitmproxy
+cat /tmp/ca.key /membrane-ca/ca.crt > /tmp/mitmproxy/mitmproxy-ca.pem
+echo "CA cert generated."
+
+# Start mitmproxy in transparent mode
+mitmdump \
+    --mode transparent \
+    --listen-port "$MITMPROXY_PORT" \
+    --set confdir=/tmp/mitmproxy \
+    --ssl-insecure \
+    &
+
+# Wait for mitmproxy to bind its port (timeout 15s)
+for i in $(seq 1 15); do
+    (echo > /dev/tcp/localhost/$MITMPROXY_PORT) 2>/dev/null && break
+    if [ "$i" -eq 15 ]; then
+        echo "ERROR: mitmproxy did not bind within 15s"
+        exit 1
+    fi
+    sleep 1
+done
+echo "mitmproxy ready."
 
 # Signal ready
 touch /tmp/handler-ready

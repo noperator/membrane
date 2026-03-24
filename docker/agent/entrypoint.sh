@@ -5,7 +5,7 @@ set -e
 ip route replace default via "$MEMBRANE_GATEWAY" 2>/dev/null || true
 
 # Set DNS resolver
-echo "nameserver ${MEMBRANE_DNS_RESOLVER:-1.1.1.1}" > /etc/resolv.conf
+echo "nameserver ${MEMBRANE_DNS_RESOLVER:-1.1.1.1}" >/etc/resolv.conf
 
 # Fix MTU
 ip link set dev eth0 mtu 1200 2>/dev/null || true
@@ -13,6 +13,15 @@ ip link set dev eth0 mtu 1200 2>/dev/null || true
 # Disable IPv6
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+
+# Install handler CA cert (must be present — handler signals ready only after writing it)
+[ -f /membrane-ca/ca.crt ] || {
+    echo "ERROR: CA cert not found"
+    exit 1
+}
+cp /membrane-ca/ca.crt /usr/local/share/ca-certificates/membrane-ca.crt
+update-ca-certificates >/dev/null 2>&1
+echo "CA cert installed."
 
 # Start Docker daemon if running in Sysbox
 if [ "$MEMBRANE_DIND" = "1" ] && command -v dockerd >/dev/null 2>&1; then
@@ -32,7 +41,7 @@ usermod -u "$WORKSPACE_UID" agent >/dev/null 2>&1 || true
 groupmod -g "$WORKSPACE_GID" agent >/dev/null 2>&1 || true
 
 if [ -n "$MEMBRANE_TITLE" ]; then
-    { echo -ne "\e]2;${MEMBRANE_TITLE}\007" > /dev/tty; } 2>/dev/null || true
+    { echo -ne "\e]2;${MEMBRANE_TITLE}\007" >/dev/tty; } 2>/dev/null || true
 fi
 
 cd /workspace

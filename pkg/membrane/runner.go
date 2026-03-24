@@ -36,6 +36,7 @@ type sessionNames struct {
 	handlerContainer string
 	internalNetwork  string
 	externalNetwork  string
+	caVolume         string
 }
 
 func newSessionNames() sessionNames {
@@ -48,6 +49,7 @@ func newSessionNames() sessionNames {
 		handlerContainer: "membrane-handler-" + id,
 		internalNetwork:  "membrane-internal-" + id,
 		externalNetwork:  "membrane-external-" + id,
+		caVolume:         "membrane-ca-" + id,
 	}
 }
 
@@ -59,6 +61,13 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		exec.Command("docker", "stop", "-t", "2", s.handlerContainer).Run()
 		exec.Command("docker", "network", "rm", s.internalNetwork).Run()
 		exec.Command("docker", "network", "rm", s.externalNetwork).Run()
+		exec.Command("docker", "volume", "rm", s.caVolume).Run()
+	}
+
+	if out, err := exec.Command("docker", "volume", "create",
+		s.caVolume).CombinedOutput(); err != nil {
+		return cleanup, "", fmt.Errorf("create ca volume %s: %s: %w",
+			s.caVolume, out, err)
 	}
 
 	if out, err := exec.Command("docker", "network", "create",
@@ -84,6 +93,7 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		"--cap-add=NET_ADMIN",
 		"--sysctl", "net.ipv4.ip_forward=1",
 		"-v", hostnamesFile + ":/etc/membrane/hostnames.txt:ro",
+		"-v", s.caVolume + ":/membrane-ca",
 		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.Resolver,
 	}
 	if len(cfg.Cidrs) > 0 {
@@ -173,6 +183,15 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 		return nil, fmt.Errorf("create agent home dir: %w", err)
 	}
 	args = append(args, "-v", agentHome+":/home/agent")
+	args = append(args, "-v", s.caVolume+":/membrane-ca:ro")
+	args = append(args,
+		// CA trust for runtimes that don't use the system store by default
+		"-e", "NODE_EXTRA_CA_CERTS=/membrane-ca/ca.crt",
+		"-e", "NODE_USE_SYSTEM_CA=1",
+		"-e", "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+		"-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+		"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+	)
 
 	// Extra args from config.
 	args = append(args, cfg.Args...)
