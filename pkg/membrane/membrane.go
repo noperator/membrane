@@ -84,7 +84,7 @@ func Run(noUpdate bool, trace bool, traceLog string, passthrough []string, cli C
 
 	s := newSessionNames()
 
-	cleanup, gatewayIP, err := startSession(s)
+	cleanup, gatewayIP, err := startSession(s, cfg)
 	defer cleanup()
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)

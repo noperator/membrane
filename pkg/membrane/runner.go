@@ -54,7 +54,7 @@ func newSessionNames() sessionNames {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(s sessionNames) (func(), string, error) {
+func startSession(s sessionNames, cfg *config) (func(), string, error) {
 	cleanup := func() {
 		exec.Command("docker", "stop", "-t", "2", s.handlerContainer).Run()
 		exec.Command("docker", "network", "rm", s.internalNetwork).Run()
@@ -72,14 +72,26 @@ func startSession(s sessionNames) (func(), string, error) {
 			s.internalNetwork, out, err)
 	}
 
+	hostnamesFile, err := writeHostnames(cfg.Hostnames)
+	if err != nil {
+		return cleanup, "", err
+	}
+
 	handlerArgs := []string{
 		"run", "-d", "--rm",
 		"--name", s.handlerContainer,
 		"--network", s.externalNetwork,
 		"--cap-add=NET_ADMIN",
 		"--sysctl", "net.ipv4.ip_forward=1",
-		handlerImageName,
+		"-v", hostnamesFile + ":/etc/membrane/hostnames.txt:ro",
+		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.Resolver,
 	}
+	if len(cfg.Cidrs) > 0 {
+		handlerArgs = append(handlerArgs, "-e",
+			"MEMBRANE_CIDRS="+strings.Join(cfg.Cidrs, ","))
+	}
+	handlerArgs = append(handlerArgs, handlerImageName)
+
 	if out, err := exec.Command("docker", handlerArgs...).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("start handler: %s: %w", out, err)
 	}
@@ -132,8 +144,10 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 
 	args = append(args,
 		"--cap-add=NET_ADMIN",
+		"--cap-add=CAP_SETPCAP",
 		"--network", s.internalNetwork,
 		"-e", "MEMBRANE_GATEWAY="+gatewayIP,
+		"-e", "MEMBRANE_DNS_RESOLVER="+cfg.Resolver,
 		"-v", workspaceDir+":/workspace",
 	)
 
@@ -159,20 +173,6 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 		return nil, fmt.Errorf("create agent home dir: %w", err)
 	}
 	args = append(args, "-v", agentHome+":/home/agent")
-
-	// Write merged hostnames list to a temp file and mount it where
-	// firewall.sh expects it.
-	hostnamesFile, err := writeHostnames(cfg.Hostnames)
-	if err != nil {
-		return nil, err
-	}
-	args = append(args, "-v", hostnamesFile+":/usr/local/etc/hostnames.txt:ro")
-
-	args = append(args, "-e", "MEMBRANE_RESOLVER="+cfg.Resolver)
-
-	if len(cfg.Cidrs) > 0 {
-		args = append(args, "-e", "MEMBRANE_CIDRS="+strings.Join(cfg.Cidrs, ","))
-	}
 
 	// Extra args from config.
 	args = append(args, cfg.Args...)
