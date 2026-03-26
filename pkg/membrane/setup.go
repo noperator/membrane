@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -23,6 +24,11 @@ const (
 // single-character codes: c=containers, i=image, d=directory.
 // Empty string means all components.
 func Reset(components string) error {
+
+	if runtime.GOOS == "darwin" {
+		os.Setenv("DOCKER_CONTEXT", "colima-membrane")
+	}
+
 	for _, r := range components {
 		if !strings.ContainsRune("cid", r) {
 			return fmt.Errorf("unknown reset component %q (valid: c=containers, i=image, d=directory)", string(r))
@@ -39,7 +45,7 @@ func Reset(components string) error {
 		fmt.Fprintf(os.Stderr, "  c - all running membrane containers\n")
 	}
 	if doI {
-		fmt.Fprintf(os.Stderr, "  i - the membrane Docker image\n")
+		fmt.Fprintf(os.Stderr, "  i - the membrane Docker images\n")
 	}
 	if doD {
 		fmt.Fprintf(os.Stderr, "  d - ~/.membrane\n")
