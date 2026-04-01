@@ -117,7 +117,7 @@ colima ssh --profile "$COLIMA_PROFILE" -- bash -s <"$LINUX_SCRIPT"
 # -------------------------------------------------------
 echo ""
 info "Verifying sysbox from host..."
-if DOCKER_CONTEXT="$DOCKER_CONTEXT_NAME" docker run --rm --runtime=sysbox-runc alpine echo "sysbox ok"; then
+if DOCKER_CONTEXT="$DOCKER_CONTEXT_NAME" docker run --rm --runtime=sysbox-runc alpine:3.21 echo "sysbox ok"; then
     info "Sysbox verified — ready to use."
 else
     error "Sysbox runtime not working from host. Try: colima restart --profile $COLIMA_PROFILE"

@@ -61,11 +61,8 @@ else
     info "Installing Sysbox prerequisites..."
     sudo apt-get install -y -qq jq rsync wget
 
-    info "Fetching latest Sysbox release for ${ARCH}..."
-    SYSBOX_URL=$(curl -fsSL https://api.github.com/repos/nestybox/sysbox/releases/latest |
-        jq -r ".assets[] | select(.name | test(\"linux_${ARCH}\\\\.deb$\")) | .browser_download_url" |
-        head -1)
-    [[ -n "$SYSBOX_URL" ]] || error "Could not find Sysbox .deb for ${ARCH}."
+    SYSBOX_VER=0.6.7
+    SYSBOX_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VER}/sysbox-ce_${SYSBOX_VER}.linux_${ARCH}.deb"
 
     info "Downloading Sysbox..."
     wget -q -O /tmp/sysbox.deb "$SYSBOX_URL"
@@ -103,7 +100,7 @@ info "Running smoke tests..."
 
 # Test 1: basic startup
 info "Test 1: basic startup..."
-if KERNEL=$(docker run --rm --runtime=sysbox-runc alpine uname -r 2>&1); then
+if KERNEL=$(docker run --rm --runtime=sysbox-runc alpine:3.21 uname -r 2>&1); then
     info "  kernel: $KERNEL — OK"
 else
     warn "  basic startup FAILED"
@@ -115,7 +112,7 @@ fi
 # Note: bind-mounted directories bypass UID remapping (intentional Sysbox behavior),
 # so we check /proc/self/uid_map instead of file ownership on a mount.
 info "Test 2: user namespace isolation..."
-UID_MAP=$(docker run --rm --runtime=sysbox-runc alpine cat /proc/self/uid_map 2>&1)
+UID_MAP=$(docker run --rm --runtime=sysbox-runc alpine:3.21 cat /proc/self/uid_map 2>&1)
 HOST_UID=$(echo "$UID_MAP" | awk '{print $2}')
 if [[ -z "$HOST_UID" || "$HOST_UID" -eq 0 ]]; then
     warn "  userns: uid_map shows no remapping — isolation may not be working"
@@ -126,7 +123,7 @@ fi
 
 # Test 3: nftables egress filtering (membrane relies on this)
 info "Test 3: nftables egress filtering..."
-if docker run --rm --runtime=sysbox-runc --cap-add NET_ADMIN alpine sh -c '
+if docker run --rm --runtime=sysbox-runc --cap-add NET_ADMIN alpine:3.21 sh -c '
     if ! ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
         echo "SKIP: 1.1.1.1 not reachable (no internet?)"
         exit 0

@@ -29,6 +29,8 @@ type Tracer struct {
 	done          chan struct{} // closed when the streaming goroutine exits
 }
 
+const traceeImage = "aquasec/tracee:0.24.1"
+
 // traceeEvents is the default set of events to trace.
 var traceeEvents = []string{
 	"security_file_open",
@@ -53,8 +55,8 @@ func NewTracer(agentContainerName, traceFile string) *Tracer {
 // Start launches the Tracee container and blocks until Tracee signals ready
 // or the 30-second timeout expires.
 func (t *Tracer) Start() error {
-	if err := exec.Command("docker", "image", "inspect", "aquasec/tracee:latest").Run(); err != nil {
-		cmd := exec.Command("docker", "pull", "aquasec/tracee:latest")
+	if err := exec.Command("docker", "image", "inspect", traceeImage).Run(); err != nil {
+		cmd := exec.Command("docker", "pull", traceeImage)
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -72,7 +74,7 @@ func (t *Tracer) Start() error {
 		"-v", "/etc/os-release:/etc/os-release-host:ro",
 		"-e", "LIBBPFGO_OSRELEASE_FILE=/etc/os-release-host",
 		"--entrypoint", "/tracee/tracee",
-		"aquasec/tracee:latest",
+		traceeImage,
 		"--output", "json",
 		"--log", "debug",
 		"--scope", "container=new",

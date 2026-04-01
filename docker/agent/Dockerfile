@@ -70,8 +70,8 @@ ENV PATH="${GOPATH}/bin:${PATH}"
 # LAYER 5: Coding agents (changes occasionally)
 # =============================================================================
 
-RUN npm install -g @anthropic-ai/claude-code
-RUN npm install -g @openai/codex
+RUN npm install -g @anthropic-ai/claude-code@2.1.87
+RUN npm install -g @openai/codex@0.118.0
 # RUN npm install -g opencode-ai@latest
 # RUN npm install -g @charmland/crush
 
@@ -83,7 +83,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-RUN CRUN_VER=$(curl -s https://api.github.com/repos/containers/crun/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && \
+RUN CRUN_VER=1.22 && \
     ARCH=$(dpkg --print-architecture) && \
     curl -L -o /usr/bin/crun "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-${ARCH}" && \
     chmod +x /usr/bin/crun
@@ -121,7 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pipx \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_VERSION=0.11.2 sh
 
 # =============================================================================
 # LAYER 8: Sudo configuration (depends on utilities layer for sudo)
