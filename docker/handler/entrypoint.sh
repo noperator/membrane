@@ -96,7 +96,6 @@ table ip membrane {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
         tcp flags syn tcp option maxseg size set rt mtu
-        iifname "$INTERNAL_IF" udp dport 53 accept
         iifname "$INTERNAL_IF" ip daddr @allowed-any-port accept
         iifname "$INTERNAL_IF" ip daddr . tcp dport @allowed accept
         iifname "$INTERNAL_IF" log prefix "[membrane BLOCKED] " limit rate 5/second

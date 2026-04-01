@@ -108,7 +108,32 @@ func main() {
 	}
 }
 
+func extractQueryName(pkt []byte) string {
+	if len(pkt) < 12 {
+		return ""
+	}
+	if binary.BigEndian.Uint16(pkt[4:6]) == 0 {
+		return ""
+	}
+	name, _ := parseDNSName(pkt, 12)
+	return strings.TrimRight(strings.ToLower(name), ".")
+}
+
 func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed map[string][]int) {
+	name := extractQueryName(query)
+	if _, ok := allowed[name]; !ok {
+		resp := make([]byte, len(query))
+		copy(resp, query)
+		resp[2] = (query[2] & 0x01) | 0x80 // QR=1 (response), preserve RD bit
+		resp[3] = 0x83                     // RA=1, RCODE=3 (NXDOMAIN)
+		resp[6], resp[7] = 0, 0            // ANCOUNT = 0
+		resp[8], resp[9] = 0, 0            // NSCOUNT = 0
+		resp[10], resp[11] = 0, 0          // ARCOUNT = 0
+		conn.WriteToUDP(resp, clientAddr)
+		log.Printf("dns-proxy: blocked %s (not in allow list)", name)
+		return
+	}
+
 	upstreamAddr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Printf("dns-proxy: resolve upstream: %v", err)
