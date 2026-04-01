@@ -78,7 +78,7 @@ table ip membrane {
 
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
-        iifname "$INTERNAL_IF" ip daddr @allowed-any-port tcp dport { 80, 443 } redirect to :$MITMPROXY_PORT
+        iifname "$INTERNAL_IF" ip daddr @allowed-any-port meta l4proto tcp redirect to :$MITMPROXY_PORT
         iifname "$INTERNAL_IF" ip daddr . tcp dport @allowed redirect to :$MITMPROXY_PORT
     }
 
@@ -132,6 +132,7 @@ mitmdump \
     --listen-port "$MITMPROXY_PORT" \
     --set confdir=/tmp/mitmproxy \
     --ssl-insecure \
+    --set rawtcp=true \
     -s /addon.py \
     &
 
