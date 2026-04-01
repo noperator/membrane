@@ -106,6 +106,11 @@ EOF
 
 echo "Firewall rules loaded."
 
+# Block all IPv6 forwarding as a safety net — all nftables rules are
+# IPv4 only so any IPv6 traffic would otherwise be unfiltered.
+ip6tables -P FORWARD DROP 2>/dev/null || true
+ip6tables -P OUTPUT DROP 2>/dev/null || true
+
 # Start DNS proxy (updates nftables sets on resolution)
 MEMBRANE_DNS_RESOLVER="$DNS_RESOLVER" MEMBRANE_ALLOW_FILE="$ALLOW_FILE" dns-proxy &
 DNS_PROXY_PID=$!
