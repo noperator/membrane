@@ -30,7 +30,8 @@ def _load_rules():
             if "/" not in cidr:
                 cidr = cidr + "/32"
             addr, prefix_len = cidr.split("/", 1)
-            allowed_cidrs.append((addr, int(prefix_len)))
+            http_rules = rule.get("http") or []
+            allowed_cidrs.append((addr, int(prefix_len), http_rules))
             continue
 
         host = rule.get("host", "").lower()
@@ -85,6 +86,26 @@ def _matches_rule(url_path, rule, method, path):
     return True
 
 
+def _match_cidr(ip_int, method, path):
+    """Check ip_int against ALLOWED_CIDRS with optional http rule
+    enforcement. Returns 'allow', 'block', or None (no match).
+    """
+    for net_addr, prefix_len, http_rules in ALLOWED_CIDRS:
+        try:
+            net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
+        except OSError:
+            continue
+        mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+        if (ip_int & mask) == (net_int & mask):
+            if not http_rules:
+                return "allow"
+            for rule in http_rules:
+                if _matches_rule("/", rule, method, path):
+                    return "allow"
+            return "block"
+    return None
+
+
 def request(flow: mhttp.HTTPFlow) -> None:
     host = flow.request.pretty_host.lower() if flow.request.pretty_host else ""
 
@@ -100,18 +121,32 @@ def request(flow: mhttp.HTTPFlow) -> None:
         except OSError:
             flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
             return
-        for net_addr, prefix_len in ALLOWED_CIDRS:
-            try:
-                net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
-            except OSError:
-                continue
-            mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
-            if (ip_int & mask) == (net_int & mask):
-                return  # matched CIDR — allow
+        result = _match_cidr(ip_int, flow.request.method, flow.request.path)
+        if result == "allow":
+            return
+        if result == "block":
+            flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+            return
+        # result is None — no CIDR matched, fall through to outer 403
         flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
         return
 
     if host not in ALLOWED_HOSTS:
+        # Before blocking, check if the destination IP matches a CIDR entry
+        peername = flow.server_conn.peername
+        if peername:
+            try:
+                ip_int = struct.unpack("!I", socket.inet_aton(peername[0]))[0]
+            except OSError:
+                ip_int = None
+            if ip_int is not None:
+                result = _match_cidr(ip_int, flow.request.method, flow.request.path)
+                if result == "allow":
+                    return
+                if result == "block":
+                    flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+                    return
+        # No CIDR match — block
         flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
         return
 
