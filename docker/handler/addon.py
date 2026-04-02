@@ -97,6 +97,15 @@ def _load_rules():
 ALLOWED_HOSTS, ALLOWED_CIDRS, URL_RULES, TCP_ALLOWED = _load_rules()
 
 
+def _is_http_or_tls(data: bytes) -> bool:
+    """Return True if the first bytes look like TLS or plain HTTP."""
+    if starts_like_tls_record(data):
+        return True
+    if data and data[:8].split(b" ")[0].isalpha() and b" " in data[:16]:
+        return True
+    return False
+
+
 def _reverse_lookup(ip: str) -> str:
     """Look up hostname for an IP from the dns-proxy reverse map.
     Returns empty string if not found."""
@@ -120,38 +129,49 @@ def next_layer(nextlayer: proxy_layer.NextLayer) -> None:
     if not host and addr:
         host = _reverse_lookup(addr[0])
 
-    # If host has no http-only rules, allow through normally
-    if not host:
-        return
-    if host not in ALLOWED_HOSTS:
-        return
-    if host not in URL_RULES:
-        return
-    if host in TCP_ALLOWED:
-        # Has explicit TCP_ALLOWED entry — check port
-        port = addr[1] if addr else 0
-        allowed_ports = TCP_ALLOWED[host]
-        if allowed_ports is None:
-            return  # any port allowed
-        for pr in allowed_ports:
-            if pr["port"] == port:
-                return  # this port explicitly allowed
-        # Port not in TCP_ALLOWED — block
+    if host and host in ALLOWED_HOSTS and host in URL_RULES:
+        # Host has http-only rules — check if raw TCP is permitted
+        if host in TCP_ALLOWED:
+            port = addr[1] if addr else 0
+            allowed_ports = TCP_ALLOWED[host]
+            if allowed_ports is None:
+                return  # any port allowed
+            for pr in allowed_ports:
+                if pr["port"] == port:
+                    return  # this port explicitly allowed
+            # Port not in TCP_ALLOWED — block
+            nextlayer.layer = RejectLayer(nextlayer.context)
+            return
+
+        # No TCP_ALLOWED entry — check if data looks like TLS or HTTP
+        if _is_http_or_tls(nextlayer.data_client()):
+            return  # TLS or HTTP — allow through
+
+        # Empty data or non-HTTP/TLS — block immediately
         nextlayer.layer = RejectLayer(nextlayer.context)
         return
 
-    # Host has http-only rules and no TCP_ALLOWED entry
-    # Check if data looks like TLS or HTTP — if so, allow through
-    data = nextlayer.data_client()
-
-    if starts_like_tls_record(data):
-        return  # TLS — mitmproxy will decrypt, http rules apply
-
-    if data and data[:8].split(b" ")[0].isalpha() and b" " in data[:16]:
-        return  # plain HTTP verb
-
-    # Empty data or non-HTTP/TLS — block immediately
-    nextlayer.layer = RejectLayer(nextlayer.context)
+    # No hostname match — check ALLOWED_CIDRS for http-only entries
+    if addr:
+        try:
+            ip_int = struct.unpack("!I", socket.inet_aton(addr[0]))[0]
+        except OSError:
+            return
+        for net_addr, prefix_len, http_rules in ALLOWED_CIDRS:
+            try:
+                net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
+            except OSError:
+                continue
+            mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+            if (ip_int & mask) == (net_int & mask):
+                if not http_rules:
+                    return  # CIDR with no http rules — allow raw TCP
+                # CIDR has http rules — check if TLS or HTTP
+                if _is_http_or_tls(nextlayer.data_client()):
+                    return  # TLS or HTTP — allow through
+                # Non-HTTP/TLS — block
+                nextlayer.layer = RejectLayer(nextlayer.context)
+                return
 
 
 def _effective_path(url_path, rule_path):
