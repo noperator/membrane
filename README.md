@@ -287,9 +287,12 @@ readonly:
 # `allow` lists what the agent is allowed to reach. Each entry is
 # auto-detected from its value:
 #
-#   hostname:  DNS-resolved, any port; traffic passes through mitmproxy
-#   IP:        added directly to firewall as /32; bypasses mitmproxy
-#   CIDR:      added directly to firewall; bypasses mitmproxy
+#   hostname:  DNS-resolved, any port; passes through mitmproxy with no
+#              method/path constraints unless http: is specified
+#   IP:        added directly to firewall as /32; passes through mitmproxy
+#              with no constraints unless http: is specified
+#   CIDR:      added directly to firewall; passes through mitmproxy with
+#              no constraints unless http: is specified
 #   URL:       DNS-resolved; method/path constraints enforced via mitmproxy
 #
 # Object form supports additional constraints. For hostnames, `ports`
@@ -305,7 +308,7 @@ allow:
   - dest: registry.mycompany.com
     ports: [443]
 
-  # IP and CIDR: bypass DNS, added directly to firewall
+  # IP and CIDR: bypass DNS, added directly to firewall; http: rules supported
   - 192.168.2.1
   - 192.168.3.0/24
 
@@ -357,10 +360,10 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 - [ ] optimize startup/teardown time
 - [ ] move tracee from dedicated sidecar into handler
 - [ ] per-session home dir overlay
-- [ ] support HTTP filters on IP dest
 
 <details><summary>Completed</summary>
 
+- [x] support HTTP filters on IP dest
 - [x] detect HTTP(S) via bytes vs ports
 - [x] support Docker-in-Docker on macOS
 - [x] whitelist HTTPS paths/endpoints with L7 method/path filtering

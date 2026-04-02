@@ -25,9 +25,12 @@ readonly:
 # `allow` lists what the agent is allowed to reach. Each entry is
 # auto-detected from its value:
 #
-#   hostname:  DNS-resolved, any port; traffic passes through mitmproxy
-#   IP:        added directly to firewall as /32; bypasses mitmproxy
-#   CIDR:      added directly to firewall; bypasses mitmproxy
+#   hostname:  DNS-resolved, any port; passes through mitmproxy with no
+#              method/path constraints unless http: is specified
+#   IP:        added directly to firewall as /32; passes through mitmproxy
+#              with no constraints unless http: is specified
+#   CIDR:      added directly to firewall; passes through mitmproxy with
+#              no constraints unless http: is specified
 #   URL:       DNS-resolved; method/path constraints enforced via mitmproxy
 #
 # Object form supports additional constraints. For hostnames, `ports`
@@ -37,7 +40,7 @@ readonly:
 # If no `http` key is present, all methods and paths are allowed.
 # For example:
 #
-#   - dest: hostname
+#   - dest: noperator.dev
 #     ports: [80, 443]
 #   - dest: https://api.example.com
 #     http:
@@ -45,6 +48,11 @@ readonly:
 #         paths:
 #           - messages        # relative to URL path: /v1/messages
 #           - /other/path     # absolute path
+#   - dest: 192.168.1.1
+#     http:
+#       - methods: [GET]
+#         paths:
+#           - /api/
 allow:
   # Anthropic
   - statsig.anthropic.com
