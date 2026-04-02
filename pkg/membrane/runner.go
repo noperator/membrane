@@ -80,6 +80,7 @@ func newSessionNames() sessionNames {
 func startSession(s sessionNames, cfg *config) (func(), string, error) {
 	cleanup := func() {
 		_ = exec.Command("docker", "stop", "-t", "2", s.handlerContainer).Run()
+		_ = exec.Command("docker", "rm", s.handlerContainer).Run()
 		_ = exec.Command("docker", "network", "rm", s.internalNetwork).Run()
 		_ = exec.Command("docker", "network", "rm", s.externalNetwork).Run()
 		_ = exec.Command("docker", "volume", "rm", s.caVolume).Run()
@@ -113,7 +114,7 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 	}
 
 	handlerArgs := []string{
-		"run", "-d", "--rm",
+		"run", "-d",
 		"--name", s.handlerContainer,
 		"--network", s.externalNetwork,
 		"--cap-add=NET_ADMIN",
@@ -121,6 +122,7 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		"-v", s.caVolume + ":/membrane-ca",
 		"-v", allowFile + ":/etc/membrane/allow.json:ro",
 		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.dnsResolver(),
+		"-e", fmt.Sprintf("MEMBRANE_SSL_INSECURE=%v", cfg.SSLInsecure),
 		handlerImageName,
 	}
 

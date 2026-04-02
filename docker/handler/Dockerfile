@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS builder
+FROM golang:1.23.2-alpine3.20 AS builder
 COPY dns-proxy/ /src/
 RUN cd /src && CGO_ENABLED=0 go build -o /dns-proxy .
 
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install mitmproxy --break-system-packages
+RUN pip3 install mitmproxy==12.2.1 --break-system-packages
 
 RUN mkdir -p /etc/membrane
 

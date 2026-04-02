@@ -5,9 +5,14 @@
 # Defaults to 1.1.1.1 if not set.
 dns_resolver:
 
+# `ssl_insecure` disables upstream TLS certificate verification in
+# mitmproxy. Useful for internal services with self-signed or private
+# CA certs. Disabled by default.
+ssl_insecure: false
+
 # `ignore` lists patterns matched against filenames or relative paths.
 # Matching files and directories are shadowed with an empty placeholder
-# inside the container — the agent can see they exist but cannot read
+# inside the container; the agent can see they exist but cannot read
 # their contents.
 ignore:
   - "*.bak"
@@ -23,47 +28,35 @@ readonly:
   - .membrane.yaml
 
 # `allow` lists what the agent is allowed to reach. Each entry is
-# auto-detected from its value:
-#   IP address  → /32 CIDR, any port
-#   CIDR        → CIDR range, any port
-#   hostname    → DNS-resolved, any port
-#   URL         → DNS-resolved, port from URL, L7 enforcement via mitmproxy
-#
-# Object form is also supported:
-#   - dest: hostname
-#     ports: [80, 443]
-#   - dest: https://api.example.com
-#     http:
-#       - methods: [POST]
-#         paths:
-#           - messages        # relative to URL path: /v1/messages
-#           - /other/path     # absolute path
+# auto-detected from its value: hostname, IP, CIDR, or URL. Object
+# form supports additional constraints via ports: and http: keys.
 allow:
   # Anthropic
-  - api.anthropic.com
-  - sentry.io
   - statsig.anthropic.com
+  - api.anthropic.com
+  - platform.claude.com
   - statsig.com
+  - sentry.io
 
   # Node.js/npm
   - registry.npmjs.org
   - deb.nodesource.com
 
   # Python packages
-  - pypi.org
   - files.pythonhosted.org
+  - pypi.org
 
   # Go packages
-  - dl.google.com
-  - go.dev
   - golang.org
   - google.golang.org
+  - sum.golang.org
+  - proxy.golang.org
+  - dl.google.com
+  - storage.googleapis.com
   - gopkg.in
   - goproxy.io
+  - go.dev
   - pkg.go.dev
-  - proxy.golang.org
-  - storage.googleapis.com
-  - sum.golang.org
 
   # Rust packages
   - crates.io
@@ -71,20 +64,23 @@ allow:
   - index.crates.io
 
   # Ubuntu/Debian packages
+  - deb.debian.org
   - archive.ubuntu.com
-  - security.ubuntu.com
   - ports.ubuntu.com
+  - security.ubuntu.com
 
   # Ubuntu PPAs (deadsnakes, golang-backports, etc.)
-  - ppa.launchpadcontent.net
   - launchpad.net
+  - api.launchpad.net
+  - ppa.launchpadcontent.net
 
   # GitHub
   - github.com
-  - api.github.com
   - codeload.github.com
-  - raw.githubusercontent.com
+  - api.github.com
   - objects.githubusercontent.com
+  - release-assets.githubusercontent.com
+  - raw.githubusercontent.com
 
   # GitLab
   - gitlab.com
@@ -99,11 +95,11 @@ allow:
   - openrouter.ai
 
   # Docker Hub
-  - registry-1.docker.io
-  - auth.docker.io
-  - production.cloudflare.docker.com
   - docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
   - hub.docker.com
+  - production.cloudflare.docker.com
+  - registry-1.docker.io
+  - auth.docker.io
 
   # Cloudflare
   - cloudflare-dns.com
@@ -114,21 +110,14 @@ allow:
   # AWS Bedrock - North America
   - bedrock-runtime.us-east-1.amazonaws.com
   - bedrock.us-east-1.amazonaws.com
-  - bedrock-runtime.us-east-2.amazonaws.com
-  - bedrock.us-east-2.amazonaws.com
   - bedrock-runtime.us-west-1.amazonaws.com
   - bedrock.us-west-1.amazonaws.com
+  - bedrock-runtime.us-east-2.amazonaws.com
+  - bedrock.us-east-2.amazonaws.com
   - bedrock-runtime.us-west-2.amazonaws.com
   - bedrock.us-west-2.amazonaws.com
 
-# `args` lists raw arguments appended to the `docker run` command that
-# launches the agent container. Use this to pass environment variables,
-# additional mounts, port mappings, or anything else accepted by
-# `docker run`. Environment variables are expanded ($VAR, ${VAR})
-# anywhere in a value, including mid-string (e.g. MY_PATH=$HOME/mydir).
-# Shell command substitution ($(...)) is not supported — set secrets in
-# your shell environment first and reference them here. Values are
-# passed directly to `docker run` without shell interpretation. Do not
-# add shell-style quoting around values — quotes are treated as literal
-# characters. Each flag and its argument must be separate list items.
+# `args` lists raw arguments appended to the `docker run` command.
+# Environment variables are expanded ($VAR, ${VAR}). Each flag and
+# its argument must be separate items.
 args:

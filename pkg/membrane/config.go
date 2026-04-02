@@ -14,6 +14,7 @@ import (
 
 type config struct {
 	DNSResolver string      `yaml:"dns_resolver"`
+	SSLInsecure bool        `yaml:"ssl_insecure"`
 	Ignore      []string    `yaml:"ignore"`
 	Readonly    []string    `yaml:"readonly"`
 	Args        []string    `yaml:"args"`
@@ -27,13 +28,20 @@ func (c *config) dnsResolver() string {
 	return "1.1.1.1"
 }
 
+// portRule is a port with an explicit transport protocol.
+// Proto is "tcp" or "udp"; Port is the port number.
+type portRule struct {
+	Port  int    `json:"port"`
+	Proto string `json:"proto"` // "tcp" or "udp"
+}
+
 // AllowRule represents a single entry in the allow list.
 // Type is one of "cidr", "host", or "url".
 type AllowRule struct {
 	Type   string     `json:"type"`
 	CIDR   string     `json:"cidr,omitempty"`
 	Host   string     `json:"host,omitempty"`
-	Ports  []int      `json:"ports,omitempty"` // nil = any port
+	Ports  []portRule `json:"ports,omitempty"` // nil = any port
 	Scheme string     `json:"scheme,omitempty"`
 	Path   string     `json:"path,omitempty"`
 	HTTP   []HTTPRule `json:"http,omitempty"`
@@ -87,11 +95,11 @@ func (r *AllowRule) parseAuto(s string) error {
 			if err != nil {
 				return fmt.Errorf("invalid port in URL %q: %w", s, err)
 			}
-			r.Ports = []int{p}
+			r.Ports = []portRule{{Port: p, Proto: "tcp"}}
 		} else if u.Scheme == "https" {
-			r.Ports = []int{443}
+			r.Ports = []portRule{{Port: 443, Proto: "tcp"}}
 		} else if u.Scheme == "http" {
-			r.Ports = []int{80}
+			r.Ports = []portRule{{Port: 80, Proto: "tcp"}}
 		}
 		if r.Path != "" && r.Path != "/" {
 			r.HTTP = []HTTPRule{
@@ -108,7 +116,7 @@ func (r *AllowRule) parseAuto(s string) error {
 		if err != nil {
 			return fmt.Errorf("invalid port in %q: %w", s, err)
 		}
-		r.Ports = []int{p}
+		r.Ports = []portRule{{Port: p, Proto: "tcp"}}
 	} else {
 		r.Host = s
 	}
@@ -142,11 +150,11 @@ func (r *AllowRule) parseMappingNode(value *yaml.Node) error {
 
 	if portsNode != nil {
 		for _, n := range portsNode.Content {
-			p, err := strconv.Atoi(n.Value)
+			pr, err := parsePort(n.Value)
 			if err != nil {
 				return fmt.Errorf("invalid port %q: %w", n.Value, err)
 			}
-			r.Ports = appendUniqueInt(r.Ports, p)
+			r.Ports = appendUniquePort(r.Ports, pr)
 		}
 	}
 
@@ -175,13 +183,32 @@ func (r *AllowRule) parseMappingNode(value *yaml.Node) error {
 	return nil
 }
 
-func appendUniqueInt(s []int, v int) []int {
+// parsePort parses a port specifier of the form "443", "443/tcp", or "443/udp".
+// A bare integer defaults to TCP. Proto must be "tcp" or "udp".
+func parsePort(s string) (portRule, error) {
+	proto := "tcp"
+	portStr := s
+	if idx := strings.LastIndex(s, "/"); idx >= 0 {
+		portStr = s[:idx]
+		proto = s[idx+1:]
+		if proto != "tcp" && proto != "udp" {
+			return portRule{}, fmt.Errorf("invalid protocol %q: must be tcp or udp", proto)
+		}
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return portRule{}, fmt.Errorf("invalid port number %q: %w", portStr, err)
+	}
+	return portRule{Port: p, Proto: proto}, nil
+}
+
+func appendUniquePort(s []portRule, pr portRule) []portRule {
 	for _, x := range s {
-		if x == v {
+		if x == pr {
 			return s
 		}
 	}
-	return append(s, v)
+	return append(s, pr)
 }
 
 // ParseAllowEntry parses a raw CLI --allow string into an AllowRule.

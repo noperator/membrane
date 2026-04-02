@@ -41,25 +41,46 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 DNS_RESOLVER="${MEMBRANE_DNS_RESOLVER:-1.1.1.1}"
 ALLOW_FILE="${MEMBRANE_ALLOW_FILE:-/etc/membrane/allow.json}"
 
-# Extract CIDRs from allow file for initial nftables population
-# Hostnames are resolved dynamically by dns-proxy at query time
-CIDRS=$(python3 -c "
+# Extract CIDRs from allow file for initial nftables population.
+# CIDRs without ports → @allowed-any-port (TCP only via forward rule).
+# CIDRs with ports → @allowed (ip . proto . port).
+# Hostnames are resolved dynamically by dns-proxy at query time.
+read -r -d '' _EXTRACT_CIDRS <<'PYEOF' || true
 import json, sys
-with open('$ALLOW_FILE') as f:
+with open(sys.argv[1]) as f:
     rules = json.load(f)
+any_port = []
+port_constrained = []
 for r in rules:
     if r.get('type') == 'cidr' and r.get('cidr'):
-        print(r['cidr'])
-" 2>/dev/null)
+        ports = r.get('ports') or []
+        if not ports:
+            any_port.append(r['cidr'])
+        else:
+            for p in ports:
+                port_constrained.append(f"{r['cidr']} . {p['proto']} . {p['port']}")
+print('ANY_PORT=' + ','.join(any_port))
+print('PORT_CONSTRAINED=' + ','.join(port_constrained))
+PYEOF
+ANY_PORT=$(python3 -c "$_EXTRACT_CIDRS" "$ALLOW_FILE" 2>/dev/null | grep '^ANY_PORT=' | cut -d= -f2-)
+PORT_CONSTRAINED=$(python3 -c "$_EXTRACT_CIDRS" "$ALLOW_FILE" 2>/dev/null | grep '^PORT_CONSTRAINED=' | cut -d= -f2-)
 
-ALL_IPS=$(echo "$CIDRS" | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
-
-[ -n "$ALL_IPS" ] || ALL_IPS="127.0.0.2/32"
+[ -n "$ANY_PORT" ] || ANY_PORT="127.0.0.2/32"
 
 MITMPROXY_PORT=8080
 
-# Build elements clause conditionally (nftables requires non-empty elements list)
-ANY_PORT_ELEMENTS="elements = { $ALL_IPS }"
+SSL_INSECURE_FLAG=""
+if [ "${MEMBRANE_SSL_INSECURE:-false}" = "true" ]; then
+    SSL_INSECURE_FLAG="--ssl-insecure"
+fi
+
+# Build elements clauses (nftables requires non-empty elements list)
+ANY_PORT_ELEMENTS="elements = { $ANY_PORT }"
+if [ -n "$PORT_CONSTRAINED" ]; then
+    ALLOWED_ELEMENTS="elements = { $PORT_CONSTRAINED }"
+else
+    ALLOWED_ELEMENTS=""
+fi
 
 # Set up nftables
 nft -f - <<EOF
@@ -67,7 +88,9 @@ table ip membrane
 delete table ip membrane
 table ip membrane {
     set allowed {
-        type ipv4_addr . inet_service
+        type ipv4_addr . inet_proto . inet_service
+        flags interval
+        $ALLOWED_ELEMENTS
     }
 
     set allowed-any-port {
@@ -78,8 +101,9 @@ table ip membrane {
 
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
-        iifname "$INTERNAL_IF" ip daddr @allowed-any-port tcp dport { 80, 443 } redirect to :$MITMPROXY_PORT
-        iifname "$INTERNAL_IF" ip daddr . tcp dport @allowed redirect to :$MITMPROXY_PORT
+        iifname "$INTERNAL_IF" ip daddr @allowed-any-port meta l4proto tcp redirect to :$MITMPROXY_PORT
+        iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed meta l4proto tcp redirect to :$MITMPROXY_PORT
+        iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed meta l4proto udp accept
     }
 
     chain postrouting {
@@ -96,9 +120,8 @@ table ip membrane {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
         tcp flags syn tcp option maxseg size set rt mtu
-        iifname "$INTERNAL_IF" udp dport 53 accept
-        iifname "$INTERNAL_IF" ip daddr @allowed-any-port accept
-        iifname "$INTERNAL_IF" ip daddr . tcp dport @allowed accept
+        iifname "$INTERNAL_IF" ip daddr @allowed-any-port meta l4proto tcp accept
+        iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed accept
         iifname "$INTERNAL_IF" log prefix "[membrane BLOCKED] " limit rate 5/second
         iifname "$INTERNAL_IF" reject with icmp admin-prohibited
     }
@@ -106,6 +129,11 @@ table ip membrane {
 EOF
 
 echo "Firewall rules loaded."
+
+# Block all IPv6 forwarding as a safety net — all nftables rules are
+# IPv4 only so any IPv6 traffic would otherwise be unfiltered.
+ip6tables -P FORWARD DROP 2>/dev/null || true
+ip6tables -P OUTPUT DROP 2>/dev/null || true
 
 # Start DNS proxy (updates nftables sets on resolution)
 MEMBRANE_DNS_RESOLVER="$DNS_RESOLVER" MEMBRANE_ALLOW_FILE="$ALLOW_FILE" dns-proxy &
@@ -127,7 +155,8 @@ mitmdump \
     --mode transparent \
     --listen-port "$MITMPROXY_PORT" \
     --set confdir=/tmp/mitmproxy \
-    --ssl-insecure \
+    $SSL_INSECURE_FLAG \
+    --set rawtcp=true \
     -s /addon.py \
     &
 

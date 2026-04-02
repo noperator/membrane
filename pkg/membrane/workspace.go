@@ -1,11 +1,31 @@
 package membrane
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+func validateConfig(cfg *config) error {
+	for _, ignore := range cfg.Ignore {
+		iTrimmed := strings.TrimRight(ignore, "/")
+		if !strings.Contains(iTrimmed, "/") {
+			continue
+		}
+		for _, readonly := range cfg.Readonly {
+			rTrimmed := strings.TrimRight(readonly, "/")
+			if iTrimmed == rTrimmed {
+				continue
+			}
+			if strings.HasPrefix(iTrimmed, rTrimmed+"/") {
+				return fmt.Errorf("ignore pattern %q is nested inside readonly pattern %q — this conflict cannot be enforced; remove one of the conflicting rules", ignore, readonly)
+			}
+		}
+	}
+	return nil
+}
 
 type mount struct {
 	hostPath      string
@@ -20,6 +40,10 @@ type mounts struct {
 // scan walks workspaceDir and applies ignore/readonly patterns from cfg.
 // Returns the full set of overlay mounts to pass to docker run.
 func scan(workspaceDir string, cfg *config) (*mounts, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	// Create temp empty file and dir for shadowing ignored paths.
 	// Not cleaned up: syscall.Exec replaces this process so defers won't
 	// run, and the OS handles /tmp cleanup.
@@ -99,9 +123,8 @@ func scan(workspaceDir string, cfg *config) (*mounts, error) {
 				containerPath: "/workspace/" + relPath,
 				empty:         false,
 			})
-			if d.IsDir() {
-				return fs.SkipDir
-			}
+			// Do not SkipDir — continue walking so nested ignore patterns
+			// can still be evaluated and shadow mounts added for them.
 			return nil
 		}
 
@@ -128,12 +151,13 @@ func isInsideExcludedDir(relPath string, excludedDirs []string) bool {
 // Name-based patterns match against just the filename.
 func matchesAny(relPath, name string, patterns []string) bool {
 	for _, pattern := range patterns {
-		if strings.Contains(pattern, "/") {
-			if matched, _ := filepath.Match(pattern, relPath); matched {
+		trimmed := strings.TrimRight(pattern, "/")
+		if strings.Contains(trimmed, "/") {
+			if matched, _ := filepath.Match(trimmed, relPath); matched {
 				return true
 			}
 		} else {
-			if matched, _ := filepath.Match(pattern, name); matched {
+			if matched, _ := filepath.Match(trimmed, name); matched {
 				return true
 			}
 		}

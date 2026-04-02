@@ -12,21 +12,28 @@ import (
 	"time"
 )
 
+const reverseMapFile = "/tmp/membrane-dns-map.json"
+
+type portRule struct {
+	Port  int    `json:"port"`
+	Proto string `json:"proto"` // "tcp" or "udp"
+}
+
 type allowRule struct {
-	Type  string `json:"type"`
-	Host  string `json:"host"`
-	Ports []int  `json:"ports"`
+	Type  string     `json:"type"`
+	Host  string     `json:"host"`
+	Ports []portRule `json:"ports"`
 }
 
 // buildAllowedHosts parses MEMBRANE_ALLOW JSON and returns a map of
 // hostname → allowed ports. A nil ports slice means any port is allowed.
-func buildAllowedHosts(allowJSON string) map[string][]int {
+func buildAllowedHosts(allowJSON string) map[string][]portRule {
 	var rules []allowRule
 	if err := json.Unmarshal([]byte(allowJSON), &rules); err != nil {
 		log.Printf("dns-proxy: parse MEMBRANE_ALLOW: %v", err)
-		return make(map[string][]int)
+		return make(map[string][]portRule)
 	}
-	allowed := make(map[string][]int)
+	allowed := make(map[string][]portRule)
 	for _, r := range rules {
 		if r.Type != "host" && r.Type != "url" {
 			continue
@@ -42,13 +49,31 @@ func buildAllowedHosts(allowJSON string) map[string][]int {
 		if len(r.Ports) == 0 {
 			allowed[host] = nil
 		} else {
-			allowed[host] = appendUniqueInts(allowed[host], r.Ports...)
+			allowed[host] = appendUniquePorts(allowed[host], r.Ports...)
 		}
 	}
 	return allowed
 }
 
-func appendUniqueInts(s []int, vals ...int) []int {
+func updateReverseMap(ip, hostname string) {
+	existing := map[string]string{}
+	if data, err := os.ReadFile(reverseMapFile); err == nil {
+		json.Unmarshal(data, &existing)
+	}
+	existing[ip] = hostname
+
+	tmp := reverseMapFile + ".tmp"
+	data, err := json.Marshal(existing)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	os.Rename(tmp, reverseMapFile)
+}
+
+func appendUniquePorts(s []portRule, vals ...portRule) []portRule {
 	for _, v := range vals {
 		found := false
 		for _, x := range s {
@@ -108,7 +133,48 @@ func main() {
 	}
 }
 
-func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed map[string][]int) {
+func extractQueryName(pkt []byte) string {
+	if len(pkt) < 12 {
+		return ""
+	}
+	if binary.BigEndian.Uint16(pkt[4:6]) == 0 {
+		return ""
+	}
+	name, _ := parseDNSName(pkt, 12)
+	return strings.TrimRight(strings.ToLower(name), ".")
+}
+
+func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed map[string][]portRule) {
+	// Reject packets with more than one question — we only validate the
+	// first question name, so additional questions are an exfiltration
+	// channel. Standard DNS always uses QDCOUNT=1.
+	if len(query) >= 6 && binary.BigEndian.Uint16(query[4:6]) != 1 {
+		resp := make([]byte, len(query))
+		copy(resp, query)
+		resp[2] = (query[2] & 0x01) | 0x80
+		resp[3] = 0x83
+		resp[6], resp[7] = 0, 0
+		resp[8], resp[9] = 0, 0
+		resp[10], resp[11] = 0, 0
+		conn.WriteToUDP(resp, clientAddr)
+		log.Printf("dns-proxy: blocked multi-question packet from %s", clientAddr)
+		return
+	}
+
+	name := extractQueryName(query)
+	if _, ok := allowed[name]; !ok {
+		resp := make([]byte, len(query))
+		copy(resp, query)
+		resp[2] = (query[2] & 0x01) | 0x80 // QR=1 (response), preserve RD bit
+		resp[3] = 0x83                     // RA=1, RCODE=3 (NXDOMAIN)
+		resp[6], resp[7] = 0, 0            // ANCOUNT = 0
+		resp[8], resp[9] = 0, 0            // NSCOUNT = 0
+		resp[10], resp[11] = 0, 0          // ARCOUNT = 0
+		conn.WriteToUDP(resp, clientAddr)
+		log.Printf("dns-proxy: blocked %s (not in allow list)", name)
+		return
+	}
+
 	upstreamAddr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Printf("dns-proxy: resolve upstream: %v", err)
@@ -147,15 +213,17 @@ func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstr
 						"allowed-any-port", "{", ip.String()+"/32", "}").Run(); err != nil {
 						log.Printf("dns-proxy: nft add %s to allowed-any-port: %v", ip, err)
 					}
+					updateReverseMap(ip.String(), name)
 				} else {
-					// port-constrained: add ip . port pairs
-					for _, port := range ports {
-						elem := fmt.Sprintf("%s . %d", ip.String(), port)
+					// port-constrained: add ip . proto . port triples
+					for _, pr := range ports {
+						elem := fmt.Sprintf("%s . %s . %d", ip.String(), pr.Proto, pr.Port)
 						if err := exec.Command("nft", "add", "element", "ip", "membrane",
 							"allowed", "{", elem, "}").Run(); err != nil {
 							log.Printf("dns-proxy: nft add %s to allowed: %v", elem, err)
 						}
 					}
+					updateReverseMap(ip.String(), name)
 				}
 			}
 			log.Printf("dns-proxy: %s → %v (ports=%v)", name, ips, ports)
