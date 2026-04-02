@@ -14,6 +14,7 @@ import (
 
 type config struct {
 	DNSResolver string      `yaml:"dns_resolver"`
+	SSLInsecure bool        `yaml:"ssl_insecure"`
 	Ignore      []string    `yaml:"ignore"`
 	Readonly    []string    `yaml:"readonly"`
 	Args        []string    `yaml:"args"`

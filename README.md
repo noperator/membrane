@@ -265,10 +265,6 @@ Configuration is YAML and works at two levels:
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
-# Defaults to 1.1.1.1 if not set.
-dns_resolver: 1.1.1.1
-
 # `ignore` lists patterns matched against filenames or relative paths.
 # Matching files and directories are shadowed with an empty placeholder
 # inside the container; the agent can see they exist but cannot read
@@ -360,6 +356,7 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 - [ ] optimize startup/teardown time
 - [ ] move tracee from dedicated sidecar into handler
 - [ ] per-session home dir overlay
+- [ ] support trusting specific CA certs
 
 <details><summary>Completed</summary>
 

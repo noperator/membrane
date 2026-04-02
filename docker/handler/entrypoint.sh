@@ -69,6 +69,11 @@ PORT_CONSTRAINED=$(python3 -c "$_EXTRACT_CIDRS" "$ALLOW_FILE" 2>/dev/null | grep
 
 MITMPROXY_PORT=8080
 
+SSL_INSECURE_FLAG=""
+if [ "${MEMBRANE_SSL_INSECURE:-false}" = "true" ]; then
+    SSL_INSECURE_FLAG="--ssl-insecure"
+fi
+
 # Build elements clauses (nftables requires non-empty elements list)
 ANY_PORT_ELEMENTS="elements = { $ANY_PORT }"
 if [ -n "$PORT_CONSTRAINED" ]; then
@@ -150,7 +155,7 @@ mitmdump \
     --mode transparent \
     --listen-port "$MITMPROXY_PORT" \
     --set confdir=/tmp/mitmproxy \
-    --ssl-insecure \
+    $SSL_INSECURE_FLAG \
     --set rawtcp=true \
     -s /addon.py \
     &

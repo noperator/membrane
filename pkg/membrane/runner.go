@@ -121,6 +121,7 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		"-v", s.caVolume + ":/membrane-ca",
 		"-v", allowFile + ":/etc/membrane/allow.json:ro",
 		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.dnsResolver(),
+		"-e", fmt.Sprintf("MEMBRANE_SSL_INSECURE=%v", cfg.SSLInsecure),
 		handlerImageName,
 	}
 

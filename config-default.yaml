@@ -5,6 +5,11 @@
 # Defaults to 1.1.1.1 if not set.
 dns_resolver:
 
+# `ssl_insecure` disables upstream TLS certificate verification in
+# mitmproxy. Useful for internal services with self-signed or private
+# CA certs. Disabled by default.
+ssl_insecure: false
+
 # `ignore` lists patterns matched against filenames or relative paths.
 # Matching files and directories are shadowed with an empty placeholder
 # inside the container; the agent can see they exist but cannot read
