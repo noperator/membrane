@@ -265,7 +265,8 @@ Configuration is YAML and works at two levels:
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# `dns_resolver` is the upstream DNS resolver. Defaults to 1.1.1.1.
+# `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
+# Defaults to 1.1.1.1 if not set.
 dns_resolver: 1.1.1.1
 
 # `ignore` lists patterns matched against filenames or relative paths.
@@ -276,17 +277,20 @@ ignore:
   - secrets/
   - "*.pem"
 
-# `readonly` lists patterns mounted into the container as read-only.
+# `readonly` lists patterns mounted into the container as read-only. Use
+# this for things like .git (so the agent can read history but not
+# rewrite it) or credential files that should be visible but not
+# writable.
 readonly:
   - config/
 
 # `allow` lists what the agent is allowed to reach. Each entry is
 # auto-detected from its value:
 #
-#   hostname:  DNS-resolved, any port, no L7 filtering
-#   IP:        added directly to firewall as /32
-#   CIDR:      added directly to firewall
-#   URL:       DNS-resolved, port from scheme, L7 filtering via mitmproxy
+#   hostname:  DNS-resolved, any port; traffic passes through mitmproxy
+#   IP:        added directly to firewall as /32; bypasses mitmproxy
+#   CIDR:      added directly to firewall; bypasses mitmproxy
+#   URL:       DNS-resolved; method/path constraints enforced via mitmproxy
 #
 # Object form supports additional constraints. For hostnames, `ports`
 # restricts to specific ports. For URLs, `http` enables L7 enforcement:
@@ -294,7 +298,7 @@ readonly:
 # Paths without a leading `/` are relative to the URL's path prefix.
 # If no `http` key is present, all methods and paths are allowed.
 allow:
-  # plain hostname: any port, any method, passthrough
+  # plain hostname: any port, any method/path allowed; goes through mitmproxy
   - internal.mycompany.com
 
   # hostname with port restriction
@@ -350,12 +354,14 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 
 - [ ] support Docker checkpoint
 - [ ] support wildcard hostnames
-- [ ] detect HTTP(S) via bytes vs ports
 - [ ] optimize startup/teardown time
 - [ ] move tracee from dedicated sidecar into handler
+- [ ] per-session home dir overlay
+- [ ] support HTTP filters on IP dest
 
 <details><summary>Completed</summary>
 
+- [x] detect HTTP(S) via bytes vs ports
 - [x] support Docker-in-Docker on macOS
 - [x] whitelist HTTPS paths/endpoints with L7 method/path filtering
 - [x] pass config via CLI (in addition to file)
