@@ -217,6 +217,47 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		time.Sleep(time.Second)
 	}
 
+	// Persist handler logs to ~/.membrane/logs/<handler-container>.log
+	// during the session, gzipped on cleanup. Mirrors the trace file
+	// pattern in tracer.go — preserves logs after the session ends so
+	// failures can be investigated post-hoc.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return cleanup, "", fmt.Errorf("get home dir: %w", err)
+	}
+	logDir := filepath.Join(home, ".membrane", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return cleanup, "", fmt.Errorf("create handler log dir: %w", err)
+	}
+	logPath := filepath.Join(logDir, s.handlerContainer+".log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
+	}
+
+	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
+	logCmd.Stdout = logFile
+	logCmd.Stderr = logFile
+	if err := logCmd.Start(); err != nil {
+		logFile.Close()
+		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "membrane: handler logs -> %s (gzipped on exit)\n", logPath)
+
+	prevCleanup2 := cleanup
+	cleanup = func() {
+		if logCmd.Process != nil {
+			_ = logCmd.Process.Kill()
+		}
+		_ = logCmd.Wait()
+		logFile.Close()
+		if err := gzipFile(logPath + ".gz"); err == nil {
+			os.Remove(logPath)
+		}
+		prevCleanup2()
+	}
+
 	out, err = exec.Command("docker", "inspect", "-f",
 		fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}",
 			s.internalNetwork),
