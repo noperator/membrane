@@ -108,7 +108,7 @@ func injectDockerUserRule(internalNetworkID string) (string, error) {
 	if _, err := exec.LookPath("sudo"); err != nil {
 		return "", nil
 	}
-	if err := exec.Command("sudo", "iptables", "-I", "DOCKER-USER",
+	if err := exec.Command("sudo", "iptables", "--wait", "-I", "DOCKER-USER",
 		"-i", bridge, "-j", "ACCEPT").Run(); err != nil {
 		return "", fmt.Errorf("inject DOCKER-USER rule: %w", err)
 	}
@@ -120,7 +120,7 @@ func removeDockerUserRule(bridge string) {
 		return
 	}
 	// Ignore errors — rule may already be gone if Docker restarted
-	_ = exec.Command("sudo", "iptables", "-D", "DOCKER-USER",
+	_ = exec.Command("sudo", "iptables", "--wait", "-D", "DOCKER-USER",
 		"-i", bridge, "-j", "ACCEPT").Run()
 }
 
