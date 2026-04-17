@@ -197,6 +197,15 @@ def next_layer(nextlayer: proxy_layer.NextLayer) -> None:
     if has_unconstrained:
         return  # raw TCP permitted
 
+    # If TLS has already been established for this connection, we've
+    # committed to the HTTP path. The decrypted buffer may be transiently
+    # empty at inner layer boundaries (especially for HTTP/2 before the
+    # preface arrives); byte-sniffing it would spuriously reject valid
+    # flows. Let mitmproxy pick the inner layer.
+    layer_names = [type(l).__name__ for l in nextlayer.context.layers]
+    if "ClientTLSLayer" in layer_names:
+        return
+
     # All matching rules require HTTP/TLS; check bytes.
     if _is_http_or_tls(nextlayer.data_client()):
         return  # HTTP/TLS — allow through
@@ -287,3 +296,9 @@ def request(flow: mhttp.HTTPFlow) -> None:
         b"",
         {"Content-Type": "text/plain"},
     )
+
+
+# Signal to entrypoint.sh that the addon has fully loaded.
+# Must come at the bottom of the module — anything after this line
+# would not be initialized when the file appears.
+open("/tmp/mitmproxy-addon-loaded", "w").close()
