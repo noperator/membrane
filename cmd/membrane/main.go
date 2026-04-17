@@ -20,11 +20,12 @@ func main() {
 	allow := flag.StringArrayP("allow", "a", []string{}, "allow rule: hostname, IP, CIDR, or URL (repeatable)")
 	arg := flag.StringArray("arg", []string{}, "extra docker run argument (repeatable)")
 	dnsResolver := flag.String("dns-resolver", "", "DNS resolver (overrides config file)")
+	sessionIDFile := flag.String("session-id-file", "", "write session ID to this file on startup (for test harnesses)")
 	var reset stringFlag
 	flag.Var(&reset, "reset", "remove membrane state and exit (c=containers, i=image, d=directory)")
 	flag.Lookup("reset").NoOptDefVal = "cid"
 	optionFlags := flag.NewFlagSet("", flag.ContinueOnError)
-	for _, name := range []string{"no-trace", "no-update", "reset", "trace-log"} {
+	for _, name := range []string{"no-trace", "no-update", "reset", "session-id-file", "trace-log"} {
 		optionFlags.AddFlag(flag.Lookup(name))
 	}
 	configFlags := flag.NewFlagSet("", flag.ContinueOnError)
@@ -69,7 +70,7 @@ func main() {
 		DNSResolver: *dnsResolver,
 	}
 
-	if err := membrane.Run(*noUpdate, !*noTrace, *traceLog, flag.Args(), cli); err != nil {
+	if err := membrane.Run(*noUpdate, !*noTrace, *traceLog, *sessionIDFile, flag.Args(), cli); err != nil {
 		var exitErr *membrane.ExitError
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.Code)

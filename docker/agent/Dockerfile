@@ -39,9 +39,10 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
 
 # Go
 ARG GO_VERSION=1.23.2
-RUN wget "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" && \
-    tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz" && \
-    rm "go${GO_VERSION}.linux-amd64.tar.gz"
+RUN ARCH=$(dpkg --print-architecture) && \
+    wget "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" && \
+    tar -C /usr/local -xzf "go${GO_VERSION}.linux-${ARCH}.tar.gz" && \
+    rm "go${GO_VERSION}.linux-${ARCH}.tar.gz"
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # =============================================================================

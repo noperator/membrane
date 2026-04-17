@@ -74,6 +74,56 @@ func newSessionNames() sessionNames {
 	}
 }
 
+// brNetfilterLoaded reports whether the br_netfilter kernel module is
+// currently loaded. When loaded, bridge traffic passes through the host's
+// iptables FORWARD chain, which can cause DOCKER-ISOLATION-STAGE-1 to drop
+// membrane's proxied traffic. See injectDockerUserRule.
+func brNetfilterLoaded() bool {
+	data, err := os.ReadFile("/proc/modules")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "br_netfilter ") {
+			return true
+		}
+	}
+	return false
+}
+
+// injectDockerUserRule inserts an iptables rule into DOCKER-USER that allows
+// forwarded traffic from the membrane internal bridge. This is necessary when
+// br_netfilter is loaded on the host (Docker versions prior to 27.3.1 loaded
+// it automatically), which causes DOCKER-ISOLATION-STAGE-1 to drop packets
+// from --internal networks destined for external IPs — silently breaking
+// membrane's transparent proxy. DOCKER-USER is evaluated before
+// DOCKER-ISOLATION-STAGE-1, so an ACCEPT here prevents the DROP from firing.
+//
+// Returns ("", nil) if sudo is not available — non-fatal.
+func injectDockerUserRule(internalNetworkID string) (string, error) {
+	if len(internalNetworkID) < 12 {
+		return "", fmt.Errorf("unexpected network ID %q", internalNetworkID)
+	}
+	bridge := "br-" + internalNetworkID[:12]
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return "", nil
+	}
+	if err := exec.Command("sudo", "iptables", "--wait", "-I", "DOCKER-USER",
+		"-i", bridge, "-j", "ACCEPT").Run(); err != nil {
+		return "", fmt.Errorf("inject DOCKER-USER rule: %w", err)
+	}
+	return bridge, nil
+}
+
+func removeDockerUserRule(bridge string) {
+	if bridge == "" {
+		return
+	}
+	// Ignore errors — rule may already be gone if Docker restarted
+	_ = exec.Command("sudo", "iptables", "--wait", "-D", "DOCKER-USER",
+		"-i", bridge, "-j", "ACCEPT").Run()
+}
+
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
@@ -97,19 +147,36 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		return cleanup, "", fmt.Errorf("create network %s: %s: %w",
 			s.externalNetwork, out, err)
 	}
-	if out, err := exec.Command("docker", "network", "create",
-		"--internal", s.internalNetwork).CombinedOutput(); err != nil {
+
+	out, err := exec.Command("docker", "network", "create",
+		"--internal", s.internalNetwork).CombinedOutput()
+	if err != nil {
 		return cleanup, "", fmt.Errorf("create network %s: %s: %w",
 			s.internalNetwork, out, err)
+	}
+	networkID := strings.TrimSpace(string(out))
+
+	var bridge string
+	if brNetfilterLoaded() {
+		fmt.Fprintf(os.Stderr, "membrane: br_netfilter detected; requesting sudo to add iptables rule for transparent proxy\n")
+		bridge, err = injectDockerUserRule(networkID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not inject DOCKER-USER rule: %v\n", err)
+		}
+	}
+	origCleanup := cleanup
+	cleanup = func() {
+		removeDockerUserRule(bridge)
+		origCleanup()
 	}
 
 	allowFile, err := writeAllowFile(cfg.Allow)
 	if err != nil {
 		return cleanup, "", fmt.Errorf("write allow file: %w", err)
 	}
-	origCleanup := cleanup
+	prevCleanup := cleanup
 	cleanup = func() {
-		origCleanup()
+		prevCleanup()
 		os.Remove(allowFile)
 	}
 
@@ -150,7 +217,46 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		time.Sleep(time.Second)
 	}
 
-	out, err := exec.Command("docker", "inspect", "-f",
+	// Persist handler logs to ~/.membrane/logs/<handler-container>.log
+	// during the session, gzipped on cleanup. Mirrors the trace file
+	// pattern in tracer.go — preserves logs after the session ends so
+	// failures can be investigated post-hoc.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return cleanup, "", fmt.Errorf("get home dir: %w", err)
+	}
+	logDir := filepath.Join(home, ".membrane", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return cleanup, "", fmt.Errorf("create handler log dir: %w", err)
+	}
+	logPath := filepath.Join(logDir, s.handlerContainer+".log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
+	}
+
+	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
+	logCmd.Stdout = logFile
+	logCmd.Stderr = logFile
+	if err := logCmd.Start(); err != nil {
+		logFile.Close()
+		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
+	}
+
+	prevCleanup2 := cleanup
+	cleanup = func() {
+		if logCmd.Process != nil {
+			_ = logCmd.Process.Kill()
+		}
+		_ = logCmd.Wait()
+		logFile.Close()
+		if err := gzipFile(logPath + ".gz"); err == nil {
+			os.Remove(logPath)
+		}
+		prevCleanup2()
+	}
+
+	out, err = exec.Command("docker", "inspect", "-f",
 		fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}",
 			s.internalNetwork),
 		s.handlerContainer).Output()

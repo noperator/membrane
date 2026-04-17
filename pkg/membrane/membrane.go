@@ -25,7 +25,7 @@ type CLIOverrides struct {
 
 // Run is the main entry point called from cmd/membrane/main.go.
 // passthrough args are forwarded as the container command.
-func Run(noUpdate bool, trace bool, traceLog string, passthrough []string, cli CLIOverrides) error {
+func Run(noUpdate bool, trace bool, traceLog string, sessionIDFile string, passthrough []string, cli CLIOverrides) error {
 
 	if runtime.GOOS == "darwin" {
 		os.Setenv("DOCKER_CONTEXT", "colima-membrane")
@@ -97,6 +97,12 @@ func Run(noUpdate bool, trace bool, traceLog string, passthrough []string, cli C
 	}
 
 	s := newSessionNames()
+
+	if sessionIDFile != "" {
+		if err := os.WriteFile(sessionIDFile, []byte(s.id), 0o644); err != nil {
+			return fmt.Errorf("write session id file: %w", err)
+		}
+	}
 
 	cleanup, gatewayIP, err := startSession(s, cfg)
 	defer cleanup()

@@ -63,10 +63,11 @@ membrane -h
 Usage: membrane [options] [-- command...]
 
 Options:
-      --no-trace           disable Tracee eBPF sidecar
-      --no-update          skip checking for updates
-      --reset[=cid]        remove membrane state and exit (c=containers, i=image, d=directory)
-      --trace-log string   path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)
+      --no-trace                 disable Tracee eBPF sidecar
+      --no-update                skip checking for updates
+      --reset[=cid]              remove membrane state and exit (c=containers, i=image, d=directory)
+      --session-id-file string   write session ID to this file on startup (for test harnesses)
+      --trace-log string         path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)
 
 Config:
   -a, --allow stringArray      allow rule: hostname, IP, CIDR, or URL (repeatable)
@@ -357,6 +358,12 @@ args:
 ```
 
 See [`config-default.yaml`](config-default.yaml) for the full default allow list.
+
+### Troubleshooting
+
+- **Connections fail silently when `br_netfilter` kernel module is loaded on the host.** Bridge traffic gets routed through iptables and dropped by Docker's `DOCKER-ISOLATION-STAGE-1` chain. Membrane tries to work around it by injecting a `DOCKER-USER` rule (requires `sudo`); if that fails, upgrade Docker to 27.3.1+ and reboot to unload the module cleanly.
+
+- **HTTP/2 requests to Cloudflare-hosted sites fail intermittently in some environments.** This appears to be a mitmproxy HTTP/2 stack issue. Workaround: use HTTP/1.1 for affected requests, or launch `mitmdump` with `--set http2=false`.
 
 ## Back matter
 
