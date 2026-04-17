@@ -35,6 +35,9 @@ func writeAllowFile(allow []AllowRule) (string, error) {
 		return "", fmt.Errorf("create allow file: %w", err)
 	}
 	defer f.Close()
+	if allow == nil {
+		allow = []AllowRule{}
+	}
 	if err := json.NewEncoder(f).Encode(allow); err != nil {
 		os.Remove(f.Name())
 		return "", fmt.Errorf("write allow file: %w", err)

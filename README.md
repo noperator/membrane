@@ -63,6 +63,7 @@ membrane -h
 Usage: membrane [options] [-- command...]
 
 Options:
+      --no-global-config         skip reading ~/.membrane/config.yaml (workspace and CLI flags still apply)
       --no-trace                 disable Tracee eBPF sidecar
       --no-update                skip checking for updates
       --reset[=cid]              remove membrane state and exit (c=containers, i=image, d=directory)
@@ -290,18 +291,18 @@ readonly:
 # form supports additional constraints via ports: and http: keys.
 allow:
   # 1. Plain hostname: any TCP port, any HTTP method/path.
-  #    UDP is blocked unless explicitly opted in (see example 8).
+  # UDP is blocked unless explicitly opted in (see example 8).
   - github.com
 
   # 2. Hostname with port restriction: TCP port 443 only (bare port
-  #    numbers default to TCP). Other ports blocked at L3.
+  # numbers default to TCP). Other ports blocked at L3.
   - dest: registry.mycompany.com
     ports: [443]
 
   # 3. Hostname with http rules: HTTP/HTTPS only, method/path enforced
-  #    on any TCP port. Non-HTTP TCP (SSH, etc.) is blocked. mitmproxy
-  #    detects HTTP/TLS from protocol bytes, not port number, so this
-  #    works on 8443, 8080, or any other port the agent connects to.
+  # on any TCP port. Non-HTTP TCP (SSH, etc.) is blocked. mitmproxy
+  # detects HTTP/TLS from protocol bytes, not port number, so this
+  # works on 8443, 8080, or any other port the agent connects to.
   - dest: api.anthropic.com
     http:
       - methods: [POST]
@@ -309,8 +310,8 @@ allow:
           - /v1/messages
 
   # 4. Hostname with http rules AND explicit TCP port. The two entries
-  #    are independent. HTTP is enforced on all TCP ports; port 22
-  #    also allowed. Other non-HTTP TCP ports are blocked.
+  # are independent. HTTP is enforced on all TCP ports; port 22
+  # also allowed. Other non-HTTP TCP ports are blocked.
   - dest: github.com
     http:
       - methods: [GET, POST]
@@ -319,11 +320,11 @@ allow:
     ports: [22/tcp]
 
   # 5. URL entry: shorthand for hostname + port from scheme + path
-  #    prefix. All methods allowed under /v1/.
+  # prefix. All methods allowed under /v1/.
   - https://api.openai.com/v1/
 
   # 6. URL entry with http rules: the most specific form. Port from
-  #    scheme enforced at L3, method and path enforced at L7.
+  # scheme enforced at L3, method and path enforced at L7.
   - dest: https://api.example.com/v1/
     http:
       - methods: [POST]
@@ -332,8 +333,8 @@ allow:
           - /v1/models  # absolute path also works
 
   # 7. IP and CIDR: bypass DNS, added directly to firewall. Without
-  #    http, any TCP is allowed. With http, same L7 enforcement as
-  #    hostname entries: non-HTTP TCP blocked, UDP always blocked.
+  # http, any TCP is allowed. With http, same L7 enforcement as
+  # hostname entries: non-HTTP TCP blocked, UDP always blocked.
   - 192.168.2.1
   - dest: 192.168.3.0/24
     http:
@@ -341,9 +342,21 @@ allow:
         paths: [/api/]
 
   # 8. UDP opt-in: bare port numbers default to TCP. Append /udp to
-  #    explicitly allow UDP on a specific port.
+  # explicitly allow UDP on a specific port.
   - dest: 8.8.8.8
     ports: [53/udp]
+
+  # 9. Host pattern wildcard: `*` must be a full DNS label. Matches
+  # any immediate subdomain of github.com (api.github.com,
+  # objects.github.com, etc.) but NOT the apex github.com itself.
+  - "*.github.com"
+
+  # 10. Any host: bare `*` allows any destination. Use with caution.
+  # Here: GET requests to any host, on any TCP port, over HTTP or
+  # HTTPS. Non-HTTP TCP and UDP still blocked.
+  - dest: "*"
+    http:
+      - methods: [GET]
 
 # `args` lists raw arguments appended to the `docker run` command.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
@@ -363,8 +376,6 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 
 - **Connections fail silently when `br_netfilter` kernel module is loaded on the host.** Bridge traffic gets routed through iptables and dropped by Docker's `DOCKER-ISOLATION-STAGE-1` chain. Membrane tries to work around it by injecting a `DOCKER-USER` rule (requires `sudo`); if that fails, upgrade Docker to 27.3.1+ and reboot to unload the module cleanly.
 
-- **HTTP/2 requests to Cloudflare-hosted sites fail intermittently in some environments.** This appears to be a mitmproxy HTTP/2 stack issue. Workaround: use HTTP/1.1 for affected requests, or launch `mitmdump` with `--set http2=false`.
-
 ## Back matter
 
 ### See also
@@ -377,14 +388,16 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 ### To-do
 
 - [ ] support Docker checkpoint
-- [ ] support wildcard hostnames
 - [ ] optimize startup/teardown time
 - [ ] move tracee from dedicated sidecar into handler
 - [ ] per-session home dir overlay
 - [ ] support trusting specific CA certs
+- [ ] return error messages from proxy
+- [ ] add debug flag
 
 <details><summary>Completed</summary>
 
+- [x] support wildcard hostnames
 - [x] support HTTP filters on IP dest
 - [x] detect HTTP(S) via bytes vs ports
 - [x] support Docker-in-Docker on macOS

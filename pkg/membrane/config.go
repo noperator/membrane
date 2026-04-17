@@ -36,7 +36,7 @@ type portRule struct {
 }
 
 // AllowRule represents a single entry in the allow list.
-// Type is one of "cidr", "host", or "url".
+// Type is one of "cidr", "host", "url", "any", or "host-pattern".
 type AllowRule struct {
 	Type   string     `json:"type"`
 	CIDR   string     `json:"cidr,omitempty"`
@@ -67,7 +67,33 @@ func (r *AllowRule) UnmarshalYAML(value *yaml.Node) error {
 	}
 }
 
+// validateHostPattern checks that a wildcard host pattern uses only full-label
+// wildcards (e.g. *.example.com), rejecting mid-label wildcards like foo*bar.com.
+func validateHostPattern(s string) error {
+	labels := strings.Split(s, ".")
+	for _, label := range labels {
+		if strings.Contains(label, "*") && label != "*" {
+			return fmt.Errorf("invalid host pattern %q: wildcards may only appear as full labels (\"*.example.com\"), not within labels", s)
+		}
+	}
+	return nil
+}
+
 func (r *AllowRule) parseAuto(s string) error {
+	// 0a. Bare * → any host
+	if s == "*" {
+		r.Type = "any"
+		return nil
+	}
+	// 0b. Wildcard host pattern
+	if strings.Contains(s, "*") {
+		if err := validateHostPattern(s); err != nil {
+			return err
+		}
+		r.Type = "host-pattern"
+		r.Host = strings.ToLower(s)
+		return nil
+	}
 	// 1. IP address → CIDR /32
 	if net.ParseIP(s) != nil {
 		r.Type = "cidr"
@@ -219,7 +245,8 @@ func ParseAllowEntry(raw string) (AllowRule, error) {
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
 // (.membrane.yaml) configs. Workspace config lists are appended to local lists.
-func loadConfig(workspaceDir string) (*config, error) {
+// When skipGlobal is true, the global config is skipped entirely.
+func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("get home dir: %w", err)
@@ -228,23 +255,26 @@ func loadConfig(workspaceDir string) (*config, error) {
 	localPath := filepath.Join(home, ".membrane", "config.yaml")
 	workspacePath := filepath.Join(workspaceDir, ".membrane.yaml")
 
-	localCfg, localErr := loadConfigFile(localPath)
-	workspace, workspaceErr := loadConfigFile(workspacePath)
+	base := config{}
 
-	localMissing := os.IsNotExist(localErr)
+	if !skipGlobal {
+		localCfg, localErr := loadConfigFile(localPath)
+		localMissing := os.IsNotExist(localErr)
+		if localErr != nil && !localMissing {
+			return nil, fmt.Errorf("load local config: %w", localErr)
+		}
+		if !localMissing {
+			base = *localCfg
+		}
+	}
+
+	workspace, workspaceErr := loadConfigFile(workspacePath)
 	workspaceMissing := os.IsNotExist(workspaceErr)
 
-	if localErr != nil && !localMissing {
-		return nil, fmt.Errorf("load local config: %w", localErr)
-	}
 	if workspaceErr != nil && !workspaceMissing {
 		return nil, fmt.Errorf("load workspace config: %w", workspaceErr)
 	}
 
-	base := config{}
-	if !localMissing {
-		base = *localCfg
-	}
 	if !workspaceMissing {
 		base.Ignore = append(base.Ignore, workspace.Ignore...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)

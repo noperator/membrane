@@ -13,6 +13,7 @@ import posixpath
 import socket
 import struct
 import urllib.parse
+from fnmatch import fnmatchcase
 
 from mitmproxy import http as mhttp
 from mitmproxy.net.tls import starts_like_tls_record
@@ -34,13 +35,22 @@ def _load_rules():
     with open(allow_file) as f:
         rules = json.load(f)
 
-    allowed_hosts = set()
     allowed_cidrs = []
+    # url_rules: host → [(url_path, http_rules), ...]
+    # Hosts with no url-level constraints get a sentinel ("/", []) entry.
     url_rules = {}
-    tcp_allowed = {}  # hostname → list of allowed ports ([] means any port)
+    # host_patterns: [(pattern, rule_list), ...]
+    host_patterns = []
+    # any_rules: [(url_path, http_rules), ...] — empty list means no * rule
+    any_rules = []
+    # any_tcp: True if any bare-* rule exists with no http constraints
+    any_tcp = False
 
+    # First pass: collect all rules by type
     for rule in rules:
-        if rule.get("type") == "cidr":
+        rtype = rule.get("type")
+
+        if rtype == "cidr":
             cidr = rule.get("cidr", "")
             if "/" not in cidr:
                 cidr = cidr + "/32"
@@ -49,11 +59,43 @@ def _load_rules():
             allowed_cidrs.append((addr, int(prefix_len), http_rules))
             continue
 
+        if rtype == "any":
+            http_rules = rule.get("http") or []
+            url_path = rule.get("path", "") or "/"
+            if not http_rules and not rule.get("path"):
+                any_tcp = True
+                any_rules.append(("/", []))
+            else:
+                any_rules.append((url_path, http_rules))
+            continue
+
+        if rtype == "host-pattern":
+            host = rule.get("host", "").lower()
+            if not host:
+                continue
+            http_rules = rule.get("http") or []
+            url_path = rule.get("path", "") or "/"
+            # Find existing pattern entry or create new one
+            found = False
+            for i, (pat, rl) in enumerate(host_patterns):
+                if pat == host:
+                    if not http_rules and not rule.get("path"):
+                        host_patterns[i] = (pat, rl + [("/", [])])
+                    else:
+                        host_patterns[i] = (pat, rl + [(url_path, http_rules)])
+                    found = True
+                    break
+            if not found:
+                if not http_rules and not rule.get("path"):
+                    host_patterns.append((host, [("/", [])]))
+                else:
+                    host_patterns.append((host, [(url_path, http_rules)]))
+            continue
+
+        # host or url types
         host = rule.get("host", "").lower()
         if not host:
             continue
-
-        allowed_hosts.add(host)
 
         if rule.get("path") or rule.get("http"):
             url_path = rule.get("path", "") or "/"
@@ -61,40 +103,16 @@ def _load_rules():
             if host not in url_rules:
                 url_rules[host] = []
             url_rules[host].append((url_path, http_rules))
-
-        if not rule.get("http") and host:
-            ports = rule.get("ports") or []
-            if host not in tcp_allowed:
-                tcp_allowed[host] = []
-            if not ports:
-                tcp_allowed[host] = None  # None means any port allowed
-            elif tcp_allowed[host] is not None:
-                for pr in ports:
-                    tcp_allowed[host].append(pr)
-
-    # Remove hosts from tcp_allowed that also have http rules
-    for host in list(tcp_allowed.keys()):
-        if host not in url_rules:
-            continue
-        # Host has http rules — rebuild tcp_allowed from explicit port
-        # entries only (ignore plain no-port entries for this host)
-        explicit_ports = []
-        for rule in rules:
-            if rule.get("host", "").lower() != host:
-                continue
-            if rule.get("http"):
-                continue
-            for pr in rule.get("ports") or []:
-                explicit_ports.append(pr)
-        if explicit_ports:
-            tcp_allowed[host] = explicit_ports
         else:
-            del tcp_allowed[host]
+            # No constraints — add sentinel entry
+            if host not in url_rules:
+                url_rules[host] = []
+            url_rules[host].append(("/", []))
 
-    return allowed_hosts, allowed_cidrs, url_rules, tcp_allowed
+    return allowed_cidrs, url_rules, host_patterns, any_rules, any_tcp
 
 
-ALLOWED_HOSTS, ALLOWED_CIDRS, URL_RULES, TCP_ALLOWED = _load_rules()
+ALLOWED_CIDRS, URL_RULES, HOST_PATTERNS, ANY_RULES, ANY_TCP = _load_rules()
 
 
 def _is_http_or_tls(data: bytes) -> bool:
@@ -117,6 +135,42 @@ def _reverse_lookup(ip: str) -> str:
         return ""
 
 
+def _collect_matching_sources(host, addr):
+    """Collect all rule_lists that match the given host or IP.
+    Returns a list of rule_lists."""
+    matched = []
+
+    if host and host in URL_RULES:
+        matched.append(URL_RULES[host])
+
+    for pattern, rule_list in HOST_PATTERNS:
+        if host and fnmatchcase(host, pattern):
+            matched.append(rule_list)
+
+    if addr:
+        try:
+            ip_int = struct.unpack("!I", socket.inet_aton(addr[0]))[0]
+        except OSError:
+            ip_int = None
+        if ip_int is not None:
+            for net_addr, prefix_len, http_rules in ALLOWED_CIDRS:
+                try:
+                    net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
+                except OSError:
+                    continue
+                mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+                if (ip_int & mask) == (net_int & mask):
+                    if not http_rules:
+                        matched.append([("/", [])])
+                    else:
+                        matched.append([("/", http_rules)])
+
+    if ANY_RULES:
+        matched.append(ANY_RULES)
+
+    return matched
+
+
 def next_layer(nextlayer: proxy_layer.NextLayer) -> None:
     """Block non-HTTP/TLS connections to hosts with http-only rules."""
     if nextlayer.layer is not None:
@@ -129,49 +183,35 @@ def next_layer(nextlayer: proxy_layer.NextLayer) -> None:
     if not host and addr:
         host = _reverse_lookup(addr[0])
 
-    if host and host in ALLOWED_HOSTS and host in URL_RULES:
-        # Host has http-only rules — check if raw TCP is permitted
-        if host in TCP_ALLOWED:
-            port = addr[1] if addr else 0
-            allowed_ports = TCP_ALLOWED[host]
-            if allowed_ports is None:
-                return  # any port allowed
-            for pr in allowed_ports:
-                if pr["port"] == port:
-                    return  # this port explicitly allowed
-            # Port not in TCP_ALLOWED — block
-            nextlayer.layer = RejectLayer(nextlayer.context)
-            return
+    matching_sources = _collect_matching_sources(host, addr)
 
-        # No TCP_ALLOWED entry — check if data looks like TLS or HTTP
-        if _is_http_or_tls(nextlayer.data_client()):
-            return  # TLS or HTTP — allow through
+    if not matching_sources:
+        return  # no rules matched — nftables handles L3/L4
 
-        # Empty data or non-HTTP/TLS — block immediately
-        nextlayer.layer = RejectLayer(nextlayer.context)
+    # If any matching rule has no http constraints, allow raw TCP.
+    has_unconstrained = any(
+        any(http_rules == [] for (_, http_rules) in rl)
+        for rl in matching_sources
+    )
+
+    if has_unconstrained:
+        return  # raw TCP permitted
+
+    # If TLS has already been established for this connection, we've
+    # committed to the HTTP path. The decrypted buffer may be transiently
+    # empty at inner layer boundaries (especially for HTTP/2 before the
+    # preface arrives); byte-sniffing it would spuriously reject valid
+    # flows. Let mitmproxy pick the inner layer.
+    layer_names = [type(l).__name__ for l in nextlayer.context.layers]
+    if "ClientTLSLayer" in layer_names:
         return
 
-    # No hostname match — check ALLOWED_CIDRS for http-only entries
-    if addr:
-        try:
-            ip_int = struct.unpack("!I", socket.inet_aton(addr[0]))[0]
-        except OSError:
-            return
-        for net_addr, prefix_len, http_rules in ALLOWED_CIDRS:
-            try:
-                net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
-            except OSError:
-                continue
-            mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
-            if (ip_int & mask) == (net_int & mask):
-                if not http_rules:
-                    return  # CIDR with no http rules — allow raw TCP
-                # CIDR has http rules — check if TLS or HTTP
-                if _is_http_or_tls(nextlayer.data_client()):
-                    return  # TLS or HTTP — allow through
-                # Non-HTTP/TLS — block
-                nextlayer.layer = RejectLayer(nextlayer.context)
-                return
+    # All matching rules require HTTP/TLS; check bytes.
+    if _is_http_or_tls(nextlayer.data_client()):
+        return  # HTTP/TLS — allow through
+
+    # Non-HTTP bytes to an http-only dest — block immediately
+    nextlayer.layer = RejectLayer(nextlayer.context)
 
 
 def _effective_path(url_path, rule_path):
@@ -224,85 +264,31 @@ def normalize_path(path):
     return path
 
 
-def _match_cidr(ip_int, method, path):
-    """Check ip_int against ALLOWED_CIDRS with optional http rule
-    enforcement. Returns 'allow', 'block', or None (no match).
-    """
-    for net_addr, prefix_len, http_rules in ALLOWED_CIDRS:
-        try:
-            net_int = struct.unpack("!I", socket.inet_aton(net_addr))[0]
-        except OSError:
-            continue
-        mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
-        if (ip_int & mask) == (net_int & mask):
-            if not http_rules:
-                return "allow"
-            for rule in http_rules:
-                if _matches_rule("/", rule, method, path):
-                    return "allow"
-            return "block"
-    return None
-
-
 def request(flow: mhttp.HTTPFlow) -> None:
     host = flow.request.pretty_host.lower() if flow.request.pretty_host else ""
     path = normalize_path(flow.request.path)
-
-    if not host:
-        # No hostname — check destination IP against ALLOWED_CIDRS
-        peername = flow.server_conn.peername
-        if not peername:
-            flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-            return
-        ip = peername[0]
-        try:
-            ip_int = struct.unpack("!I", socket.inet_aton(ip))[0]
-        except OSError:
-            flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-            return
-        result = _match_cidr(ip_int, flow.request.method, path)
-        if result == "allow":
-            return
-        if result == "block":
-            flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-            return
-        # result is None — no CIDR matched, fall through to outer 403
-        flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-        return
-
-    if host not in ALLOWED_HOSTS:
-        # Before blocking, check if the destination IP matches a CIDR entry
-        peername = flow.server_conn.peername
-        if peername:
-            try:
-                ip_int = struct.unpack("!I", socket.inet_aton(peername[0]))[0]
-            except OSError:
-                ip_int = None
-            if ip_int is not None:
-                result = _match_cidr(ip_int, flow.request.method, path)
-                if result == "allow":
-                    return
-                if result == "block":
-                    flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-                    return
-        # No CIDR match — block
-        flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
-        return
-
-    if host not in URL_RULES:
-        return  # hostname allowed, no URL-level constraints
-
     method = flow.request.method
 
-    for url_path, http_rules in URL_RULES[host]:
-        if not http_rules:
-            # No http rules — any method/path under url_path is allowed
-            if path == url_path or path.startswith(url_path.rstrip("/") + "/"):
-                return
-            continue
-        for rule in http_rules:
-            if _matches_rule(url_path, rule, method, path):
-                return  # matched — allow
+    # Collect all matching rule lists
+    peername = flow.server_conn.peername
+    addr = peername if peername else None
+
+    matched = _collect_matching_sources(host, addr)
+
+    if not matched:
+        flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+        return
+
+    for rule_list in matched:
+        for url_path, http_rules in rule_list:
+            if not http_rules:
+                # No http constraints — permit anything under url_path
+                if path == url_path or path.startswith(url_path.rstrip("/") + "/"):
+                    return
+            else:
+                for rule in http_rules:
+                    if _matches_rule(url_path, rule, method, path):
+                        return  # matched — allow
 
     # No rule matched — block
     flow.response = mhttp.Response.make(
@@ -310,3 +296,9 @@ def request(flow: mhttp.HTTPFlow) -> None:
         b"",
         {"Content-Type": "text/plain"},
     )
+
+
+# Signal to entrypoint.sh that the addon has fully loaded.
+# Must come at the bottom of the module — anything after this line
+# would not be initialized when the file appears.
+open("/tmp/mitmproxy-addon-loaded", "w").close()

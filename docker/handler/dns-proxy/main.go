@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -25,34 +26,86 @@ type allowRule struct {
 	Ports []portRule `json:"ports"`
 }
 
-// buildAllowedHosts parses MEMBRANE_ALLOW JSON and returns a map of
-// hostname → allowed ports. A nil ports slice means any port is allowed.
-func buildAllowedHosts(allowJSON string) map[string][]portRule {
+type patternEntry struct {
+	pattern string
+	ports   []portRule // nil = any-port
+}
+
+type allowedSet struct {
+	exact    map[string][]portRule
+	patterns []patternEntry
+	anyHost  bool
+	anyPorts []portRule // from bare-* rule; nil = any-port
+}
+
+// unionPorts merges src into dst. nil means any-port and wins over specific ports.
+// Returns nil if either side is nil (any-port).
+func unionPorts(dst []portRule, src []portRule) []portRule {
+	if dst == nil || src == nil {
+		return nil
+	}
+	return appendUniquePorts(dst, src...)
+}
+
+// buildAllowedHosts parses MEMBRANE_ALLOW JSON and returns an allowedSet
+// containing exact hosts, wildcard patterns, and the any-host flag.
+func buildAllowedHosts(allowJSON string) *allowedSet {
 	var rules []allowRule
 	if err := json.Unmarshal([]byte(allowJSON), &rules); err != nil {
 		log.Printf("dns-proxy: parse MEMBRANE_ALLOW: %v", err)
-		return make(map[string][]portRule)
+		return &allowedSet{exact: make(map[string][]portRule)}
 	}
-	allowed := make(map[string][]portRule)
+	as := &allowedSet{exact: make(map[string][]portRule)}
 	for _, r := range rules {
-		if r.Type != "host" && r.Type != "url" {
-			continue
-		}
-		host := strings.ToLower(r.Host)
-		if host == "" {
-			continue
-		}
-		// If already any-port, no further expansion needed
-		if existing, ok := allowed[host]; ok && existing == nil {
-			continue
-		}
-		if len(r.Ports) == 0 {
-			allowed[host] = nil
-		} else {
-			allowed[host] = appendUniquePorts(allowed[host], r.Ports...)
+		switch r.Type {
+		case "any":
+			if as.anyHost {
+				as.anyPorts = unionPorts(as.anyPorts, r.Ports)
+			} else {
+				as.anyHost = true
+				if len(r.Ports) == 0 {
+					as.anyPorts = nil
+				} else {
+					as.anyPorts = append([]portRule(nil), r.Ports...)
+				}
+			}
+		case "host-pattern":
+			pattern := strings.ToLower(r.Host)
+			if pattern == "" {
+				continue
+			}
+			var ports []portRule
+			if len(r.Ports) > 0 {
+				ports = append([]portRule(nil), r.Ports...)
+			}
+			// Check if pattern already exists; union ports
+			found := false
+			for i := range as.patterns {
+				if as.patterns[i].pattern == pattern {
+					as.patterns[i].ports = unionPorts(as.patterns[i].ports, ports)
+					found = true
+					break
+				}
+			}
+			if !found {
+				as.patterns = append(as.patterns, patternEntry{pattern: pattern, ports: ports})
+			}
+		case "host", "url":
+			host := strings.ToLower(r.Host)
+			if host == "" {
+				continue
+			}
+			if existing, ok := as.exact[host]; ok && existing == nil {
+				continue
+			}
+			if len(r.Ports) == 0 {
+				as.exact[host] = nil
+			} else {
+				as.exact[host] = appendUniquePorts(as.exact[host], r.Ports...)
+			}
 		}
 	}
-	return allowed
+	return as
 }
 
 func updateReverseMap(ip, hostname string) {
@@ -107,7 +160,8 @@ func main() {
 		log.Fatalf("dns-proxy: read allow file: %v", err)
 	}
 	allowed := buildAllowedHosts(string(data))
-	log.Printf("dns-proxy: tracking %d hostnames, upstream=%s", len(allowed), upstream)
+	log.Printf("dns-proxy: tracking %d hostnames, %d patterns, anyHost=%v, upstream=%s",
+		len(allowed.exact), len(allowed.patterns), allowed.anyHost, upstream)
 
 	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:53")
 	if err != nil {
@@ -129,7 +183,7 @@ func main() {
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		go handleQuery(pkt, clientAddr, conn, upstream, allowed)
+		go handleQuery(pkt, clientAddr, conn, upstream, *allowed)
 	}
 }
 
@@ -144,7 +198,7 @@ func extractQueryName(pkt []byte) string {
 	return strings.TrimRight(strings.ToLower(name), ".")
 }
 
-func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed map[string][]portRule) {
+func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed allowedSet) {
 	// Reject packets with more than one question — we only validate the
 	// first question name, so additional questions are an exfiltration
 	// channel. Standard DNS always uses QDCOUNT=1.
@@ -162,7 +216,41 @@ func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstr
 	}
 
 	name := extractQueryName(query)
-	if _, ok := allowed[name]; !ok {
+
+	// Determine if name is allowed and collect union of ports.
+	// populateSets indicates whether resolved IPs should be added to nftables.
+	var ports []portRule
+	matched := false
+	populateSets := false
+
+	// 1. Exact match
+	if p, ok := allowed.exact[name]; ok {
+		ports = p
+		matched = true
+		populateSets = true
+	}
+
+	// 2. Pattern matches — union ports from all matching patterns
+	for _, pe := range allowed.patterns {
+		if ok, _ := filepath.Match(pe.pattern, name); ok {
+			if !matched {
+				ports = pe.ports
+				matched = true
+				populateSets = true
+			} else {
+				ports = unionPorts(ports, pe.ports)
+				populateSets = true
+			}
+		}
+	}
+
+	// 3. Any-host fallback — resolve but do NOT populate nftables sets
+	if !matched && allowed.anyHost {
+		matched = true
+		populateSets = false
+	}
+
+	if !matched {
 		resp := make([]byte, len(query))
 		copy(resp, query)
 		resp[2] = (query[2] & 0x01) | 0x80 // QR=1 (response), preserve RD bit
@@ -202,32 +290,30 @@ func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstr
 	resp = resp[:rn]
 
 	// Parse response and update nftables before returning to client
-	name, ips := extractARecords(resp)
-	if name != "" && len(ips) > 0 {
-		name = strings.ToLower(strings.TrimRight(name, "."))
-		if ports, ok := allowed[name]; ok {
-			for _, ip := range ips {
-				if ports == nil {
-					// any port: add to allowed-any-port
-					if err := exec.Command("nft", "add", "element", "ip", "membrane",
-						"allowed-any-port", "{", ip.String()+"/32", "}").Run(); err != nil {
-						log.Printf("dns-proxy: nft add %s to allowed-any-port: %v", ip, err)
-					}
-					updateReverseMap(ip.String(), name)
-				} else {
-					// port-constrained: add ip . proto . port triples
-					for _, pr := range ports {
-						elem := fmt.Sprintf("%s . %s . %d", ip.String(), pr.Proto, pr.Port)
-						if err := exec.Command("nft", "add", "element", "ip", "membrane",
-							"allowed", "{", elem, "}").Run(); err != nil {
-							log.Printf("dns-proxy: nft add %s to allowed: %v", elem, err)
-						}
-					}
-					updateReverseMap(ip.String(), name)
+	respName, ips := extractARecords(resp)
+	if respName != "" && len(ips) > 0 && populateSets {
+		respName = strings.ToLower(strings.TrimRight(respName, "."))
+		for _, ip := range ips {
+			if ports == nil {
+				// any port: add to allowed-any-port
+				if err := exec.Command("nft", "add", "element", "ip", "membrane",
+					"allowed-any-port", "{", ip.String()+"/32", "}").Run(); err != nil {
+					log.Printf("dns-proxy: nft add %s to allowed-any-port: %v", ip, err)
 				}
+				updateReverseMap(ip.String(), respName)
+			} else {
+				// port-constrained: add ip . proto . port triples
+				for _, pr := range ports {
+					elem := fmt.Sprintf("%s . %s . %d", ip.String(), pr.Proto, pr.Port)
+					if err := exec.Command("nft", "add", "element", "ip", "membrane",
+						"allowed", "{", elem, "}").Run(); err != nil {
+						log.Printf("dns-proxy: nft add %s to allowed: %v", elem, err)
+					}
+				}
+				updateReverseMap(ip.String(), respName)
 			}
-			log.Printf("dns-proxy: %s → %v (ports=%v)", name, ips, ports)
 		}
+		log.Printf("dns-proxy: %s → %v (ports=%v)", respName, ips, ports)
 	}
 
 	conn.WriteToUDP(resp, clientAddr)

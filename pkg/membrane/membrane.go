@@ -25,7 +25,7 @@ type CLIOverrides struct {
 
 // Run is the main entry point called from cmd/membrane/main.go.
 // passthrough args are forwarded as the container command.
-func Run(noUpdate bool, trace bool, traceLog string, sessionIDFile string, passthrough []string, cli CLIOverrides) error {
+func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessionIDFile string, passthrough []string, cli CLIOverrides) error {
 
 	if runtime.GOOS == "darwin" {
 		os.Setenv("DOCKER_CONTEXT", "colima-membrane")
@@ -72,7 +72,7 @@ func Run(noUpdate bool, trace bool, traceLog string, sessionIDFile string, passt
 		return fmt.Errorf("resolve workspace symlinks: %w", err)
 	}
 
-	cfg, err := loadConfig(workspaceDir)
+	cfg, err := loadConfig(workspaceDir, noGlobalConfig)
 	if err != nil {
 		return err
 	}

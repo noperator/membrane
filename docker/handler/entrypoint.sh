@@ -45,12 +45,15 @@ ALLOW_FILE="${MEMBRANE_ALLOW_FILE:-/etc/membrane/allow.json}"
 # CIDRs without ports → @allowed-any-port (TCP only via forward rule).
 # CIDRs with ports → @allowed (ip . proto . port).
 # Hostnames are resolved dynamically by dns-proxy at query time.
-read -r -d '' _EXTRACT_CIDRS <<'PYEOF' || true
+read -r -d '' _EXTRACT_RULES <<'PYEOF' || true
 import json, sys
 with open(sys.argv[1]) as f:
     rules = json.load(f)
 any_port = []
 port_constrained = []
+any_host = False
+any_host_tcp_ports = []
+any_host_udp_ports = []
 for r in rules:
     if r.get('type') == 'cidr' and r.get('cidr'):
         ports = r.get('ports') or []
@@ -59,11 +62,31 @@ for r in rules:
         else:
             for p in ports:
                 port_constrained.append(f"{r['cidr']} . {p['proto']} . {p['port']}")
+    elif r.get('type') == 'any':
+        any_host = True
+        ports = r.get('ports') or []
+        if not ports:
+            # No ports = any port; clear lists to signal "any"
+            any_host_tcp_ports = None
+            any_host_udp_ports = None
+        elif any_host_tcp_ports is not None:
+            for p in ports:
+                if p['proto'] == 'tcp' and p['port'] not in any_host_tcp_ports:
+                    any_host_tcp_ports.append(p['port'])
+                elif p['proto'] == 'udp' and any_host_udp_ports is not None and p['port'] not in any_host_udp_ports:
+                    any_host_udp_ports.append(p['port'])
 print('ANY_PORT=' + ','.join(any_port))
 print('PORT_CONSTRAINED=' + ','.join(port_constrained))
+print('ANY_HOST=' + ('1' if any_host else ''))
+print('ANY_HOST_TCP_PORTS=' + (','.join(str(p) for p in any_host_tcp_ports) if any_host_tcp_ports else ''))
+print('ANY_HOST_UDP_PORTS=' + (','.join(str(p) for p in any_host_udp_ports) if any_host_udp_ports else ''))
 PYEOF
-ANY_PORT=$(python3 -c "$_EXTRACT_CIDRS" "$ALLOW_FILE" 2>/dev/null | grep '^ANY_PORT=' | cut -d= -f2-)
-PORT_CONSTRAINED=$(python3 -c "$_EXTRACT_CIDRS" "$ALLOW_FILE" 2>/dev/null | grep '^PORT_CONSTRAINED=' | cut -d= -f2-)
+_EXTRACT_OUTPUT=$(python3 -c "$_EXTRACT_RULES" "$ALLOW_FILE" 2>/dev/null)
+ANY_PORT=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_PORT=' | cut -d= -f2-)
+PORT_CONSTRAINED=$(echo "$_EXTRACT_OUTPUT" | grep '^PORT_CONSTRAINED=' | cut -d= -f2-)
+ANY_HOST=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_HOST=' | cut -d= -f2-)
+ANY_HOST_TCP_PORTS=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_HOST_TCP_PORTS=' | cut -d= -f2-)
+ANY_HOST_UDP_PORTS=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_HOST_UDP_PORTS=' | cut -d= -f2-)
 
 [ -n "$ANY_PORT" ] || ANY_PORT="127.0.0.2/32"
 
@@ -104,6 +127,16 @@ table ip membrane {
         iifname "$INTERNAL_IF" ip daddr @allowed-any-port meta l4proto tcp redirect to :$MITMPROXY_PORT
         iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed meta l4proto tcp redirect to :$MITMPROXY_PORT
         iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed meta l4proto udp accept
+        $(if [ "$ANY_HOST" = "1" ]; then
+    if [ -z "$ANY_HOST_TCP_PORTS" ]; then
+        echo "iifname \"$INTERNAL_IF\" meta l4proto tcp redirect to :$MITMPROXY_PORT"
+    else
+        IFS=',' read -ra _ports <<<"$ANY_HOST_TCP_PORTS"
+        for _p in "${_ports[@]}"; do
+            echo "iifname \"$INTERNAL_IF\" tcp dport $_p redirect to :$MITMPROXY_PORT"
+        done
+    fi
+fi)
     }
 
     chain postrouting {
@@ -122,6 +155,22 @@ table ip membrane {
         tcp flags syn tcp option maxseg size set rt mtu
         iifname "$INTERNAL_IF" ip daddr @allowed-any-port meta l4proto tcp accept
         iifname "$INTERNAL_IF" ip daddr . meta l4proto . th dport @allowed accept
+        $(if [ "$ANY_HOST" = "1" ]; then
+    if [ -z "$ANY_HOST_TCP_PORTS" ]; then
+        echo "iifname \"$INTERNAL_IF\" meta l4proto tcp accept"
+    else
+        IFS=',' read -ra _ports <<<"$ANY_HOST_TCP_PORTS"
+        for _p in "${_ports[@]}"; do
+            echo "iifname \"$INTERNAL_IF\" tcp dport $_p accept"
+        done
+    fi
+    if [ -n "$ANY_HOST_UDP_PORTS" ]; then
+        IFS=',' read -ra _uports <<<"$ANY_HOST_UDP_PORTS"
+        for _u in "${_uports[@]}"; do
+            echo "iifname \"$INTERNAL_IF\" udp dport $_u accept"
+        done
+    fi
+fi)
         iifname "$INTERNAL_IF" log prefix "[membrane BLOCKED] " limit rate 5/second
         iifname "$INTERNAL_IF" reject with icmp admin-prohibited
     }
@@ -151,7 +200,7 @@ cat /tmp/ca.key /membrane-ca/ca.crt >/tmp/mitmproxy/mitmproxy-ca.pem
 echo "CA cert generated."
 
 # Start mitmproxy in transparent mode
-mitmdump \
+PYTHONUNBUFFERED=1 mitmdump \
     --mode transparent \
     --listen-port "$MITMPROXY_PORT" \
     --set confdir=/tmp/mitmproxy \
@@ -160,11 +209,17 @@ mitmdump \
     -s /addon.py \
     &
 
-# Wait for mitmproxy to bind its port (timeout 15s)
+# Wait for mitmproxy to bind its port AND finish loading the addon
+# (timeout 15s). The port-bind alone is insufficient — mitmproxy
+# accepts connections at the kernel level before the addon's
+# _load_rules() and module initialization complete.
 for i in $(seq 1 15); do
-    (echo >/dev/tcp/localhost/$MITMPROXY_PORT) 2>/dev/null && break
+    if (echo >/dev/tcp/localhost/$MITMPROXY_PORT) 2>/dev/null &&
+        [ -f /tmp/mitmproxy-addon-loaded ]; then
+        break
+    fi
     if [ "$i" -eq 15 ]; then
-        echo "ERROR: mitmproxy did not bind within 15s"
+        echo "ERROR: mitmproxy did not become ready within 15s"
         exit 1
     fi
     sleep 1
