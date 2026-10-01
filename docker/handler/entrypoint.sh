@@ -226,8 +226,59 @@ for i in $(seq 1 15); do
 done
 echo "mitmproxy ready."
 
-# Signal ready
+TRACER_PID=""
+cleanup() {
+    if [ -n "$TRACER_PID" ]; then
+        kill -TERM "$TRACER_PID" 2>/dev/null || true
+        wait "$TRACER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
+if [ -n "${MEMBRANE_TRACE_FILE:-}" ]; then
+    rm -f /tmp/tracer-ready
+    tracer &
+    TRACER_PID=$!
+
+    for _i in $(seq 1 150); do
+        [ -f /tmp/tracer-ready ] && break
+        if ! kill -0 "$TRACER_PID" 2>/dev/null; then
+            if wait "$TRACER_PID"; then
+                tracer_status=0
+            else
+                tracer_status=$?
+            fi
+            TRACER_PID=""
+            echo "ERROR: tracer exited before becoming ready"
+            [ "$tracer_status" -ne 0 ] && exit "$tracer_status"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [ -f /tmp/tracer-ready ] || {
+        echo "ERROR: tracer did not become ready within 15s"
+        exit 1
+    }
+    echo "BPF attached and scoped (PID $TRACER_PID)."
+fi
+
+# Signal ready only after every requested service is ready.
 touch /tmp/handler-ready
 echo "Handler ready."
 
-sleep infinity
+if [ -n "$TRACER_PID" ]; then
+    if wait "$TRACER_PID"; then
+        tracer_status=0
+    else
+        tracer_status=$?
+    fi
+    TRACER_PID=""
+    echo "ERROR: tracer exited unexpectedly"
+    [ "$tracer_status" -ne 0 ] && exit "$tracer_status"
+    exit 1
+fi
+
+# Bash handles signals immediately while waiting for a background child.
+sleep infinity &
+wait "$!"

@@ -13,7 +13,7 @@ import (
 
 func main() {
 	noUpdate := flag.Bool("no-update", false, "skip checking for updates")
-	noTrace := flag.Bool("no-trace", false, "disable Tracee eBPF sidecar")
+	noTrace := flag.Bool("no-trace", false, "disable eBPF tracing")
 	noGlobalConfig := flag.Bool("no-global-config", false, "skip reading ~/.membrane/config.yaml (workspace and CLI flags still apply)")
 	traceLog := flag.String("trace-log", "", "path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)")
 	ignore := flag.StringArrayP("ignore", "i", []string{}, "ignore pattern (repeatable)")

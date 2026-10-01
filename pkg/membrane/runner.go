@@ -1,6 +1,8 @@
 package membrane
 
 import (
+	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -57,10 +60,63 @@ func hasSysbox() bool {
 type sessionNames struct {
 	id               string
 	agentContainer   string
+	cgroupParent     string
 	handlerContainer string
 	internalNetwork  string
 	externalNetwork  string
 	caVolume         string
+}
+
+// createSessionCgroup establishes the scope before any container workload can
+// run. Only these two host operations need elevated filesystem/systemd access;
+// the handler receives a read-only cgroup mount and never creates cgroups.
+func createSessionCgroup(ctx context.Context, s *sessionNames) (func(), error) {
+	cleanup := func() {}
+	out, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.CgroupVersion}} {{.CgroupDriver}}").Output()
+	if err != nil {
+		return cleanup, fmt.Errorf("inspect Docker cgroups: %w", err)
+	}
+	layout := strings.Fields(string(out))
+	if len(layout) != 2 {
+		return cleanup, fmt.Errorf("unexpected Docker cgroup configuration: %q", out)
+	}
+	var parent string
+	var create, remove []string
+	switch layout[0] + " " + layout[1] {
+	case "2 cgroupfs":
+		parent = "/membrane-" + s.id
+		path := "/sys/fs/cgroup" + parent
+		create, remove = []string{"mkdir", path}, []string{"rmdir", path}
+	case "2 systemd":
+		// A systemd slice without hyphens is at the root.
+		parent = "membrane" + s.id + ".slice"
+		create, remove = []string{"systemctl", "start", parent}, []string{"systemctl", "stop", parent}
+	default:
+		return cleanup, fmt.Errorf("tracing requires cgroup v2 with cgroupfs or systemd; Docker reports %q", layout[0]+" "+layout[1])
+	}
+	s.cgroupParent = parent
+	hostCommand := func(ctx context.Context, args []string) *exec.Cmd {
+		if runtime.GOOS == "darwin" {
+			return exec.CommandContext(ctx, "colima", append([]string{"ssh", "--profile", "membrane", "--", "sudo", "-n", "--"}, args...)...)
+		}
+		if os.Geteuid() == 0 {
+			return exec.CommandContext(ctx, args[0], args[1:]...)
+		}
+		return exec.CommandContext(ctx, "sudo", append([]string{"-n", "--"}, args...)...)
+	}
+	cleanup = func() {
+		if out, err := hostCommand(context.Background(), remove).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: remove session cgroup %s: %s: %v\n", s.cgroupParent, out, err)
+		}
+	}
+	if out, err := hostCommand(ctx, create).CombinedOutput(); err != nil {
+		if ctx.Err() == nil {
+			// A failed mkdir may mean the path already belongs to someone else.
+			cleanup = func() {}
+		}
+		return cleanup, fmt.Errorf("pre-create session cgroup (requires host permission for %s): %s: %w", strings.Join(create, " "), out, err)
+	}
+	return cleanup, nil
 }
 
 func newSessionNames() sessionNames {
@@ -130,28 +186,30 @@ func removeDockerUserRule(bridge string) {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(s sessionNames, cfg *config) (func(), string, error) {
+func startSession(ctx context.Context, s sessionNames, cfg *config, trace bool, traceLogFile string) (func(), string, error) {
 	cleanup := func() {
-		_ = exec.Command("docker", "stop", "-t", "2", s.handlerContainer).Run()
+		// Remove all workload processes before detaching BPF, including DinD.
+		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
+		_ = exec.Command("docker", "stop", "-t", "10", s.handlerContainer).Run()
 		_ = exec.Command("docker", "rm", s.handlerContainer).Run()
 		_ = exec.Command("docker", "network", "rm", s.internalNetwork).Run()
 		_ = exec.Command("docker", "network", "rm", s.externalNetwork).Run()
 		_ = exec.Command("docker", "volume", "rm", s.caVolume).Run()
 	}
 
-	if out, err := exec.Command("docker", "volume", "create",
+	if out, err := exec.CommandContext(ctx, "docker", "volume", "create",
 		s.caVolume).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("create ca volume %s: %s: %w",
 			s.caVolume, out, err)
 	}
 
-	if out, err := exec.Command("docker", "network", "create",
+	if out, err := exec.CommandContext(ctx, "docker", "network", "create",
 		s.externalNetwork).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("create network %s: %s: %w",
 			s.externalNetwork, out, err)
 	}
 
-	out, err := exec.Command("docker", "network", "create",
+	out, err := exec.CommandContext(ctx, "docker", "network", "create",
 		"--internal", s.internalNetwork).CombinedOutput()
 	if err != nil {
 		return cleanup, "", fmt.Errorf("create network %s: %s: %w",
@@ -193,37 +251,59 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 		"-v", allowFile + ":/etc/membrane/allow.json:ro",
 		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.dnsResolver(),
 		"-e", fmt.Sprintf("MEMBRANE_SSL_INSECURE=%v", cfg.SSLInsecure),
-		handlerImageName,
 	}
 
-	if out, err := exec.Command("docker", handlerArgs...).CombinedOutput(); err != nil {
+	if trace {
+		if s.cgroupParent == "" {
+			return cleanup, "", errors.New("tracing requires a pre-created session cgroup")
+		}
+		traceDir := filepath.Dir(traceLogFile)
+		if err := os.MkdirAll(traceDir, 0o755); err != nil {
+			return cleanup, "", fmt.Errorf("create trace dir: %w", err)
+		}
+		containerTracePath := "/trace/" + filepath.Base(traceLogFile)
+		handlerArgs = append(handlerArgs,
+			"--cap-add=BPF",
+			"--cap-add=PERFMON",
+			"-v", "/sys/fs/cgroup:/sys/fs/cgroup:ro",
+			"-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
+			"-e", "MEMBRANE_TARGET_CGROUP=/sys/fs/cgroup/"+strings.TrimPrefix(s.cgroupParent, "/"),
+			"-e", "MEMBRANE_TRACE_FILE="+containerTracePath,
+			"-v", traceDir+":/trace",
+		)
+	}
+
+	handlerArgs = append(handlerArgs, handlerImageName)
+
+	if out, err := exec.CommandContext(ctx, "docker", handlerArgs...).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("start handler: %s: %w", out, err)
 	}
 
-	if out, err := exec.Command("docker", "network", "connect",
+	if out, err := exec.CommandContext(ctx, "docker", "network", "connect",
 		s.internalNetwork, s.handlerContainer).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("connect handler to internal network: %s: %w", out, err)
 	}
 
 	// Wait for handler ready signal (timeout 30s).
 	for i := 0; i < 30; i++ {
-		if exec.Command("docker", "exec", s.handlerContainer,
+		if err := ctx.Err(); err != nil {
+			return cleanup, "", err
+		}
+		if exec.CommandContext(ctx, "docker", "exec", s.handlerContainer,
 			"test", "-f", "/tmp/handler-ready").Run() == nil {
 			break
 		}
-		if i == 29 {
-			logs, _ := exec.Command("docker", "logs",
+		running, _ := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", s.handlerContainer).Output()
+		if i == 29 || strings.TrimSpace(string(running)) != "true" {
+			logs, _ := exec.CommandContext(ctx, "docker", "logs",
 				s.handlerContainer).CombinedOutput()
 			return cleanup, "", fmt.Errorf(
-				"handler did not become ready within 30s\nHandler logs:\n%s", logs)
+				"handler exited or did not become ready within 30s\nHandler logs:\n%s", logs)
 		}
 		time.Sleep(time.Second)
 	}
 
-	// Persist handler logs to ~/.membrane/logs/<handler-container>.log
-	// during the session, gzipped on cleanup. Mirrors the trace file
-	// pattern in tracer.go — preserves logs after the session ends so
-	// failures can be investigated post-hoc.
+	// Keep handler logs readable during the session; gzip them on cleanup.
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return cleanup, "", fmt.Errorf("get home dir: %w", err)
@@ -237,7 +317,6 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 	if err != nil {
 		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
 	}
-
 	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
 	logCmd.Stdout = logFile
 	logCmd.Stderr = logFile
@@ -248,9 +327,7 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 
 	prevCleanup2 := cleanup
 	cleanup = func() {
-		if logCmd.Process != nil {
-			_ = logCmd.Process.Kill()
-		}
+		_ = logCmd.Process.Kill()
 		_ = logCmd.Wait()
 		logFile.Close()
 		if err := gzipFile(logPath + ".gz"); err == nil {
@@ -274,12 +351,13 @@ func startSession(s sessionNames, cfg *config) (func(), string, error) {
 	return cleanup, gatewayIP, nil
 }
 
-// buildAgentArgs constructs the full argument list for docker run of the agent.
+// buildAgentArgs constructs docker run (untraced) or docker create (scoped).
 // passthrough args are appended after the image name as the container command.
-func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string, s sessionNames, gatewayIP string) ([]string, error) {
-	sysbox := hasSysbox()
-
+func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string, s sessionNames, gatewayIP string, sysbox bool) ([]string, error) {
 	args := []string{"run", "-it", "--rm", "--init", "--name", s.agentContainer}
+	if s.cgroupParent != "" {
+		args[0] = "create"
+	}
 
 	if sysbox {
 		args = append(args, "--runtime=sysbox-runc", "-e", "MEMBRANE_DIND=1")
@@ -327,6 +405,10 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 
 	// Extra args from config.
 	args = append(args, cfg.Args...)
+	if s.cgroupParent != "" {
+		// Session identity takes precedence over a configured Docker parent.
+		args = append(args, "--cgroup-parent="+s.cgroupParent)
+	}
 
 	if title := os.Getenv("MEMBRANE_TITLE"); title != "" {
 		args = append(args, "-e", "MEMBRANE_TITLE="+title)
@@ -339,6 +421,90 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 	args = append(args, passthrough...)
 
 	return args, nil
+}
+
+// gzipFile compresses a closed handler log, independently of eBPF trace output.
+func gzipFile(dst string) error {
+	in, err := os.Open(strings.TrimSuffix(dst, ".gz"))
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	gz := gzip.NewWriter(out)
+	defer gz.Close()
+	_, err = io.Copy(gz, in)
+	return err
+}
+
+// runAgent keeps the existing terminal proxy for start/attach and stops the
+// workload if its handler exits. Creation never executes image code.
+func runAgent(ctx context.Context, s sessionNames, args []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if args[0] == "run" {
+		// Preserve the untraced Docker lifecycle. The traced path below creates
+		// the container before monitoring it, so teardown cannot race creation.
+		return execDocker(args)
+	}
+	if args[0] == "create" {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			for i, arg := range args {
+				if arg == "-it" {
+					args[i] = "-i"
+				}
+			}
+		}
+		if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("create agent: %s: %w", out, err)
+		}
+		args = []string{"start", "--attach", "--interactive", s.agentContainer}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Cancellation is handled by the select below. Canceling docker wait at
+	// the same time would incorrectly report an intentional stop as failure.
+	waitCtx, cancel := context.WithCancel(context.Background())
+	handlerDone := make(chan error, 1)
+	waitFinished := make(chan struct{})
+	defer func() {
+		cancel()
+		<-waitFinished
+	}()
+	go func() {
+		defer close(waitFinished)
+		out, err := exec.CommandContext(waitCtx, "docker", "wait", s.handlerContainer).CombinedOutput()
+		handlerDone <- fmt.Errorf("handler exited during session: %s (%v)", strings.TrimSpace(string(out)), err)
+	}()
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- execDocker(args) }()
+	select {
+	case err := <-agentDone:
+		running, inspectErr := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", s.handlerContainer).Output()
+		if inspectErr != nil || strings.TrimSpace(string(running)) != "true" {
+			logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
+			return fmt.Errorf("handler failed during session\nHandler logs:\n%s", logs)
+		}
+		return err
+	case err := <-handlerDone:
+		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
+		<-agentDone
+		logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
+		return fmt.Errorf("%w\nHandler logs:\n%s", err, logs)
+	case <-ctx.Done():
+		_ = exec.Command("docker", "stop", "-t", "2", s.agentContainer).Run()
+		err := <-agentDone
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
 }
 
 // ExitError carries the exit code from the docker run child process.
@@ -357,6 +523,8 @@ func (e *ExitError) Error() string {
 // Otherwise stdin/stdout/stderr are wired directly so that output can
 // be captured by scripts and tools like GNU parallel.
 func execDocker(args []string) error {
+	done := make(chan struct{})
+	defer close(done)
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
 		return fmt.Errorf("docker not found in PATH: %w", err)
@@ -388,8 +556,13 @@ func execDocker(args []string) error {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 		defer signal.Stop(sigCh)
 		go func() {
-			for sig := range sigCh {
-				_ = cmd.Process.Signal(sig)
+			for {
+				select {
+				case sig := <-sigCh:
+					_ = cmd.Process.Signal(sig)
+				case <-done:
+					return
+				}
 			}
 		}()
 
@@ -417,9 +590,14 @@ func execDocker(args []string) error {
 	signal.Notify(resizeCh, syscall.SIGWINCH)
 	defer signal.Stop(resizeCh)
 	go func() {
-		for range resizeCh {
-			if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-				_ = pty.Setsize(ptmx, ws)
+		for {
+			select {
+			case <-resizeCh:
+				if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+					_ = pty.Setsize(ptmx, ws)
+				}
+			case <-done:
+				return
 			}
 		}
 	}()
@@ -438,8 +616,13 @@ func execDocker(args []string) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 	go func() {
-		for sig := range sigCh {
-			_ = cmd.Process.Signal(sig)
+		for {
+			select {
+			case sig := <-sigCh:
+				_ = cmd.Process.Signal(sig)
+			case <-done:
+				return
+			}
 		}
 	}()
 

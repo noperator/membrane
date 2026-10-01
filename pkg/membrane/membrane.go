@@ -10,7 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
-	"time"
+
+	"golang.org/x/term"
 )
 
 // CLIOverrides holds config values passed via CLI flags. List fields are
@@ -104,81 +105,57 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		}
 	}
 
-	cleanup, gatewayIP, err := startSession(s, cfg)
-	defer cleanup()
+	// Resolve trace log path before starting session (needed for bind mount).
+	traceLogFile := traceLog
+	if trace && traceLogFile == "" {
+		traceLogFile = filepath.Join(membraneDir, "trace", s.agentContainer+".jsonl.gz")
+	}
+	if trace && !filepath.IsAbs(traceLogFile) {
+		traceLogFile, err = filepath.Abs(traceLogFile)
+		if err != nil {
+			return fmt.Errorf("resolve trace log path: %w", err)
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	if trace {
+		cleanupCgroup, err := createSessionCgroup(ctx, &s)
+		defer cleanupCgroup()
+		if err != nil {
+			return err
+		}
+	}
+
+	var setupSpinner *spinner
+	if trace && term.IsTerminal(int(os.Stdin.Fd())) {
+		setupSpinner = newSpinner()
+		setupSpinner.Start("Setting up sandbox...")
+	}
+	cleanup, gatewayIP, err := startSession(ctx, s, cfg, trace, traceLogFile)
+	if setupSpinner != nil {
+		setupSpinner.Stop()
+	}
+	defer func() {
+		var teardownSpinner *spinner
+		if trace && term.IsTerminal(int(os.Stdin.Fd())) {
+			teardownSpinner = newSpinner()
+			teardownSpinner.Start("Tearing down sandbox...")
+		}
+		cleanup()
+		if teardownSpinner != nil {
+			teardownSpinner.Stop()
+		}
+	}()
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
 
-	args, err := buildAgentArgs(workspaceDir, m, cfg, passthrough, s, gatewayIP)
+	args, err := buildAgentArgs(workspaceDir, m, cfg, passthrough, s, gatewayIP, hasSysbox())
 	if err != nil {
 		return err
 	}
 
-	if !trace {
-		return execDocker(args)
-	}
-
-	// -- Traced run: Tracee sidecar → agent container → cleanup --
-
-	// Resolve trace log path.
-	traceLogFile := traceLog
-	if traceLogFile == "" {
-		traceLogFile = filepath.Join(membraneDir, "trace", s.agentContainer+".jsonl.gz")
-	}
-	if err := os.MkdirAll(filepath.Dir(traceLogFile), 0o755); err != nil {
-		return fmt.Errorf("create trace dir: %w", err)
-	}
-
-	tracer := NewTracer(s.agentContainer, traceLogFile)
-	if err := tracer.Start(); err != nil {
-		return fmt.Errorf("tracee failed to start: %w\nRe-run with --no-trace to start without tracing", err)
-	}
-	defer tracer.Stop()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	go func() {
-		<-sigs
-		cancel()
-	}()
-
-	// Run the agent container in a goroutine so we can resolve its
-	// container ID and set up event filtering while it runs.
-	agentErr := make(chan error, 1)
-	go func() { agentErr <- execDocker(args) }()
-
-	// Retry docker inspect until the container exists (up to ~5s).
-	var cid string
-	for i := 0; i < 10; i++ {
-		out, err := exec.Command("docker", "inspect", "-f", "{{.Id}}", s.agentContainer).Output()
-		if err == nil {
-			cid = strings.TrimSpace(string(out))
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if cid == "" {
-		return fmt.Errorf("could not resolve container ID for %s", s.agentContainer)
-	}
-
-	tracer.StartStreaming(cid)
-
-	// Wait for the agent container to exit or a signal to arrive.
-	var result error
-	select {
-	case result = <-agentErr:
-	case <-ctx.Done():
-		// Signal received; stop the agent container so execDocker unblocks
-		// and restores the terminal. Tracee cleaned up by deferred tracer.Stop().
-		fmt.Fprintln(os.Stderr, "\r\nmembrane: stopping...")
-		_ = exec.Command("docker", "stop", "-t", "2", s.agentContainer).Run()
-		<-agentErr
-	}
-	return result
+	return runAgent(ctx, s, args)
 }
 
 func checkAndUpdate(repoDir string) error {

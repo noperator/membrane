@@ -2,3 +2,4 @@ notes.txt
 /membrane
 .membrane.yaml
 /docker/handler/dns-proxy/dns-proxy
+/docker/handler/tracer/tracer
