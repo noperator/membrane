@@ -24,14 +24,15 @@ RUN CRUN_VER=1.22 && \
 # packages. This stage needs build-essential and python3 so native npm
 # modules compile cleanly.
 FROM base AS node-stage
-ARG NODE_VERSION=20
+ARG NODE_VERSION=22
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && \
     apt-get install -y --no-install-recommends \
         nodejs build-essential python3 \
     && rm -rf /var/lib/apt/lists/*
 RUN npm install -g \
-    @anthropic-ai/claude-code@2.1.87 \
-    @openai/codex@0.118.0
+    @anthropic-ai/claude-code@2.1.286 \
+    @openai/codex@0.159.2 \
+    @moonshot-ai/kimi-code@2.1.1
 
 # ---- Parallel stage: download .debs only, do not install them ----
 # Runs concurrent with go-stage, crun-stage, node-stage.
