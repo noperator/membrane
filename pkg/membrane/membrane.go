@@ -18,7 +18,7 @@ import (
 // CLIOverrides holds config values passed via CLI flags. List fields are
 // appended to the merged file config; scalar fields replace it.
 type CLIOverrides struct {
-	Ignore      []string
+	Sealed      []string
 	Readonly    []string
 	Allow       []string // raw strings, parsed via ParseAllowEntry
 	Args        []string
@@ -79,7 +79,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return err
 	}
 
-	cfg.Ignore = append(cfg.Ignore, cli.Ignore...)
+	cfg.Sealed = append(cfg.Sealed, cli.Sealed...)
 	cfg.Readonly = append(cfg.Readonly, cli.Readonly...)
 	cfg.Args = append(cfg.Args, cli.Args...)
 	for _, entry := range cli.Allow {

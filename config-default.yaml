@@ -1,5 +1,5 @@
 # Workspace .membrane.yaml entries are appended to the global list, not
-# replaced. This applies to all list keys: ignore, readonly, allow, and args.
+# replaced. This applies to all list keys: sealed, readonly, allow, and args.
 
 # `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
 # Defaults to 1.1.1.1 if not set.
@@ -10,15 +10,13 @@ dns_resolver:
 # CA certs. Disabled by default.
 ssl_insecure: false
 
-# `ignore` lists patterns matched against filenames or relative paths.
-# Matching files and directories are shadowed with an empty placeholder
-# inside the container; the agent can see they exist but cannot read
-# their contents.
-ignore:
+# `sealed` lists patterns matched against filenames or relative paths.
+# Existing matching objects are sealed when the session starts.
+sealed:
   - "*.bak"
   - "*.tmp"
 
-# `readonly` lists patterns mounted into the container as read-only. Use
+# `readonly` enrolls existing matching objects READONLY at startup. Use
 # this for things like .git (so the agent can read history but not
 # rewrite it) or credential files that should be visible but not
 # writable.

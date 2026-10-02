@@ -10,7 +10,7 @@ import (
 func TestFilesystemPolicySelectorsAndPrecedence(t *testing.T) {
 	cfg := &config{
 		Readonly: []string{"config/", "*.txt", "tree/*/rules.[ch]"},
-		Ignore:   []string{"config/secrets.*", ".env", "sealed/"},
+		Sealed:   []string{"config/secrets.*", ".env", "sealed/"},
 	}
 	for _, test := range []struct {
 		path      string
@@ -51,7 +51,7 @@ func TestFilesystemPolicyInitialManifest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cfg := &config{Readonly: []string{"config/", "sealed/nested/"}, Ignore: []string{"config/secrets.txt", "sealed/"}}
+	cfg := &config{Readonly: []string{"config/", "sealed/nested/"}, Sealed: []string{"config/secrets.txt", "sealed/"}}
 	got, err := resolveFilesystemPolicy(root, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestFilesystemPolicySymlinkTargets(t *testing.T) {
 	if err := os.Symlink("missing", filepath.Join(root, "ordinary-dangling")); err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveFilesystemPolicy(root, &config{Ignore: []string{"sealed-link"}, Readonly: []string{"tree/"}})
+	got, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"sealed-link"}, Readonly: []string{"tree/"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,14 +99,14 @@ func TestFilesystemPolicySymlinkTargets(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("manifest = %#v, want %#v", got, want)
 	}
-	links, err := resolveFilesystemPolicy(root, &config{Ignore: []string{"ordinary-dangling"}})
+	links, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"ordinary-dangling"}})
 	if err != nil || !reflect.DeepEqual(links, []filesystemPolicyEntry{{Path: "ordinary-dangling", Mode: policySealed, NoFollow: true}}) {
 		t.Fatalf("dangling link snapshot = %#v, %v", links, err)
 	}
 	if err := os.Symlink(t.TempDir(), filepath.Join(root, "outside")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveFilesystemPolicy(root, &config{Ignore: []string{"outside"}}); err == nil {
+	if _, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"outside"}}); err == nil {
 		t.Fatal("an escaping protected link must not be silently skipped")
 	}
 }

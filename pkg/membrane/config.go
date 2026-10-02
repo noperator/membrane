@@ -2,6 +2,7 @@ package membrane
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -15,7 +16,7 @@ import (
 type config struct {
 	DNSResolver string      `yaml:"dns_resolver"`
 	SSLInsecure bool        `yaml:"ssl_insecure"`
-	Ignore      []string    `yaml:"ignore"`
+	Sealed      []string    `yaml:"sealed"`
 	Readonly    []string    `yaml:"readonly"`
 	Args        []string    `yaml:"args"`
 	Allow       []AllowRule `yaml:"allow"`
@@ -276,7 +277,7 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	}
 
 	if !workspaceMissing {
-		base.Ignore = append(base.Ignore, workspace.Ignore...)
+		base.Sealed = append(base.Sealed, workspace.Sealed...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
 		base.Args = append(base.Args, workspace.Args...)
 		base.Allow = append(base.Allow, workspace.Allow...)
@@ -292,7 +293,9 @@ func loadConfigFile(path string) (*config, error) {
 		return nil, err
 	}
 	cfg := &config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return cfg, nil

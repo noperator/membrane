@@ -24,7 +24,7 @@ type filesystemPolicyEntry struct {
 }
 
 func effectiveFilesystemPolicy(cfg *config, relative, name string, inherited uint32) uint32 {
-	if inherited == policySealed || matchesAny(relative, name, cfg.Ignore) {
+	if inherited == policySealed || matchesAny(relative, name, cfg.Sealed) {
 		return policySealed
 	}
 	if inherited == policyReadonly || matchesAny(relative, name, cfg.Readonly) {
@@ -38,7 +38,7 @@ func effectiveFilesystemPolicy(cfg *config, relative, name string, inherited uin
 // selectors combine by maximum policy, and every protected directory descendant
 // is included rather than only the directory's mount path.
 func resolveFilesystemPolicy(workspace string, cfg *config) ([]filesystemPolicyEntry, error) {
-	if len(cfg.Ignore) == 0 && len(cfg.Readonly) == 0 {
+	if len(cfg.Sealed) == 0 && len(cfg.Readonly) == 0 {
 		return nil, nil
 	}
 	var entries []filesystemPolicyEntry

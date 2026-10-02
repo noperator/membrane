@@ -776,7 +776,7 @@ def group_27(ctx):
         target = ctx.workdir / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("fixture data\n")
-    config(ctx, "readonly:\n  - config/\n  - sealed/readonly/\nignore:\n  - config/secrets.txt\n  - sealed/\n")
+    config(ctx, "readonly:\n  - config/\n  - sealed/readonly/\nsealed:\n  - config/secrets.txt\n  - sealed/\n")
     copy_policy_workload(ctx.workdir)
     result = membrane(ctx, ["sudo", "python3", "/workspace/policy-workload.py", "precedence"])
     ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith("PASS "))
@@ -797,7 +797,7 @@ def filesystem_case(ctx, sealed):
     (base / "symlink").symlink_to("protected")
     os.link(base / "protected", base / "hardlink")
     shutil.copy2(base / "trace-workload", base / "protected-exec")
-    config(ctx, ("ignore" if sealed else "readonly") + ":\n  - protected\n  - protected-exec\n  - secrets/\n")
+    config(ctx, ("sealed" if sealed else "readonly") + ":\n  - protected\n  - protected-exec\n  - secrets/\n")
     copy_policy_workload(base)
     # Linux xattr APIs are absent from macOS Python. Prepare metadata using
     # Linux's view of the same workspace, outside any Membrane policy session.
@@ -896,11 +896,11 @@ def group_30(ctx):
     a_dir, b_dir = ctx.workdir / "a", ctx.workdir / "b"
     (a_dir / "protected").write_text("sealed\n")
     (a_dir / "readonly").write_text("readonly\n")
-    (a_dir / ".membrane.yaml").write_text("ignore: [protected]\nreadonly: [readonly]\n")
+    (a_dir / ".membrane.yaml").write_text("sealed: [protected]\nreadonly: [readonly]\n")
     (b_dir / "other").write_text("B sealed\n")
     os.link(a_dir / "protected", b_dir / "protected")
     os.link(b_dir / "other", a_dir / "other")
-    (b_dir / ".membrane.yaml").write_text("ignore: [other]\n")
+    (b_dir / ".membrane.yaml").write_text("sealed: [other]\n")
     shutil.copy2(ctx.workdir / "policy-dind", a_dir / "policy-dind")
     with ExitStack() as stack:
         a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]))
@@ -945,7 +945,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     env = trace_docker_env(ctx)
     failed_dir = ctx.workdir / "failed"
     (failed_dir / "protected").write_text("secret\n")
-    (failed_dir / ".membrane.yaml").write_text("ignore: [protected]\n")
+    (failed_dir / ".membrane.yaml").write_text("sealed: [protected]\n")
     with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1")) as failed:
         output = failed.wait(expected=None)
         check(ctx, failed.process.returncode != 0 and "load filesystem policy BPF" in output, "LSM setup failure aborts clearly")
@@ -959,7 +959,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     os.link(directory / ".env", directory / "old-alias")
     (directory / "ordinary").write_text("ordinary\n")
     (directory / "readonly-old").write_text("readonly original\n")
-    (directory / ".membrane.yaml").write_text("ignore: [.env, tree/]\nreadonly: [readonly-old]\n")
+    (directory / ".membrane.yaml").write_text("sealed: [.env, tree/]\nreadonly: [readonly-old]\n")
     with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
         snapshot.wait_for("ready")
         update_snapshot_workspace(ctx, snapshot, r'''
@@ -976,7 +976,7 @@ os.replace(directory / "temp", directory / "readonly-old")
         cleaned(ctx, snapshot)
 
     directory = ctx.workdir / "late"
-    (directory / ".membrane.yaml").write_text("ignore: [.env]\n")
+    (directory / ".membrane.yaml").write_text("sealed: [.env]\n")
     with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "late-only"], options=["--no-trace"]) as late:
         late.wait_for("ready")
         check_handler(ctx, late, traced=False)
@@ -988,7 +988,7 @@ os.replace(directory / "temp", directory / "readonly-old")
 
     directory = ctx.workdir / "death"
     (directory / "protected").write_text("secret\n")
-    (directory / ".membrane.yaml").write_text("ignore: [protected]\n")
+    (directory / ".membrane.yaml").write_text("sealed: [protected]\n")
     with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]) as death:
         death.wait_for("ready")
         # Pause CLI teardown to make the otherwise tiny controller-death window
@@ -1038,7 +1038,7 @@ GROUPS = {
     11: TestGroup("DNS filtering and resolver bypass", group_11),
     12: TestGroup("HTTP path boundaries", group_12),
     13: TestGroup("HTTP rules on hostname destinations", group_13),
-    14: TestGroup("sealed filesystem objects (ignore)", group_14),
+    14: TestGroup("sealed filesystem objects", group_14),
     15: TestGroup("HTTP rules on IP destinations", group_15),
     16: TestGroup("multi-question DNS rejection", group_16),
     17: TestGroup("UDP default deny and port opt-in", group_17),
