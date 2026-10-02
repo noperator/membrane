@@ -1,5 +1,5 @@
-// Tracer loads custom eBPF probes and streams events as gzipped JSONL.
-// Started by the handler entrypoint when tracing is requested.
+// Tracer loads mandatory filesystem policy and optional observability probes.
+// Started by the handler when either policy or tracing is requested.
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel,bpfeb probe ../ebpf/probe.c -- -Wall -Werror
 
@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 )
@@ -171,14 +172,49 @@ func main() {
 	defer stop()
 	if err := run(ctx, os.Getenv("MEMBRANE_TARGET_CGROUP"), os.Getenv("MEMBRANE_TRACE_FILE")); err != nil {
 		// All resource and gzip cleanup has run before exiting.
+		var verifier *ebpf.VerifierError
+		if errors.As(err, &verifier) {
+			log.Printf("BPF verifier: %+v", verifier)
+		}
 		log.Fatalf("tracer: %+v", err)
 	}
 	log.Println("tracer exited cleanly")
 }
 
 func run(ctx context.Context, cgroupPath, traceFile string) (retErr error) {
+	policyFile := os.Getenv("MEMBRANE_POLICY_FILE")
+	if traceFile == "" && policyFile == "" {
+		return errors.New("neither tracing nor filesystem policy requested")
+	}
+	if policyFile != "" {
+		data, err := os.ReadFile(policyFile)
+		if err != nil {
+			return fmt.Errorf("read mandatory policy manifest: %w", err)
+		}
+		var entries []policyEntry
+		if err := json.Unmarshal(data, &entries); err != nil {
+			return fmt.Errorf("decode mandatory policy manifest: %w", err)
+		}
+		if len(entries) == 0 {
+			return errors.New("mandatory policy manifest is empty")
+		}
+		closePolicy, err := loadFilesystemPolicy(ctx, cgroupPath, os.Getenv("MEMBRANE_POLICY_WORKSPACE"), os.Getenv("MEMBRANE_POLICY_PINS"), entries)
+		if err != nil {
+			return err
+		}
+		defer closePolicy()
+		log.Printf("filesystem policy seeded, attached and pinned: %d startup objects", len(entries))
+	}
 	if traceFile == "" {
-		return errors.New("MEMBRANE_TRACE_FILE not set")
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.WriteFile("/tmp/tracer-ready", nil, 0644); err != nil {
+			return err
+		}
+		defer os.Remove("/tmp/tracer-ready")
+		<-ctx.Done()
+		return nil
 	}
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		return fmt.Errorf("tracing requires the host cgroup v2 filesystem: %w", err)

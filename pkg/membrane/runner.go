@@ -65,6 +65,8 @@ type sessionNames struct {
 	internalNetwork  string
 	externalNetwork  string
 	caVolume         string
+	policyPins       string
+	preservePolicy   bool
 }
 
 // createSessionCgroup establishes the scope before any container workload can
@@ -92,24 +94,21 @@ func createSessionCgroup(ctx context.Context, s *sessionNames) (func(), error) {
 		parent = "membrane" + s.id + ".slice"
 		create, remove = []string{"systemctl", "start", parent}, []string{"systemctl", "stop", parent}
 	default:
-		return cleanup, fmt.Errorf("tracing requires cgroup v2 with cgroupfs or systemd; Docker reports %q", layout[0]+" "+layout[1])
+		return cleanup, fmt.Errorf("BPF requires cgroup v2 with cgroupfs or systemd; Docker reports %q", layout[0]+" "+layout[1])
+	}
+	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "membrane: requesting sudo to manage BPF session cgroups and filesystem policy")
 	}
 	s.cgroupParent = parent
-	hostCommand := func(ctx context.Context, args []string) *exec.Cmd {
-		if runtime.GOOS == "darwin" {
-			return exec.CommandContext(ctx, "colima", append([]string{"ssh", "--profile", "membrane", "--", "sudo", "-n", "--"}, args...)...)
-		}
-		if os.Geteuid() == 0 {
-			return exec.CommandContext(ctx, args[0], args[1:]...)
-		}
-		return exec.CommandContext(ctx, "sudo", append([]string{"-n", "--"}, args...)...)
-	}
 	cleanup = func() {
-		if out, err := hostCommand(context.Background(), remove).CombinedOutput(); err != nil {
+		if s.preservePolicy {
+			return
+		}
+		if out, err := dockerHostCommand(context.Background(), remove...).CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: remove session cgroup %s: %s: %v\n", s.cgroupParent, out, err)
 		}
 	}
-	if out, err := hostCommand(ctx, create).CombinedOutput(); err != nil {
+	if out, err := dockerHostCommand(ctx, create...).CombinedOutput(); err != nil {
 		if ctx.Err() == nil {
 			// A failed mkdir may mean the path already belongs to someone else.
 			cleanup = func() {}
@@ -186,10 +185,17 @@ func removeDockerUserRule(bridge string) {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(ctx context.Context, s sessionNames, cfg *config, trace bool, traceLogFile string) (func(), string, error) {
+func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, workspace, policyFile string) (func(), string, error) {
 	cleanup := func() {
 		// Remove all workload processes before detaching BPF, including DinD.
 		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
+		if s.policyPins != "" {
+			if err := stopPolicyWorkload(*s); err != nil {
+				s.preservePolicy = true
+				fmt.Fprintf(os.Stderr, "ERROR: retaining mandatory policy and handler: %v; pins=%s cgroup=%s\n", err, s.policyPins, s.cgroupParent)
+				return
+			}
+		}
 		_ = exec.Command("docker", "stop", "-t", "10", s.handlerContainer).Run()
 		_ = exec.Command("docker", "rm", s.handlerContainer).Run()
 		_ = exec.Command("docker", "network", "rm", s.internalNetwork).Run()
@@ -253,24 +259,32 @@ func startSession(ctx context.Context, s sessionNames, cfg *config, trace bool, 
 		"-e", fmt.Sprintf("MEMBRANE_SSL_INSECURE=%v", cfg.SSLInsecure),
 	}
 
-	if trace {
+	if trace || policyFile != "" {
 		if s.cgroupParent == "" {
-			return cleanup, "", errors.New("tracing requires a pre-created session cgroup")
+			return cleanup, "", errors.New("BPF requires a pre-created session cgroup")
 		}
-		traceDir := filepath.Dir(traceLogFile)
-		if err := os.MkdirAll(traceDir, 0o755); err != nil {
-			return cleanup, "", fmt.Errorf("create trace dir: %w", err)
-		}
-		containerTracePath := "/trace/" + filepath.Base(traceLogFile)
-		handlerArgs = append(handlerArgs,
-			"--cap-add=BPF",
-			"--cap-add=PERFMON",
+		handlerArgs = append(handlerArgs, "--cap-add=BPF", "--cap-add=PERFMON",
 			"-v", "/sys/fs/cgroup:/sys/fs/cgroup:ro",
+			"-e", "MEMBRANE_TARGET_CGROUP="+sessionCgroupPath(*s))
+	}
+	if trace {
+		traceDir := filepath.Dir(traceLogFile)
+		if err := os.MkdirAll(traceDir, 0755); err != nil {
+			return cleanup, "", err
+		}
+		handlerArgs = append(handlerArgs,
 			"-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
-			"-e", "MEMBRANE_TARGET_CGROUP=/sys/fs/cgroup/"+strings.TrimPrefix(s.cgroupParent, "/"),
-			"-e", "MEMBRANE_TRACE_FILE="+containerTracePath,
-			"-v", traceDir+":/trace",
-		)
+			"-e", "MEMBRANE_TRACE_FILE=/trace/"+filepath.Base(traceLogFile),
+			"-v", traceDir+":/trace")
+	}
+	if policyFile != "" {
+		handlerArgs = append(handlerArgs,
+			"-v", workspace+":/policy-workspace:ro",
+			"-v", policyFile+":/etc/membrane/policy.json:ro",
+			"-v", s.policyPins+":/policy-pins",
+			"-e", "MEMBRANE_POLICY_FILE=/etc/membrane/policy.json",
+			"-e", "MEMBRANE_POLICY_WORKSPACE=/policy-workspace",
+			"-e", "MEMBRANE_POLICY_PINS=/policy-pins")
 	}
 
 	handlerArgs = append(handlerArgs, handlerImageName)
@@ -353,7 +367,7 @@ func startSession(ctx context.Context, s sessionNames, cfg *config, trace bool, 
 
 // buildAgentArgs constructs docker run (untraced) or docker create (scoped).
 // passthrough args are appended after the image name as the container command.
-func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []string, s sessionNames, gatewayIP string, sysbox bool) ([]string, error) {
+func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s sessionNames, gatewayIP string, sysbox bool) ([]string, error) {
 	args := []string{"run", "-it", "--rm", "--init", "--name", s.agentContainer}
 	if s.cgroupParent != "" {
 		args[0] = "create"
@@ -370,19 +384,6 @@ func buildAgentArgs(workspaceDir string, m *mounts, cfg *config, passthrough []s
 		"-e", "MEMBRANE_GATEWAY="+gatewayIP,
 		"-v", workspaceDir+":/workspace",
 	)
-
-	// Add overlay mounts. Readonly first, then shadows (shadows must come
-	// after to override).
-	for _, mt := range m.items {
-		if !mt.empty {
-			args = append(args, "-v", mt.hostPath+":"+mt.containerPath+":ro")
-		}
-	}
-	for _, mt := range m.items {
-		if mt.empty {
-			args = append(args, "-v", mt.hostPath+":"+mt.containerPath+":ro")
-		}
-	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -494,7 +495,11 @@ func runAgent(ctx context.Context, s sessionNames, args []string) error {
 		return err
 	case err := <-handlerDone:
 		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
-		<-agentDone
+		select {
+		case <-agentDone:
+		case <-time.After(30 * time.Second):
+			return fmt.Errorf("%w; timed out waiting for workload attachment to exit", err)
+		}
 		logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
 		return fmt.Errorf("%w\nHandler logs:\n%s", err, logs)
 	case <-ctx.Done():

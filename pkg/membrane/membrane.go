@@ -2,6 +2,7 @@ package membrane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,7 +27,7 @@ type CLIOverrides struct {
 
 // Run is the main entry point called from cmd/membrane/main.go.
 // passthrough args are forwarded as the container command.
-func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessionIDFile string, passthrough []string, cli CLIOverrides) error {
+func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessionIDFile string, passthrough []string, cli CLIOverrides) (retErr error) {
 
 	if runtime.GOOS == "darwin" {
 		os.Setenv("DOCKER_CONTEXT", "colima-membrane")
@@ -92,7 +93,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		cfg.DNSResolver = cli.DNSResolver
 	}
 
-	m, err := scan(workspaceDir, cfg)
+	policy, err := resolveFilesystemPolicy(workspaceDir, cfg)
 	if err != nil {
 		return err
 	}
@@ -118,12 +119,24 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-	if trace {
+	if trace || len(policy) != 0 {
 		cleanupCgroup, err := createSessionCgroup(ctx, &s)
-		defer cleanupCgroup()
+		defer func() { cleanupCgroup(); removePolicyDirectory(s) }()
 		if err != nil {
 			return err
 		}
+	}
+
+	policyFile := ""
+	if len(policy) != 0 {
+		if err := createPolicyPins(ctx, &s); err != nil {
+			return err
+		}
+		policyFile, err = writePolicyFile(policy)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(policyFile)
 	}
 
 	var setupSpinner *spinner
@@ -131,7 +144,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		setupSpinner = newSpinner()
 		setupSpinner.Start("Setting up sandbox...")
 	}
-	cleanup, gatewayIP, err := startSession(ctx, s, cfg, trace, traceLogFile)
+	cleanup, gatewayIP, err := startSession(ctx, &s, cfg, trace, traceLogFile, workspaceDir, policyFile)
 	if setupSpinner != nil {
 		setupSpinner.Stop()
 	}
@@ -142,6 +155,9 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 			teardownSpinner.Start("Tearing down sandbox...")
 		}
 		cleanup()
+		if s.preservePolicy {
+			retErr = errors.Join(retErr, fmt.Errorf("mandatory policy retained because workload teardown could not be verified: %s", s.policyPins))
+		}
 		if teardownSpinner != nil {
 			teardownSpinner.Stop()
 		}
@@ -150,7 +166,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return fmt.Errorf("start session: %w", err)
 	}
 
-	args, err := buildAgentArgs(workspaceDir, m, cfg, passthrough, s, gatewayIP, hasSysbox())
+	args, err := buildAgentArgs(workspaceDir, cfg, passthrough, s, gatewayIP, hasSysbox())
 	if err != nil {
 		return err
 	}

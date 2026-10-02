@@ -236,7 +236,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' TERM INT
 
-if [ -n "${MEMBRANE_TRACE_FILE:-}" ]; then
+if [ -n "${MEMBRANE_TRACE_FILE:-}" ] || [ -n "${MEMBRANE_POLICY_FILE:-}" ]; then
     rm -f /tmp/tracer-ready
     tracer &
     TRACER_PID=$!

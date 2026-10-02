@@ -10,7 +10,7 @@ func TestAgentCgroupParentDockerArgument(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent"}}
 	for _, parent := range []string{"/membrane-test", ""} {
-		args, err := buildAgentArgs(workspace, &mounts{}, cfg, nil,
+		args, err := buildAgentArgs(workspace, cfg, nil,
 			sessionNames{cgroupParent: parent}, "172.20.0.2", false)
 		if err != nil {
 			t.Fatal(err)
@@ -22,6 +22,9 @@ func TestAgentCgroupParentDockerArgument(t *testing.T) {
 			continue
 		}
 		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "/workspace/") || strings.Contains(joined, "empty-file") || strings.Contains(joined, "empty-dir") {
+			t.Fatalf("per-path filesystem policy mount returned: %v", args)
+		}
 		if args[0] != "create" || !strings.Contains(joined, "--cgroup-parent="+parent) {
 			t.Fatalf("missing traced create/parent: %v", args)
 		}

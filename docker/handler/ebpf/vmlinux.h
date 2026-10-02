@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Only the Linux types used by probe.c. Kernel fields are relocated by CO-RE
+// Only the Linux types used by probe.c and policy.c. Fields are relocated by CO-RE
 // against runtime BTF; no build-host kernel headers or BTF dump are needed.
 #ifndef MEMBRANE_VMLINUX_H
 #define MEMBRANE_VMLINUX_H
@@ -18,7 +18,9 @@ typedef _Bool bool;
 #define false 0
 
 enum bpf_map_type {
+    BPF_MAP_TYPE_ARRAY = 2,
     BPF_MAP_TYPE_CGROUP_ARRAY = 8,
+    BPF_MAP_TYPE_INODE_STORAGE = 28,
     BPF_MAP_TYPE_RINGBUF = 27,
 };
 
@@ -29,6 +31,11 @@ struct mm_struct {
 };
 struct task_struct {
     struct task_struct *real_parent;
+    struct task_struct *group_leader;
+    unsigned int flags;
+    int pid;
+    __u64 start_boottime;
+    unsigned in_execve:1;
     int tgid;
     struct mm_struct *mm;
 };
@@ -39,6 +46,21 @@ struct path {
 struct file {
     struct path f_path;
     unsigned int f_flags;
+    unsigned int f_mode;
+    struct inode *f_inode;
+};
+struct inode {
+    unsigned short i_mode;
+};
+struct dentry {
+    struct inode *d_inode;
+    struct dentry *d_parent;
+};
+struct vm_area_struct {
+    struct file *vm_file;
+};
+struct linux_binprm {
+    struct file *file;
 };
 struct trace_entry {
     unsigned short type;
@@ -52,6 +74,10 @@ struct trace_event_raw_sys_enter {
     unsigned long args[6];
 };
 #pragma clang attribute pop
+
+struct iattr;
+struct mnt_idmap;
+struct posix_acl;
 
 // Socket ABI structures are userspace data, not CO-RE kernel fields.
 struct sockaddr {

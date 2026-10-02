@@ -1,0 +1,5 @@
+# Always regenerate BPF objects with the builder's compiler and checked-in CO-RE types.
+tracer/*_bpf*.go
+tracer/*_bpf*.o
+tracer/tracer
+dns-proxy/dns-proxy

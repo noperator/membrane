@@ -53,6 +53,17 @@ def command_details(args, expected, actual, stdout, stderr):
             f"stdout:\n{stdout}\nstderr:\n{stderr}")
 
 
+def start_process(args, *, detach=False, **kwargs):
+    if detach or sys.platform != "linux":
+        return subprocess.Popen(args, start_new_session=True, **kwargs)
+    # Keep the native host's controlling terminal and sudo timestamp, but give
+    # each command its own process group for timeout cleanup. A small exec
+    # wrapper supports Python 3.10 without preexec_fn in our threaded runner.
+    return subprocess.Popen([sys.executable, "-c",
+                             "import os, sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])",
+                             *args], **kwargs)
+
+
 def run(ctx, args, *, cwd=None, env=None, input=None, timeout=120, expected=0):
     """Capture every command; expected=None leaves status checks to the caller."""
     cwd = cwd if cwd is not None else ctx.workdir
@@ -60,10 +71,9 @@ def run(ctx, args, *, cwd=None, env=None, input=None, timeout=120, expected=0):
     actual, stdout, stderr = "not started", "", ""
     problem = None
     try:
-        with subprocess.Popen(args, cwd=cwd, env=env, text=True,
-                              stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              start_new_session=True) as process:
+        with start_process(args, detach=ctx is None, cwd=cwd, env=env, text=True,
+                           stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             try:
                 stdout, stderr = process.communicate(input, timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -305,11 +315,7 @@ def group_13(ctx):
 
 
 def group_14(ctx):
-    (ctx.workdir / "secrets").mkdir()
-    (ctx.workdir / "secrets/api-key.txt").write_text("api-key-value\n")
-    config(ctx, "ignore:\n  - secrets/\n")
-    exit_status(ctx, "14A trailing-slash ignore hides directory contents", 1,
-                ["cat", "/workspace/secrets/api-key.txt"])
+    filesystem_case(ctx, sealed=True)
 
 
 def group_15(ctx):
@@ -519,10 +525,10 @@ class Session:
             if self.use_terminal:
                 self.terminal = pty.openpty()
                 self.terminal_state = termios.tcgetattr(self.terminal[1])
-            self.process = subprocess.Popen(
+            self.process = start_process(
                 self.args, cwd=self.directory, env=self.env,
                 stdin=self.terminal[1] if self.terminal else subprocess.DEVNULL,
-                stdout=self.log, stderr=self.log, start_new_session=True)
+                stdout=self.log, stderr=self.log)
         except OSError as error:
             self.close()
             raise TestFailure(f"group {self.ctx.number}: {error}\n" + command_details(
@@ -636,17 +642,21 @@ def inspect(ctx, name):
     return json.loads(run(ctx, ["docker", "inspect", name]).stdout)[0]
 
 
-def check_handler(ctx, session, traced=True):
+def check_handler(ctx, session, traced=True, policy=False):
     data = inspect(ctx, "membrane-handler-" + session.id)
     cfg = data["HostConfig"]
     caps = {c.removeprefix("CAP_") for c in cfg.get("CapAdd") or []}
-    expected = {"NET_ADMIN", "BPF", "PERFMON"} if traced else {"NET_ADMIN"}
+    expected = {"NET_ADMIN", "BPF", "PERFMON"} if traced or policy else {"NET_ADMIN"}
     check(ctx, caps == expected and not cfg["Privileged"] and cfg["PidMode"] != "host", "handler capabilities and namespaces")
     mounts = {m["Destination"]: m for m in data["Mounts"]}
     kernel = {"/sys/fs/cgroup", "/sys/kernel/tracing"}
-    check(ctx, kernel.intersection(mounts) == (kernel if traced else set())
+    check(ctx, kernel.intersection(mounts) == (kernel if traced else {"/sys/fs/cgroup"} if policy else set())
           and all(not mounts[p]["RW"] for p in kernel.intersection(mounts))
           and ("/trace" in mounts) == traced, "tracing mounts match --no-trace setting")
+    if policy:
+        check(ctx, "/sys/kernel/security" not in mounts
+              and all(p in mounts and not mounts[p]["RW"] for p in ("/policy-workspace", "/etc/membrane/policy.json"))
+              and mounts["/policy-pins"]["RW"], "trusted enrollment and pin mounts")
     return data
 
 
@@ -659,6 +669,9 @@ def cleaned(ctx, session):
     check(ctx, all(run(ctx, [*host_prefix, "test", "!", "-d", path], expected=None).returncode == 0 for path in
               ("/sys/fs/cgroup/membrane-" + session.id, "/sys/fs/cgroup/membrane" + session.id + ".slice")),
           session.directory.name + ": session parent removed")
+    prefix = [*host_prefix, "sudo", "-n"] if sys.platform == "darwin" or os.geteuid() != 0 else []
+    check(ctx, run(ctx, [*prefix, "test", "!", "-d", "/sys/fs/bpf/membrane/" + session.id], expected=None).returncode == 0,
+          session.directory.name + ": mandatory policy pins removed")
 
 
 def build_trace_workload(ctx):
@@ -755,20 +768,55 @@ def group_25(ctx):
 
 
 def group_26(ctx):
-    (ctx.workdir / "secrets").mkdir()
-    (ctx.workdir / "secrets/api-key.txt").write_text("api-key-value\n")
-    config(ctx, "readonly:\n  - secrets/\n")
-    exit_status(ctx, "26A trailing-slash readonly makes directory read-only", 1,
-                ["bash", "-c", "echo test > /workspace/secrets/api-key.txt"])
+    filesystem_case(ctx, sealed=False)
 
 
 def group_27(ctx):
-    (ctx.workdir / "config").mkdir()
-    (ctx.workdir / "config/settings.yaml").write_text("safe-setting\n")
-    (ctx.workdir / "config/secrets.txt").write_text("secret-value\n")
-    config(ctx, "readonly:\n  - config/\nignore:\n  - config/secrets.txt\n")
-    exit_status(ctx, "27A ignore nested inside readonly errors at startup", 1,
-                ["echo", "should not run"])
+    for path in ("config/settings.yaml", "config/secrets.txt", "sealed/readonly/child"):
+        target = ctx.workdir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture data\n")
+    config(ctx, "readonly:\n  - config/\n  - sealed/readonly/\nignore:\n  - config/secrets.txt\n  - sealed/\n")
+    copy_policy_workload(ctx.workdir)
+    result = membrane(ctx, ["sudo", "python3", "/workspace/policy-workload.py", "precedence"])
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith("PASS "))
+    check(ctx, True, "27A overlapping rules start successfully; SEALED dominates READONLY")
+
+
+def copy_policy_workload(directory):
+    shutil.copy2(REPO_ROOT / "scripts/testdata/policy-workload.py", directory / "policy-workload.py")
+
+
+def filesystem_case(ctx, sealed):
+    build_trace_workload(ctx)
+    base = ctx.workdir
+    (base / "secrets/sub").mkdir(parents=True)
+    for path, data in (("protected", "protected data\n"), ("secrets/api-key.txt", "api-key-value\n"),
+                       ("ordinary", "ordinary\n"), ("replacement", "replacement\n")):
+        (base / path).write_text(data)
+    (base / "symlink").symlink_to("protected")
+    os.link(base / "protected", base / "hardlink")
+    shutil.copy2(base / "trace-workload", base / "protected-exec")
+    config(ctx, ("ignore" if sealed else "readonly") + ":\n  - protected\n  - protected-exec\n  - secrets/\n")
+    copy_policy_workload(base)
+    # Linux xattr APIs are absent from macOS Python. Prepare metadata using
+    # Linux's view of the same workspace, outside any Membrane policy session.
+    prepared = run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(base) + ":/workspace",
+                         "-w", "/workspace", "--entrypoint=python3", "membrane-agent",
+                         "/workspace/policy-workload.py", "prepare"])
+    ctx.output.extend(line for line in prepared.stdout.splitlines() if line.startswith(("PASS ", "SKIP ")))
+    with Session(ctx, base, ["sudo", "python3", "/workspace/policy-workload.py",
+                            "sealed" if sealed else "readonly"], options=["--no-trace"]) as session:
+        session.wait_for("ready")
+        check(ctx, (base / "protected").read_text() == "protected data\n", "host can read protected object")
+        (base / "protected").write_text("host modified protected object\n")
+        (base / "secrets/api-key.txt").write_text("host modified child\n")
+        (base / "host-new").write_text("host\n")
+        check(ctx, (base / "protected").read_text().startswith("host modified"), "host can modify enrolled objects")
+        session.release()
+        output = session.wait()
+        ctx.output.extend(line for line in output.splitlines() if line.startswith("PASS "))
+        cleaned(ctx, session)
 
 
 def group_28(ctx):
@@ -812,6 +860,164 @@ def group_29(ctx):
         cleaned(ctx, terminal)
 
 
+def update_snapshot_workspace(ctx, session, changes):
+    # Send Python over stdin so SSH cannot reinterpret paths or multiline code.
+    # Colima's login user owns the shared workspace; native Linux uses the same
+    # user as this runner. No container exec or session cgroup is involved.
+    command = (["colima", "ssh", "--profile", "membrane", "--", "python3", "-"]
+               if sys.platform == "darwin" else [sys.executable, "-"])
+    script = f"""import os
+from pathlib import Path
+directory = Path({str(session.directory)!r})
+session_id = {session.id!r}
+cgroup = next(line.split(':', 2)[2] for line in Path('/proc/self/cgroup').read_text().splitlines()
+              if line.startswith('0::'))
+parents = {{'membrane-' + session_id, 'membrane' + session_id + '.slice'}}
+if parents.intersection(Path(cgroup).parts):
+    raise RuntimeError('host mutator is inside session cgroup: ' + cgroup)
+print('PASS trusted Docker-host mutator outside session cgroup: ' + cgroup, flush=True)
+"""
+    result = run(ctx, command, input=script + changes + '\n(directory / "continue").touch()\n')
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith("PASS "))
+
+
+def group_30(ctx):
+    build_trace_workload(ctx)
+    host = ["colima", "ssh", "--profile", "membrane", "--", "sudo", "-n"] if sys.platform == "darwin" else (["sudo", "-n"] if os.geteuid() != 0 else [])
+    info = json.loads(run(ctx, ["docker", "info", "--format", "{{json .}}"], ).stdout)
+    arch = {"aarch64": "arm64", "x86_64": "amd64"}.get(info["Architecture"], info["Architecture"])
+    run(ctx, ["go", "build", "-buildvcs=false", "-o", str(ctx.workdir / "policy-dind"),
+              str(REPO_ROOT / "scripts/testdata/policy-dind.go")],
+        env=dict(ctx.environment, CGO_ENABLED="0", GOOS="linux", GOARCH=arch))
+    for name in ("a", "b", "failed", "snapshot", "late", "death"):
+        directory = ctx.workdir / name
+        directory.mkdir()
+        copy_policy_workload(directory)
+    a_dir, b_dir = ctx.workdir / "a", ctx.workdir / "b"
+    (a_dir / "protected").write_text("sealed\n")
+    (a_dir / "readonly").write_text("readonly\n")
+    (a_dir / ".membrane.yaml").write_text("ignore: [protected]\nreadonly: [readonly]\n")
+    (b_dir / "other").write_text("B sealed\n")
+    os.link(a_dir / "protected", b_dir / "protected")
+    os.link(b_dir / "other", a_dir / "other")
+    (b_dir / ".membrane.yaml").write_text("ignore: [other]\n")
+    shutil.copy2(ctx.workdir / "policy-dind", a_dir / "policy-dind")
+    with ExitStack() as stack:
+        a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]))
+        a.wait_for("ready")
+        b = stack.enter_context(Session(ctx, b_dir, ["sudo", "python3", "/workspace/policy-workload.py", "ordinary"], options=["--trace-log=" + str(b_dir / "trace.jsonl.gz")]))
+        b.wait_for("ready")
+        check_handler(ctx, a, traced=False, policy=True)
+        check_handler(ctx, b, traced=True, policy=True)
+        agent_a, agent_b = inspect(ctx, "membrane-agent-" + a.id), inspect(ctx, "membrane-agent-" + b.id)
+        check(ctx, a.id != b.id and agent_a["HostConfig"]["CgroupParent"] != agent_b["HostConfig"]["CgroupParent"], "concurrent policy sessions have distinct cgroups")
+        for session in (a, b):
+            pins = "/sys/fs/bpf/membrane/" + session.id
+            for name in ("policy_cgroup", "policy_inodes", "policy_controller", "policy_file_open"):
+                run(ctx, [*host, "test", "-f", pins + "/" + name])
+            check(ctx, True, session.directory.name + ": own pinned maps and enforcement links")
+        run(ctx, ["docker", "exec", "membrane-handler-" + a.id, "test", "!", "-d", "/trace"])
+        check(ctx, (a_dir / "protected").read_text() == "other session write\n", "other session can mutate the same inode")
+        run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", "/workspace/other"])
+        run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(a_dir) + ":/data", "--entrypoint=python3", "membrane-agent", "-c",
+                  "from pathlib import Path; p=Path('/data/protected'); p.read_bytes(); p.write_text('unrelated write\\n')"])
+        check(ctx, True, "unrelated Docker container remains unrestricted")
+        # Explicit original exploit, executing as sandbox root through sudo.
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mkdir", "-p", "/tmp/workspace-copy"])
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", "/workspace", "/tmp/workspace-copy"])
+        probe = """import errno, os
+for name, readable in [('protected', False), ('readonly', True)]:
+ for flags, allowed in [(os.O_RDONLY, readable), (os.O_WRONLY, False)]:
+  try: fd = os.open('/tmp/workspace-copy/' + name, flags)
+  except OSError as e:
+   if allowed or e.errno != errno.EACCES: raise
+  else:
+   os.close(fd)
+   if not allowed: raise RuntimeError('mount alias bypass: ' + name)
+"""
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "python3", "-c", probe])
+        check(ctx, True, "F-005 sudo bind-mount alias preserves sealed/readonly policy")
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "/workspace/policy-dind"], timeout=90)
+        check(ctx, True, "inner Docker descendant remains subject to policy")
+        b.release(); b.wait(); trace_events(ctx, b_dir / "trace.jsonl.gz"); cleaned(ctx, b)
+        a.release(); a.wait(); cleaned(ctx, a)
+
+    env = trace_docker_env(ctx)
+    failed_dir = ctx.workdir / "failed"
+    (failed_dir / "protected").write_text("secret\n")
+    (failed_dir / ".membrane.yaml").write_text("ignore: [protected]\n")
+    with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1")) as failed:
+        output = failed.wait(expected=None)
+        check(ctx, failed.process.returncode != 0 and "load filesystem policy BPF" in output, "LSM setup failure aborts clearly")
+        check(ctx, not (failed_dir / "first-instruction").exists(), "failed policy never starts workload")
+        cleaned(ctx, failed)
+
+    directory = ctx.workdir / "snapshot"
+    for name in ("late", "moved", "tree"):
+        (directory / name).mkdir()
+    (directory / ".env").write_text("startup sealed\n")
+    os.link(directory / ".env", directory / "old-alias")
+    (directory / "ordinary").write_text("ordinary\n")
+    (directory / "readonly-old").write_text("readonly original\n")
+    (directory / ".membrane.yaml").write_text("ignore: [.env, tree/]\nreadonly: [readonly-old]\n")
+    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
+        snapshot.wait_for("ready")
+        update_snapshot_workspace(ctx, snapshot, r'''
+(directory / ".env").rename(directory / "renamed-env")
+(directory / ".env").write_text("replacement\n")
+(directory / "late/.env").write_text("late\n")
+(directory / "ordinary").rename(directory / "moved/.env")
+(directory / "temp").write_text("replacement\n")
+os.replace(directory / "temp", directory / "readonly-old")
+(directory / "tree/new").write_text("new\n")
+''')
+        output = snapshot.wait()
+        ctx.output.extend(line for line in output.splitlines() if line.startswith("PASS "))
+        cleaned(ctx, snapshot)
+
+    directory = ctx.workdir / "late"
+    (directory / ".membrane.yaml").write_text("ignore: [.env]\n")
+    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "late-only"], options=["--no-trace"]) as late:
+        late.wait_for("ready")
+        check_handler(ctx, late, traced=False)
+        check(ctx, not inspect(ctx, "membrane-agent-" + late.id)["HostConfig"]["CgroupParent"], "empty snapshot does not create a BPF cgroup")
+        update_snapshot_workspace(ctx, late, r'(directory / ".env").write_text("late\n")')
+        output = late.wait()
+        ctx.output.extend(line for line in output.splitlines() if line.startswith("PASS "))
+        cleaned(ctx, late)
+
+    directory = ctx.workdir / "death"
+    (directory / "protected").write_text("secret\n")
+    (directory / ".membrane.yaml").write_text("ignore: [protected]\n")
+    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]) as death:
+        death.wait_for("ready")
+        # Pause CLI teardown to make the otherwise tiny controller-death window
+        # deterministic. Keep the handler alive too, so its controller is the
+        # only process deliberately killed here. The workload still runs.
+        handler = "membrane-handler-" + death.id
+        agent = "membrane-agent-" + death.id
+        handler_pid = str(inspect(ctx, handler)["State"]["Pid"])
+        processes = run(ctx, ["docker", "top", handler, "-eo", "pid,comm"]).stdout.splitlines()[1:]
+        tracer_pids = [line.split()[0] for line in processes if line.split()[-1] == "tracer"]
+        check(ctx, len(tracer_pids) == 1, "one handler-side BPF controller")
+        os.kill(death.process.pid, signal.SIGSTOP)
+        try:
+            run(ctx, [*host, "kill", "-STOP", handler_pid])
+            run(ctx, [*host, "kill", "-KILL", tracer_pids[0]])
+            run(ctx, [*host, "test", "-f", "/sys/fs/bpf/membrane/" + death.id + "/policy_file_open"])
+            death.release()
+            deadline = time.monotonic() + 15
+            while "PASS held policy remains active" not in death.output() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            check(ctx, "PASS held policy remains active" in death.output(), "live workload denied after controller SIGKILL")
+            check(ctx, inspect(ctx, handler)["State"]["Running"], "policy persists while handler teardown is paused")
+        finally:
+            os.kill(death.process.pid, signal.SIGCONT)
+            run(ctx, [*host, "kill", "-CONT", handler_pid], expected=None)
+        death.wait(expected=None)
+        cleaned(ctx, death)
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -832,7 +1038,7 @@ GROUPS = {
     11: TestGroup("DNS filtering and resolver bypass", group_11),
     12: TestGroup("HTTP path boundaries", group_12),
     13: TestGroup("HTTP rules on hostname destinations", group_13),
-    14: TestGroup("ignored filesystem paths", group_14),
+    14: TestGroup("sealed filesystem objects (ignore)", group_14),
     15: TestGroup("HTTP rules on IP destinations", group_15),
     16: TestGroup("multi-question DNS rejection", group_16),
     17: TestGroup("UDP default deny and port opt-in", group_17),
@@ -845,9 +1051,10 @@ GROUPS = {
     24: TestGroup("all-host wildcard and port restrictions", group_24),
     25: TestGroup("eBPF tracing and session isolation", group_25),
     26: TestGroup("readonly filesystem paths", group_26),
-    27: TestGroup("conflicting filesystem policy rules", group_27),
+    27: TestGroup("filesystem policy precedence", group_27),
     28: TestGroup("tracing modes and failure handling", group_28),
     29: TestGroup("traced workload lifecycle and terminal I/O", group_29),
+    30: TestGroup("filesystem LSM isolation, lifecycle and startup snapshot", group_30),
 }
 
 
@@ -930,6 +1137,16 @@ def main():
             print(f"FAIL {error}")
             return 1
         print(result.stdout + result.stderr, end="", flush=True)
+
+    if sys.platform == "linux" and os.geteuid() != 0 and selected.intersection({14, 25, 26, 27, 28, 29, 30}):
+        print("membrane tests: requesting sudo for BPF session setup and cleanup", file=sys.stderr, flush=True)
+        # Authenticate after the build, in the foreground before workers
+        # redirect I/O. Native workers retain this terminal via start_process().
+        try:
+            subprocess.run(["sudo", "-v"], check=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(f"FAIL host sudo authentication: {error}", file=sys.stderr)
+            return 1
 
     # Home is shared by Colima, whereas macOS /private/tmp need not be.
     artifacts = Path.home() / ".membrane/tmp"

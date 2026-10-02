@@ -1,5 +1,8 @@
-notes.txt
-/membrane
 .membrane.yaml
 /docker/handler/dns-proxy/dns-proxy
+/docker/handler/tracer/*_bpf*.go
+/docker/handler/tracer/*_bpf*.o
 /docker/handler/tracer/tracer
+/membrane
+__pycache__
+notes.txt
