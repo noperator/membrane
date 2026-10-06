@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-linux.sh
-# Installs Sysbox on Ubuntu and registers it with Docker.
+# Configures BPF LSM and installs persistent Sysbox services on Ubuntu.
 # Idempotent — safe to run multiple times.
 # Usage: bash install-linux.sh
 
@@ -22,14 +22,64 @@ error() {
     exit 1
 }
 
+enable_sysbox() {
+    # Sysbox CE 0.6.7 supplies these three enableable units. The wrapper binds
+    # both components and is WantedBy=multi-user.target; components are
+    # WantedBy=sysbox.service. Inspect the installed units, never guess a fallback.
+    local unit state
+    for unit in sysbox.service sysbox-mgr.service sysbox-fs.service; do
+        systemctl cat "$unit" >/dev/null 2>&1 || error "Sysbox package unit $unit is missing; reinstall the supported Sysbox package."
+    done
+    for unit in sysbox-mgr.service sysbox-fs.service sysbox.service; do
+        state=$(systemctl is-enabled "$unit" 2>/dev/null) || true
+        case "$state" in
+        enabled) sudo systemctl start "$unit" ;;
+        disabled | enabled-runtime | linked | linked-runtime) sudo systemctl enable --now "$unit" ;;
+        *) error "Cannot persist $unit (state: $state); inspect the installed package's systemd units." ;;
+        esac
+        systemctl is-active --quiet "$unit" || error "sysbox-runc is installed but its backing service $unit is not active."
+        [[ "$(systemctl is-enabled "$unit")" == enabled ]] || error "$unit is not enabled across reboot."
+        info "$unit: active and enabled"
+    done
+}
+
+configure_colima_sysbox() {
+    [[ "${MEMBRANE_COLIMA:-0}" == 1 ]] || return 0
+    # Colima starts Docker after VM provisioning. Pull Sysbox into that start
+    # transaction even when the earlier multi-user boot did not start it.
+    local dropin=/etc/systemd/system/docker.service.d/membrane-sysbox.conf
+    local settings='[Unit]
+Wants=sysbox.service
+After=sysbox.service'
+    systemctl cat --no-pager docker.service >/dev/null 2>&1 || error "Docker's systemd unit is missing."
+    if ! sudo cmp -s "$dropin" - <<<"$settings"; then
+        sudo test ! -e "$dropin" || error "$dropin has different contents; inspect it before running setup."
+        sudo mkdir -p /etc/systemd/system/docker.service.d
+        sudo tee "$dropin" >/dev/null <<<"$settings"
+        sudo systemctl daemon-reload
+    fi
+    info "Colima Docker startup pulls in Sysbox before starting containers."
+}
+
+# Allow the setup helpers to be exercised against fixture commands without
+# running package installation or smoke tests.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return; fi
+
 # -------------------------------------------------------
 # Platform check
 # -------------------------------------------------------
 [[ "$(uname)" == "Linux" ]] || error "This script is Linux only."
 command -v apt-get &>/dev/null || error "apt-get not found — Ubuntu/Debian required."
 command -v docker &>/dev/null || error "Docker not found. Install Docker first."
+command -v systemctl &>/dev/null || error "systemd is required on the Docker host."
+[[ -d /run/systemd/system ]] || error "systemd must be running on the Docker host."
+command -v python3 &>/dev/null || error "python3 is required for kernel/boot configuration checks."
 
 ARCH=$(dpkg --print-architecture) # amd64 or arm64
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sudo env MEMBRANE_CONFIGURE_BPF_LSM="${MEMBRANE_CONFIGURE_BPF_LSM:-0}" \
+    python3 "$SCRIPT_DIR/setup-bpf-lsm.py"
 
 # -------------------------------------------------------
 # Helpers
@@ -61,7 +111,7 @@ elif [ -x /usr/bin/sysbox-runc ]; then
 
     tmp=$(mktemp)
     if ! (sudo test -f /etc/docker/daemon.json && sudo cat /etc/docker/daemon.json || echo '{}') |
-        jq '.runtimes["sysbox-runc"] = {"path": "/usr/bin/sysbox-runc"}' >"$tmp"; then
+        jq '.runtimes["sysbox-runc"].path = "/usr/bin/sysbox-runc"' >"$tmp"; then
         rm -f "$tmp"
         error "Failed to merge sysbox-runc runtime into /etc/docker/daemon.json."
     fi
@@ -95,15 +145,7 @@ else
     sudo apt-get install -y /tmp/sysbox.deb
     rm -f /tmp/sysbox.deb
 
-    info "Starting Sysbox services..."
-    if sudo systemctl start sysbox 2>/dev/null; then
-        info "Started via 'sysbox' unit."
-    else
-        warn "Could not start 'sysbox' unit, trying components individually..."
-        sudo systemctl start sysbox-mgr
-        sudo systemctl start sysbox-fs
-    fi
-    sleep 2
+    enable_sysbox
 
     info "Starting Docker..."
     sudo systemctl start docker
@@ -116,6 +158,10 @@ fi
 # -------------------------------------------------------
 # Smoke tests
 # -------------------------------------------------------
+# An already installed Sysbox still needs its services after a VM restart.
+enable_sysbox
+configure_colima_sysbox
+runtime_registered "sysbox-runc" || error "Sysbox services are active but sysbox-runc is not registered with Docker."
 info "Running smoke tests..."
 
 # Test 1: basic startup
@@ -123,7 +169,9 @@ info "Test 1: basic startup..."
 if KERNEL=$(docker run --rm --runtime=sysbox-runc alpine:3.21 uname -r 2>&1); then
     info "  kernel: $KERNEL — OK"
 else
-    warn "  basic startup FAILED"
+    warn "  basic startup FAILED: $KERNEL"
+    sudo systemctl status --no-pager sysbox.service sysbox-mgr.service sysbox-fs.service >&2 || true
+    warn "  Runtime registration alone is insufficient; check the backing Sysbox daemons and their sockets above."
     exit 1
 fi
 

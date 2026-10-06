@@ -13,10 +13,10 @@ import (
 
 func main() {
 	noUpdate := flag.Bool("no-update", false, "skip checking for updates")
-	noTrace := flag.Bool("no-trace", false, "disable Tracee eBPF sidecar")
+	noTrace := flag.Bool("no-trace", false, "disable eBPF tracing")
 	noGlobalConfig := flag.Bool("no-global-config", false, "skip reading ~/.membrane/config.yaml (workspace and CLI flags still apply)")
 	traceLog := flag.String("trace-log", "", "path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)")
-	ignore := flag.StringArrayP("ignore", "i", []string{}, "ignore pattern (repeatable)")
+	sealed := flag.StringArrayP("sealed", "s", []string{}, "sealed pattern (repeatable)")
 	readonly := flag.StringArrayP("readonly", "r", []string{}, "readonly pattern (repeatable)")
 	allow := flag.StringArrayP("allow", "a", []string{}, "allow rule: hostname, IP, CIDR, or URL (repeatable)")
 	arg := flag.StringArray("arg", []string{}, "extra docker run argument (repeatable)")
@@ -30,7 +30,7 @@ func main() {
 		optionFlags.AddFlag(flag.Lookup(name))
 	}
 	configFlags := flag.NewFlagSet("", flag.ContinueOnError)
-	for _, name := range []string{"ignore", "readonly", "allow", "arg", "dns-resolver"} {
+	for _, name := range []string{"sealed", "readonly", "allow", "arg", "dns-resolver"} {
 		configFlags.AddFlag(flag.Lookup(name))
 	}
 	flag.Usage = func() {
@@ -64,7 +64,7 @@ func main() {
 	}
 
 	cli := membrane.CLIOverrides{
-		Ignore:      *ignore,
+		Sealed:      *sealed,
 		Readonly:    *readonly,
 		Allow:       *allow,
 		Args:        *arg,

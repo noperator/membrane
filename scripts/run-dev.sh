@@ -20,6 +20,6 @@ echo "Building membrane-handler..."
 docker build -t membrane-handler "${REPO_ROOT}/docker/handler/"
 
 echo "Building membrane binary..."
-go build -o "${REPO_ROOT}/membrane" "${REPO_ROOT}/cmd/membrane"
+(cd "$REPO_ROOT" && go build -o membrane ./cmd/membrane)
 
 "${REPO_ROOT}/membrane" "$@"

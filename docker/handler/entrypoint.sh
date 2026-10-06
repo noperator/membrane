@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Installed at this path by the handler Dockerfile.
+# shellcheck source=/dev/null
+source /supervisor.sh
+rm -f /tmp/handler-ready /tmp/dns-proxy-ready /tmp/mitmproxy-addon-loaded /tmp/tracer-ready
+# Fail startup before creating services if the scoped control mount is unusable.
+test -r "$MEMBRANE_TARGET_CGROUP/cgroup.events"
+test -w "$MEMBRANE_TARGET_CGROUP/cgroup.kill"
+drain_workload
 
 # Count non-loopback interfaces using a glob (avoids ls|grep)
 nonlo_count() {
@@ -187,7 +195,18 @@ ip6tables -P OUTPUT DROP 2>/dev/null || true
 # Start DNS proxy (updates nftables sets on resolution)
 MEMBRANE_DNS_RESOLVER="$DNS_RESOLVER" MEMBRANE_ALLOW_FILE="$ALLOW_FILE" dns-proxy &
 DNS_PROXY_PID=$!
+supervise dns-proxy "$DNS_PROXY_PID"
 echo "DNS proxy started (PID $DNS_PROXY_PID)."
+
+for i in $(seq 1 150); do
+    check_children
+    [ -f /tmp/dns-proxy-ready ] && break
+    sleep 0.1
+done
+[ -f /tmp/dns-proxy-ready ] || {
+    echo "ERROR: DNS proxy did not become ready within 15s"
+    exit 1
+}
 
 # Generate ephemeral CA keypair
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
@@ -208,12 +227,15 @@ PYTHONUNBUFFERED=1 mitmdump \
     --set rawtcp=true \
     -s /addon.py \
     &
+MITMPROXY_PID=$!
+supervise mitmproxy "$MITMPROXY_PID"
 
 # Wait for mitmproxy to bind its port AND finish loading the addon
 # (timeout 15s). The port-bind alone is insufficient — mitmproxy
 # accepts connections at the kernel level before the addon's
 # _load_rules() and module initialization complete.
 for i in $(seq 1 15); do
+    check_children
     if (echo >/dev/tcp/localhost/$MITMPROXY_PORT) 2>/dev/null &&
         [ -f /tmp/mitmproxy-addon-loaded ]; then
         break
@@ -226,8 +248,26 @@ for i in $(seq 1 15); do
 done
 echo "mitmproxy ready."
 
-# Signal ready
+if [ -n "${MEMBRANE_TRACE_FILE:-}" ] || [ -n "${MEMBRANE_POLICY_FILE:-}" ]; then
+    rm -f /tmp/tracer-ready
+    tracer &
+    TRACER_PID=$!
+    supervise tracer "$TRACER_PID"
+
+    for _i in $(seq 1 150); do
+        check_children
+        [ -f /tmp/tracer-ready ] && break
+        sleep 0.1
+    done
+    [ -f /tmp/tracer-ready ] || {
+        echo "ERROR: tracer did not become ready within 15s"
+        exit 1
+    }
+    echo "BPF attached and scoped (PID $TRACER_PID)."
+fi
+
+# Signal ready only after every requested service is ready and alive.
+check_children
 touch /tmp/handler-ready
 echo "Handler ready."
-
-sleep infinity
+wait_for_critical_exit

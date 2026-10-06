@@ -11,15 +11,14 @@
 
 Membrane is a lightweight, agent-agnostic, cross-platform sandbox that gives you real-time visibility into everything that your agent does.
 
-The most important property of a secure sandbox is that you can clearly understand what it's doing. As it gets bigger and more complex, it introduces more potential failure points. Membrane is deliberately minimal. It covers the core features you'd expect from an agent sandbox (namely, network and filesystem isolation) and omits everything else. At the time of this writing, **membrane's codebase is 50X smaller than [OpenShell](https://github.com/NVIDIA/OpenShell)**, or about 2% the size. Simplicity is a feature.
+The most important property of a secure sandbox is that you can clearly understand what it's doing. As it gets bigger and more complex, it introduces more potential failure points. Membrane is deliberately minimal. It covers the core features you'd expect from an agent sandbox (namely, network and filesystem isolation) and omits everything else. At the time of this writing, **Membrane has about 1% as many lines of code as [OpenShell](https://github.com/NVIDIA/OpenShell)**. Simplicity is a feature.
 
-```
-$ find OpenShell/ -name '*.rs' -exec cat {} \; | wc -c
- 2833412
-$ find membrane/ -name '*.go' -exec cat {} \; | wc -c
-   55689
-$ echo 2833412 / 55689 | bc -l
-50.88
+```text
+$ tokei -o json membrane/  | jq .Total.code
+6727
+
+$ tokei -o json OpenShell/ | jq .Total.code
+659714
 ```
 
 ### Features
@@ -37,7 +36,7 @@ $ echo 2833412 / 55689 | bc -l
 
 ### Prerequisites
 
-Membrane has been tested on macOS and Ubuntu Linux. On **macOS**, [Homebrew](https://brew.sh) must be installed for the first-run install script to install Colima and Docker CLI (if needed). On **Linux**, [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) must be installed and running; the first-run install script installs Sysbox on top of an existing Docker installation.
+Membrane has been tested on macOS and Ubuntu Linux. The Linux Docker host must use cgroup v2 and have BPF LSM active. On **macOS**, [Homebrew](https://brew.sh) must be installed; Membrane runs in a dedicated [Colima](https://github.com/abiosoft/colima) VM that provides the Linux kernel. On **Linux**, [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) must be installed; the first-run setup configures BPF LSM when supported and installs Sysbox on top of the existing Docker installation.
 
 ### Install
 
@@ -47,11 +46,11 @@ go install github.com/noperator/membrane/cmd/membrane@latest
 
 <details><summary>Initial setup</summary>
 
-On first run, membrane checks that all dependencies are present (or otherwise offers to install them). It then clones the repo to `~/.membrane/src/`, builds the `membrane-agent` and `membrane-handler` Docker images, and writes a default config to `~/.membrane/config.yaml`. Subsequent runs check for updates automatically. Initial install takes about 2 minutes.
+On first run, membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, builds the `membrane-agent` and `membrane-handler` Docker images, and writes a default config to `~/.membrane/config.yaml`. Subsequent runs check for updates automatically. Initial install takes about 2 minutes.
 
-On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If these aren't present, membrane will offer to run [`scripts/install-macos.sh`](scripts/install-macos.sh) which installs Colima and Docker CLI via Homebrew, creates a dedicated Colima VM, and installs Sysbox inside the VM and registers it as a Docker runtime. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
+On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
 
-On **Linux**, membrane uses the system Docker daemon directly. If Sysbox isn't installed, membrane will offer to run [`scripts/install-linux.sh`](scripts/install-linux.sh) which installs and registers it automatically.
+On **Linux**, membrane uses the system Docker daemon directly. If setup is incomplete, membrane offers to run [`scripts/install-linux.sh`](scripts/install-linux.sh), which activates BPF LSM when supported and installs, registers, enables, and verifies Sysbox. Enabling BPF LSM can require a GRUB update and reboot; membrane asks before changing native Linux boot configuration.
 
 </details>
 
@@ -64,7 +63,7 @@ Usage: membrane [options] [-- command...]
 
 Options:
       --no-global-config         skip reading ~/.membrane/config.yaml (workspace and CLI flags still apply)
-      --no-trace                 disable Tracee eBPF sidecar
+      --no-trace                 disable eBPF tracing
       --no-update                skip checking for updates
       --reset[=cid]              remove membrane state and exit (c=containers, i=image, d=directory)
       --session-id-file string   write session ID to this file on startup (for test harnesses)
@@ -74,7 +73,7 @@ Config:
   -a, --allow stringArray      allow rule: hostname, IP, CIDR, or URL (repeatable)
       --arg stringArray        extra docker run argument (repeatable)
       --dns-resolver string    DNS resolver (overrides config file)
-  -i, --ignore stringArray     ignore pattern (repeatable)
+  -s, --sealed stringArray     sealed pattern (repeatable)
   -r, --readonly stringArray   readonly pattern (repeatable)
 ```
 
@@ -134,155 +133,114 @@ membrane --reset=ci    # containers and images only
 
 ### Trace execution
 
-By default, membrane records an eBPF trace of everything the agent does. In this example, I just tell Claude to go download the homepage of my blog.
+By default, membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers.
+
+Membrane creates the workload cgroup and installs and scopes the eBPF probes before starting any workload code. If required probes or filesystem policy cannot be loaded or attached, setup fails before the workload starts.
+
+In this example, I just tell Codex to go download the homepage of my blog.
 
 ```bash
-membrane --trace-log=blog.jsonl -- \
-    claude --dangerously-skip-permissions \
-    -p 'Download the homepage of my blog noperator.dev and save it to blog.html.'
-
-Done — saved the homepage to `/workspace/blog.html` (16,927 bytes).
+membrane --trace-log=blog.jsonl.gz -- \
+    codex exec --dangerously-bypass-approvals-and-sandbox \
+    'Download the homepage of my blog noperator.dev and save it to blog.html.'
 ```
 
-Now we can look at the eBPF trace with jq and grep to show the full story of what Claude did in the container:
+Codex uses curl to download the page and saves it to `/workspace/blog.html`.
+
+The raw trace is intentionally comprehensive, so we can use a reproducible jq filter to show the commands Codex launches to carry out its actions, along with their workspace file activity and network connections:
 
 ```bash
-𝄢 jq -rs '
-  sort_by(.timestamp) |
-  (map(select(.processName == "gosu")) | last | .timestamp) as $t |
-  .[] | select(.timestamp > $t) |
-  if .eventName == "sched_process_exec" then
-    "exec  \(.processName): \(.args[] | select(.name == "argv") | .value | join(" "))"
-  elif .eventName == "net_packet_dns" and ((.args[] | select(.name == "metadata") | .value.direction) == 2) then
-    "dns   \(.processName) → \(.args[] | select(.name == "proto_dns") | .value.questions[0] | "\(.name) \(.type)")"
-  elif .eventName == "security_file_open" then
-    "file  \(.processName): \(.args[] | select(.name == "flags") | .value) \(.args[] | select(.name == "pathname") | .value)"
-  elif .eventName == "security_socket_connect" then
-    "conn  \(.processName): \(.args[] | select(.name == "remote_addr") | .value | "\(.sa_family) \(.sin_addr // .sin6_addr // .sun_path):\(.sin_port // .sin6_port // "")")"
-  else empty end
-' blog.jsonl | grep -vE '^file.* /(usr|dev|etc|proc|sys|run|home|workspace/\.git|tmp/claude)|^conn.* /var|^\s|^$| git(-remote-http)?:'
+𝄢 gzip -dc blog.jsonl.gz | jq -rs '
+  sort_by(.timestamp) as $e |
+
+  # Find the Codex process(es).
+  [$e[]
+    | select(.type == "process_exec" and .comm == "codex")
+    | .pid
+  ] | unique as $codex_pids |
+
+  # Find real shell commands launched directly by Codex, excluding its
+  # shell-snapshot/setup machinery. Record when each command actually starts.
+  (reduce (
+    $e[]
+    | select(
+        .type == "process_exec"
+        and .comm == "bash"
+        and (.argv | startswith("/bin/bash -c "))
+        and ((.argv | contains("CODEX_")) | not)
+        and ((.argv | contains("/.codex/shell_snapshots/")) | not)
+      )
+    | select(.ppid as $p | $codex_pids | index($p))
+  ) as $x (
+    {};
+    .[$x.pid | tostring] = $x.timestamp
+  )) as $starts |
+
+  # Show activity attributable to those commands after they start.
+  $e[]
+  | select(
+      ($starts[.pid | tostring] // null) as $start
+      | $start != null and .timestamp >= $start
+    )
+  | select(
+      .type == "process_exec"
+      or .type == "socket_connect"
+      or (
+        .type == "file_open"
+        and (.path | startswith("/workspace"))
+      )
+    )
+
+  | if .type == "process_exec" then
+      "exec  \(.comm): \(.argv)"
+    elif .type == "file_open" then
+      "file  \(.comm): flags=\(.flags) \(.path)"
+    elif .type == "socket_connect" then
+      "conn  \(.comm): \(if .family == 2 then \"AF_INET\" elif .family == 10 then \"AF_INET6\" else \"AF_\(.family)\" end) \(.daddr):\(.dport)"
+    else
+      empty
+    end
+'
 ```
 
-eBPF can be pretty noisy and there's a lot to analyze here, but the main gist of what we see is:
-- the agent is given the initial prompt
-- it explores the filesystem to see which tools are available
-- finally it uses curl to save the blog homepage to disk
+We see that Codex launches curl, curl resolves and connects to the site, opens `/workspace/blog.html` for writing, and Codex verifies the result.
 
-<details><summary>Full trace</summary>
-
-```
-exec  claude: /usr/bin/env node /usr/bin/claude --dangerously-skip-permissions -p Download the homepage of my blog noperator.dev and save it to blog.html.
-exec  node: node /usr/bin/claude --dangerously-skip-permissions -p Download the homepage of my blog noperator.dev and save it to blog.html.
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-exec  sh: /bin/sh -c which npm
-exec  sh: /bin/sh -c which bun
-exec  sh: /bin/sh -c which yarn
-exec  sh: /bin/sh -c which deno
-exec  sh: /bin/sh -c which pnpm
-conn  claude: AF_INET 160.79.104.10:443
-exec  sh: /bin/sh -c which node
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  claude: AF_INET 160.79.104.10:443
-file  node: 149504 /workspace
-conn  claude: AF_INET 160.79.104.10:443
-conn  claude: AF_INET 160.79.104.10:443
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  claude: AF_INET 160.79.104.10:443
-exec  sh: /bin/sh -c which git
-exec  rg: /usr/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/arm64-linux/rg --version
-exec  rg: /usr/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/arm64-linux/rg --files --hidden /workspace
-file  rg: 147456 /workspace
-file  rg: 147456 /workspace/pkg
-file  rg: 147456 /workspace/test
-file  rg: 147456 /workspace/pkg/membrane
-file  rg: 147456 /workspace/img
-file  rg: 147456 /workspace/cmd
-file  rg: 147456 /workspace/cmd/membrane
-exec  sh: /bin/sh -c ps aux | grep -E "code|cursor|windsurf|idea|pycharm|webstorm|phpstorm|rubymine|clion|goland|rider|datagrip|dataspell|aqua|gateway|fleet|android-studio" | grep -v grep
-exec  grep: grep -E code|cursor|windsurf|idea|pycharm|webstorm|phpstorm|rubymine|clion|goland|rider|datagrip|dataspell|aqua|gateway|fleet|android-studio
-exec  ps: ps aux
-exec  grep: grep -v grep
-dns   git-remote-http → github.com A
-dns   git-remote-http → github.com AAAA
-exec  which: /bin/sh /usr/bin/which /usr/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/arm64-linux/rg
-exec  which: /bin/sh /usr/bin/which bwrap
-exec  which: /bin/sh /usr/bin/which socat
-exec  sh: /bin/sh -c npm root -g
-exec  npm: /usr/bin/env node /usr/bin/npm root -g
-exec  node: node /usr/bin/npm root -g
-exec  uname: uname -sr
-exec  sh: /bin/sh -c which zsh
-exec  sh: /bin/sh -c which bash
-exec  bash: /bin/bash -c -l SNAPSHOT_FILE=/home/agent/.claude/shell-snapshots/snapshot-bash-1772485556640-5hbuui.sh
-exec  locale-check: /usr/bin/locale-check C.UTF-8
-exec  cut: cut -d  -f3
-exec  grep: grep -vE ^_[^_]
-exec  head: head -n 1000
-exec  awk: awk {print "set -o " $1}
-exec  head: head -n 1000
-exec  grep: grep on
-exec  sed: sed s/^alias //g
-exec  sed: sed s/^/alias -- /
-exec  head: head -n 1000
-exec  bash: /bin/bash -c source /home/agent/.claude/shell-snapshots/snapshot-bash-1772485556640-5hbuui.sh && shopt -u extglob 2>/dev/null || true && eval 'curl -sL -o /workspace/blog.html https://noperator.dev' \< /dev/null && pwd -P >| /tmp/claude-cca8-cwd
-exec  curl: curl -sL -o /workspace/blog.html https://noperator.dev
-conn  curl: AF_INET 8.8.8.8:53
-dns   curl → noperator.dev A
-dns   curl → noperator.dev AAAA
+```text
+exec  bash: /bin/bash -c curl --fail --location --silent --show-error https://noperator.dev/ --output blog.html
+exec  curl: curl --fail --location --silent --show-error https://noperator.dev/ --output blog.html
+conn  curl: AF_INET 172.18.0.2:53
+conn  curl: AF_INET6 2606:4700:3034::ac43:a3fd:443
+conn  curl: AF_INET6 2606:4700:3030::6815:5b07:443
+conn  curl: AF_INET 172.67.163.253:443
 conn  curl: AF_INET 104.21.91.7:443
 conn  curl: AF_INET 172.67.163.253:443
-conn  curl: AF_INET6 2606:4700:3037::ac43:a3fd:443
-conn  curl: AF_INET6 2606:4700:3035::6815:5b07:443
-conn  curl: AF_INET 104.21.91.7:443
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  claude: AF_INET 160.79.104.10:443
-file  node: 131072 /workspace/blog.html
-exec  bash: /bin/bash -c source /home/agent/.claude/shell-snapshots/snapshot-bash-1772485556640-5hbuui.sh && shopt -u extglob 2>/dev/null || true && eval 'wc -c /workspace/blog.html && head -5 /workspace/blog.html' \< /dev/null && pwd -P >| /tmp/claude-5f6c-cwd
-exec  wc: wc -c /workspace/blog.html
-file  wc: 131072 /workspace/blog.html
-exec  head: head -5 /workspace/blog.html
-file  head: 131072 /workspace/blog.html
-file  node: 131072 /workspace/blog.html
-conn  node: AF_INET 8.8.8.8:53
-dns   node → api.anthropic.com A
-conn  node: AF_INET 8.8.8.8:53
-dns   node → http-intake.logs.us5.datadoghq.com A
-conn  claude: AF_INET 160.79.104.10:443
-conn  claude: AF_INET 34.149.66.137:443
+file  curl: flags=131649 /workspace/blog.html
+exec  bash: /bin/bash -c ls -lh blog.html
+exec  ls: ls -lh blog.html
 ```
-
-</details>
-
-</details>
 
 ### Configure
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, ignore patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, sealed patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# `ignore` lists patterns matched against filenames or relative paths.
-# Matching files and directories are shadowed with an empty placeholder
-# inside the container; the agent can see they exist but cannot read
-# their contents.
-ignore:
+# For both `sealed` and `readonly` below: These filesystem policies are based
+# on a startup *snapshot*. Selectors (e.g., a path like `.env`) are evaluated
+# before workload code runs against objects that already exist. An enrolled
+# object remains protected if it is renamed; a newly created or replacement
+# inode is not automatically enrolled just because its pathname matches a
+# selector.
+
+# `sealed` paths remain visible (e.g., `stat` still works), but file contents
+# cannot be read or modified.
+sealed:
   - secrets/
   - "*.pem"
 
-# `readonly` lists patterns mounted into the container as read-only. Use
-# this for things like .git (so the agent can read history but not
-# rewrite it) or credential files that should be visible but not
-# writable.
+# `readonly` paths may have their contents read, but cannot be modified.
 readonly:
   - config/
 
@@ -358,9 +316,10 @@ allow:
     http:
       - methods: [GET]
 
-# `args` lists raw arguments appended to the `docker run` command.
+# `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
-# its argument must be separate items.
+# its argument must be separate items. Treat this as trusted host-level
+# configuration, especially in a workspace .membrane.yaml.
 args:
   - -e
   - MY_API_KEY=abc123
@@ -389,15 +348,16 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 
 - [ ] support Docker checkpoint
 - [ ] optimize startup/teardown time
-- [ ] move tracee from dedicated sidecar into handler
 - [ ] per-session home dir overlay
 - [ ] support trusting specific CA certs
 - [ ] return error messages from proxy
 - [ ] add debug flag
 - [ ] BYO container
+- [ ] require explicit trust/approval for workspace `.membrane.yaml`
 
 <details><summary>Completed</summary>
 
+- [x] replace Tracee sidecar with built-in eBPF probes
 - [x] support wildcard hostnames
 - [x] support HTTP filters on IP dest
 - [x] detect HTTP(S) via bytes vs ports
@@ -412,7 +372,7 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 - [x] git-aware read-only mounts
 - [x] refresh firewall on DNS resolution (dns-proxy)
 - [x] quiet down logging a bit
-- [x] make ignore/readonly configurable
+- [x] make sealed/readonly configurable
 - [x] allow reading from host stdin (to be used in pipeline)
 - [x] auto-install prerequisites on first run
 
