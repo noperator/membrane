@@ -5,23 +5,27 @@ import (
 	"net"
 	"syscall"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
 
 // Compile success alone is insufficient: clang can emit libc calls which
 // cannot be resolved when loading a BPF program (for example, memcmp).
 func TestGeneratedProgramReferences(t *testing.T) {
-	spec, err := loadProbe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, program := range spec.Programs {
-		symbols, err := program.Instructions.SymbolOffsets()
+	for _, load := range []func() (*ebpf.CollectionSpec, error){loadProbe, loadPolicy} {
+		spec, err := load()
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, reference := range program.Instructions.FunctionReferences() {
-			if _, ok := symbols[reference]; !ok {
-				t.Errorf("%s: unresolved BPF function %q", name, reference)
+		for name, program := range spec.Programs {
+			symbols, err := program.Instructions.SymbolOffsets()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, reference := range program.Instructions.FunctionReferences() {
+				if _, ok := symbols[reference]; !ok {
+					t.Errorf("%s: unresolved BPF function %q", name, reference)
+				}
 			}
 		}
 	}

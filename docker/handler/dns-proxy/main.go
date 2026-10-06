@@ -172,6 +172,11 @@ func main() {
 		log.Fatalf("dns-proxy: listen: %v", err)
 	}
 	defer conn.Close()
+	if err := os.WriteFile("/tmp/dns-proxy-ready", nil, 0644); err != nil {
+		log.Fatalf("dns-proxy: signal readiness: %v", err)
+	}
+	defer os.Remove("/tmp/dns-proxy-ready")
+
 	log.Printf("dns-proxy: listening on UDP :53")
 
 	buf := make([]byte, 4096)

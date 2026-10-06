@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 // Mandatory per-session inode policy. Enrollment and attachment precede workload
-// startup; the host owns the pins and removes them only after workload teardown.
+// startup; the loader owns all resources until workload teardown.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
 #define EACCES 13
-#define CONTROLLER 3
-#define PF_EXITING 4
 #define MAP_PRIVATE 2
 #define READONLY 1
 #define SEALED 2
@@ -20,7 +18,6 @@
 #define O_TRUNC 01000
 #define S_IFMT 0170000
 #define S_IFDIR 0040000
-#define S_IFREG 0100000
 
 struct inode_policy {
     __u32 mode;
@@ -40,69 +37,21 @@ struct {
     __type(value, struct inode_policy);
 } policy_inodes SEC(".maps");
 
-// Inode storage does not retain the inode. The controller holds O_PATH FDs
-// while alive; after it exits, reject scoped file operations until teardown.
-// This prevents cache eviction from discarding labels in the death/kill window.
-struct controller_identity { __u64 started; __u32 pid; __u32 padding; };
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct controller_identity);
-} policy_controller SEC(".maps");
-extern struct task_struct *bpf_task_from_pid(__s32 pid) __ksym;
-extern void bpf_task_release(struct task_struct *task) __ksym;
-
-static __always_inline bool controller_alive(void) {
-    __u32 key = 0;
-    struct controller_identity *owner = bpf_map_lookup_elem(&policy_controller, &key);
-    if (!owner || !owner->pid)
-        return false;
-    struct task_struct *task = bpf_task_from_pid(owner->pid);
-    if (!task)
-        return false;
-    bool alive = task->start_boottime == owner->started && !(task->flags & PF_EXITING);
-    bpf_task_release(task);
-    return alive;
-}
-
 static __always_inline bool in_session(void) {
     return bpf_current_task_under_cgroup(&policy_cgroup, 0) == 1;
 }
 
-static __always_inline __u32 stored_mode(struct inode *inode) {
+static __always_inline __u32 inode_mode(struct inode *inode) {
     if (!inode)
         return 0;
     struct inode_policy *policy = bpf_inode_storage_get(&policy_inodes, inode, 0, 0);
     return policy ? policy->mode : 0;
 }
 
-static __always_inline __u32 inode_mode(struct inode *inode) {
-    if (!controller_alive() && inode &&
-        ((inode->i_mode & S_IFMT) == S_IFREG || (inode->i_mode & S_IFMT) == S_IFDIR))
-        return SEALED;
-    return stored_mode(inode);
-}
-
 SEC("lsm/file_open")
 int BPF_PROG(policy_file_open, struct file *file, int ret) {
-    if (ret)
+    if (ret || !in_session())
         return ret;
-    if (!in_session()) {
-        // A private, temporary enrollment inode registers the loader's root
-        // namespace PID without exposing any control mount to the workload.
-        if (stored_mode(file->f_inode) == CONTROLLER) {
-            __u32 key = 0;
-            struct controller_identity *owner = bpf_map_lookup_elem(&policy_controller, &key);
-            if (owner && !owner->pid) {
-                struct task_struct *task = bpf_get_current_task_btf();
-                task = task->group_leader;
-                owner->started = task->start_boottime;
-                owner->pid = task->pid;
-            }
-        }
-        return 0;
-    }
     __u32 mode = inode_mode(file->f_inode);
     if (mode == SEALED && (file->f_inode->i_mode & S_IFMT) != S_IFDIR)
         return -EACCES;

@@ -119,19 +119,12 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-	if trace || len(policy) != 0 {
-		cleanupCgroup, err := createSessionCgroup(ctx, &s)
-		defer func() { cleanupCgroup(); removePolicyDirectory(s) }()
-		if err != nil {
-			return err
-		}
+	if err := checkBPFLSM(ctx); err != nil {
+		return err
 	}
 
 	policyFile := ""
 	if len(policy) != 0 {
-		if err := createPolicyPins(ctx, &s); err != nil {
-			return err
-		}
 		policyFile, err = writePolicyFile(policy)
 		if err != nil {
 			return err
@@ -154,10 +147,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 			teardownSpinner = newSpinner()
 			teardownSpinner.Start("Tearing down sandbox...")
 		}
-		cleanup()
-		if s.preservePolicy {
-			retErr = errors.Join(retErr, fmt.Errorf("mandatory policy retained because workload teardown could not be verified: %s", s.policyPins))
-		}
+		retErr = errors.Join(retErr, cleanup())
 		if teardownSpinner != nil {
 			teardownSpinner.Stop()
 		}

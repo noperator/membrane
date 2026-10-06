@@ -647,16 +647,24 @@ def check_handler(ctx, session, traced=True, policy=False):
     cfg = data["HostConfig"]
     caps = {c.removeprefix("CAP_") for c in cfg.get("CapAdd") or []}
     expected = {"NET_ADMIN", "BPF", "PERFMON"} if traced or policy else {"NET_ADMIN"}
-    check(ctx, caps == expected and not cfg["Privileged"] and cfg["PidMode"] != "host", "handler capabilities and namespaces")
+    check(ctx, caps == expected and not cfg["Privileged"] and cfg["PidMode"] != "host"
+          and cfg["CgroupnsMode"] == "private", "handler capabilities and namespaces")
     mounts = {m["Destination"]: m for m in data["Mounts"]}
-    kernel = {"/sys/fs/cgroup", "/sys/kernel/tracing"}
-    check(ctx, kernel.intersection(mounts) == (kernel if traced else {"/sys/fs/cgroup"} if policy else set())
-          and all(not mounts[p]["RW"] for p in kernel.intersection(mounts))
+    check(ctx, "/sys/fs/cgroup" not in mounts
+          and ("/sys/kernel/tracing" in mounts) == traced
+          and (not traced or not mounts["/sys/kernel/tracing"]["RW"])
           and ("/trace" in mounts) == traced, "tracing mounts match --no-trace setting")
+    parent = inspect(ctx, "membrane-agent-" + session.id)["HostConfig"]["CgroupParent"]
+    check(ctx, mounts["/workload-cgroup"]["Source"] == "/sys/fs/cgroup/" + parent.lstrip("/")
+          and mounts["/workload-cgroup"]["RW"]
+          and "MEMBRANE_TARGET_CGROUP=/workload-cgroup" in data["Config"]["Env"],
+          "handler control is scoped to its workload cgroup")
+    check(ctx, "/policy-pins" not in mounts and "/sys/fs/bpf" not in mounts,
+          "no bpffs or policy pin mount")
     if policy:
         check(ctx, "/sys/kernel/security" not in mounts
-              and all(p in mounts and not mounts[p]["RW"] for p in ("/policy-workspace", "/etc/membrane/policy.json"))
-              and mounts["/policy-pins"]["RW"], "trusted enrollment and pin mounts")
+              and all(p in mounts and not mounts[p]["RW"] for p in ("/policy-workspace", "/etc/membrane/policy.json")),
+              "trusted enrollment mounts")
     return data
 
 
@@ -671,7 +679,7 @@ def cleaned(ctx, session):
           session.directory.name + ": session parent removed")
     prefix = [*host_prefix, "sudo", "-n"] if sys.platform == "darwin" or os.geteuid() != 0 else []
     check(ctx, run(ctx, [*prefix, "test", "!", "-d", "/sys/fs/bpf/membrane/" + session.id], expected=None).returncode == 0,
-          session.directory.name + ": mandatory policy pins removed")
+          session.directory.name + ": no policy pin directory created")
 
 
 def build_trace_workload(ctx):
@@ -691,9 +699,15 @@ def trace_docker_env(ctx):
     wrapper.mkdir()
     shim = wrapper / "docker"
     shim.write_text(f'''#!{sys.executable}
-import os, sys, time
+import os, sys, time, subprocess
 from pathlib import Path
 args = sys.argv[1:]
+artifacts = os.getenv("BPF_FAILURE_ARTIFACTS")
+if artifacts and args[0] == "create":
+    (Path(artifacts) / "agent-created").touch()
+if artifacts and args[0] == "rm" and args[-1].startswith("membrane-handler-"):
+    logs = subprocess.run([{shutil.which("docker")!r}, "logs", args[-1]], capture_output=True, text=True)
+    (Path(artifacts) / "failed-handler.log").write_text(logs.stdout + logs.stderr)
 if args[0] == "run" and "membrane-handler" in args and os.getenv("FAIL_BPF"):
     args = [a for a in args if a not in ("--cap-add=BPF", "--cap-add=PERFMON")]
 if args[0] == "start" and os.getenv("CHECK_START"):
@@ -738,7 +752,7 @@ def group_25(ctx):
         check(ctx, agent["State"]["Status"] == "created" and agent["State"]["Pid"] == 0
               and bool(parent) and handler["HostConfig"]["CgroupParent"] != parent
               and run(ctx, [*host_prefix, "test", "-d", cgroup], expected=None).returncode == 0, "session parent exists before workload, outside handler")
-        check(ctx, "MEMBRANE_TARGET_CGROUP=" + cgroup in handler["Config"]["Env"]
+        check(ctx, "MEMBRANE_TARGET_CGROUP=/workload-cgroup" in handler["Config"]["Env"]
               and run(ctx, ["docker", "exec", "membrane-handler-" + a.id, "test", "-f", "/tmp/tracer-ready"], expected=None).returncode == 0,
               "BPF scoped and ready before docker start")
         a.release("start")
@@ -830,11 +844,14 @@ def group_28(ctx):
         cleaned(ctx, n)
 
     env = trace_docker_env(ctx)
-    with trace_session(ctx, "trace-failed", 45105, env=dict(env, FAIL_BPF="1")) as failed:
+    with trace_session(ctx, "trace-failed", 45105, env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(ctx.workdir / "trace-failed"))) as failed:
         failed_output = failed.wait(expected=None, timeout=60)
         check(ctx, failed.process.returncode != 0 and "load eBPF objects" in failed_output,
               "BPF load failure aborts setup clearly")
         check(ctx, not (failed.directory / "trace-failed.first").exists(), "failed loading never starts workload")
+        check(ctx, not (failed.directory / "agent-created").exists()
+              and "Handler ready." not in (failed.directory / "failed-handler.log").read_text(),
+              "failed tracing neither signals ready nor creates agent")
         cleaned(ctx, failed)
 
 
@@ -883,13 +900,12 @@ print('PASS trusted Docker-host mutator outside session cgroup: ' + cgroup, flus
 
 def group_30(ctx):
     build_trace_workload(ctx)
-    host = ["colima", "ssh", "--profile", "membrane", "--", "sudo", "-n"] if sys.platform == "darwin" else (["sudo", "-n"] if os.geteuid() != 0 else [])
     info = json.loads(run(ctx, ["docker", "info", "--format", "{{json .}}"], ).stdout)
     arch = {"aarch64": "arm64", "x86_64": "amd64"}.get(info["Architecture"], info["Architecture"])
     run(ctx, ["go", "build", "-buildvcs=false", "-o", str(ctx.workdir / "policy-dind"),
               str(REPO_ROOT / "scripts/testdata/policy-dind.go")],
         env=dict(ctx.environment, CGO_ENABLED="0", GOOS="linux", GOARCH=arch))
-    for name in ("a", "b", "failed", "snapshot", "late", "death"):
+    for name in ("a", "b", "failed", "snapshot", "late"):
         directory = ctx.workdir / name
         directory.mkdir()
         copy_policy_workload(directory)
@@ -911,11 +927,6 @@ def group_30(ctx):
         check_handler(ctx, b, traced=True, policy=True)
         agent_a, agent_b = inspect(ctx, "membrane-agent-" + a.id), inspect(ctx, "membrane-agent-" + b.id)
         check(ctx, a.id != b.id and agent_a["HostConfig"]["CgroupParent"] != agent_b["HostConfig"]["CgroupParent"], "concurrent policy sessions have distinct cgroups")
-        for session in (a, b):
-            pins = "/sys/fs/bpf/membrane/" + session.id
-            for name in ("policy_cgroup", "policy_inodes", "policy_controller", "policy_file_open"):
-                run(ctx, [*host, "test", "-f", pins + "/" + name])
-            check(ctx, True, session.directory.name + ": own pinned maps and enforcement links")
         run(ctx, ["docker", "exec", "membrane-handler-" + a.id, "test", "!", "-d", "/trace"])
         check(ctx, (a_dir / "protected").read_text() == "other session write\n", "other session can mutate the same inode")
         run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", "/workspace/other"])
@@ -946,10 +957,13 @@ for name, readable in [('protected', False), ('readonly', True)]:
     failed_dir = ctx.workdir / "failed"
     (failed_dir / "protected").write_text("secret\n")
     (failed_dir / ".membrane.yaml").write_text("sealed: [protected]\n")
-    with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1")) as failed:
+    with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(failed_dir))) as failed:
         output = failed.wait(expected=None)
         check(ctx, failed.process.returncode != 0 and "load filesystem policy BPF" in output, "LSM setup failure aborts clearly")
         check(ctx, not (failed_dir / "first-instruction").exists(), "failed policy never starts workload")
+        check(ctx, not (failed_dir / "agent-created").exists()
+              and "Handler ready." not in (failed_dir / "failed-handler.log").read_text(),
+              "failed policy neither signals ready nor creates agent")
         cleaned(ctx, failed)
 
     directory = ctx.workdir / "snapshot"
@@ -980,42 +994,129 @@ os.replace(directory / "temp", directory / "readonly-old")
     with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "late-only"], options=["--no-trace"]) as late:
         late.wait_for("ready")
         check_handler(ctx, late, traced=False)
-        check(ctx, not inspect(ctx, "membrane-agent-" + late.id)["HostConfig"]["CgroupParent"], "empty snapshot does not create a BPF cgroup")
+        check(ctx, bool(inspect(ctx, "membrane-agent-" + late.id)["HostConfig"]["CgroupParent"]), "empty snapshot still has a supervised workload cgroup")
+        processes = run(ctx, ["docker", "top", "membrane-handler-" + late.id, "-eo", "pid,comm"]).stdout.splitlines()[1:]
+        commands = {line.split(maxsplit=1)[1].strip() for line in processes}
+        check(ctx, "tracer" not in commands, "empty snapshot does not instantiate filesystem BPF")
         update_snapshot_workspace(ctx, late, r'(directory / ".env").write_text("late\n")')
         output = late.wait()
         ctx.output.extend(line for line in output.splitlines() if line.startswith("PASS "))
         cleaned(ctx, late)
 
-    directory = ctx.workdir / "death"
+
+def workload_cgroup(ctx, session):
+    parent = inspect(ctx, "membrane-agent-" + session.id)["HostConfig"]["CgroupParent"]
+    return "/sys/fs/cgroup/" + parent.lstrip("/")
+
+
+def host_root():
+    if sys.platform == "darwin":
+        return ["colima", "ssh", "--profile", "membrane", "--", "sudo", "-n"]
+    return ["sudo", "-n"] if os.geteuid() != 0 else []
+
+
+def lifecycle_session(ctx, token, *, policy=False, env=None):
+    directory = ctx.workdir / token
+    directory.mkdir()
     (directory / "protected").write_text("secret\n")
-    (directory / ".membrane.yaml").write_text("sealed: [protected]\n")
-    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]) as death:
-        death.wait_for("ready")
-        # Pause CLI teardown to make the otherwise tiny controller-death window
-        # deterministic. Keep the handler alive too, so its controller is the
-        # only process deliberately killed here. The workload still runs.
-        handler = "membrane-handler-" + death.id
-        agent = "membrane-agent-" + death.id
-        handler_pid = str(inspect(ctx, handler)["State"]["Pid"])
-        processes = run(ctx, ["docker", "top", handler, "-eo", "pid,comm"]).stdout.splitlines()[1:]
-        tracer_pids = [line.split()[0] for line in processes if line.split()[-1] == "tracer"]
-        check(ctx, len(tracer_pids) == 1, "one handler-side BPF controller")
-        os.kill(death.process.pid, signal.SIGSTOP)
-        try:
-            run(ctx, [*host, "kill", "-STOP", handler_pid])
-            run(ctx, [*host, "kill", "-KILL", tracer_pids[0]])
-            run(ctx, [*host, "test", "-f", "/sys/fs/bpf/membrane/" + death.id + "/policy_file_open"])
-            death.release()
-            deadline = time.monotonic() + 15
-            while "PASS held policy remains active" not in death.output() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            check(ctx, "PASS held policy remains active" in death.output(), "live workload denied after controller SIGKILL")
-            check(ctx, inspect(ctx, handler)["State"]["Running"], "policy persists while handler teardown is paused")
-        finally:
-            os.kill(death.process.pid, signal.SIGCONT)
-            run(ctx, [*host, "kill", "-CONT", handler_pid], expected=None)
-        death.wait(expected=None)
-        cleaned(ctx, death)
+    (directory / ".membrane.yaml").write_text("sealed: [protected]\n" if policy else "{}\n")
+    # Record workload liveness without relying on Docker's daemon state.
+    command = ["python3", "-c", """import os, time
+from pathlib import Path
+Path('/workspace/ready').write_text('ready')
+while not Path('/workspace/continue').exists():
+    Path('/workspace/alive').write_text(str(time.monotonic_ns()))
+    time.sleep(0.02)
+Path('/workspace/completed').touch()
+"""]
+    return Session(ctx, directory, command, options=["--no-trace"], env=env)
+
+
+def group_31(ctx):
+    # Keep B running while A fails. Pause only A's CLI so that handler-side
+    # fail-stop is proven independently of host-side cleanup.
+    with lifecycle_session(ctx, "survivor", policy=True) as survivor:
+        survivor.wait_for("ready")
+        survivor_cgroup = workload_cgroup(ctx, survivor)
+        for component in ("tracer", "dns-proxy", "mitmproxy"):
+            with lifecycle_session(ctx, component, policy=(component == "tracer")) as session:
+                session.wait_for("ready")
+                handler = "membrane-handler-" + session.id
+                check_handler(ctx, session, traced=False, policy=(component == "tracer"))
+                cgroup = workload_cgroup(ctx, session)
+                # The regular cgroup namespace is read-only; the only writable
+                # cgroup mount is the separate, scoped workload control mount.
+                run(ctx, ["docker", "exec", handler, "python3", "-c", """from pathlib import Path
+import os, sys
+mounts = [line.split() for line in Path('/proc/mounts').read_text().splitlines()]
+assert [(m[1]) for m in mounts if m[2] == 'cgroup2' and 'rw' in m[3].split(',')] == ['/workload-cgroup']
+for path in (sys.argv[1], '/workload-cgroup/../' + Path(sys.argv[1]).name):
+    assert not Path(path).exists(), path
+assert os.access('/workload-cgroup/cgroup.kill', os.W_OK)
+assert Path('/workload-cgroup/cgroup.events').read_text().splitlines().count('populated 1') == 1
+""", survivor_cgroup])
+                check(ctx, True, component + ": handler cannot access concurrent session cgroup")
+                run(ctx, [*host_root(), "test", "!", "-e", "/sys/fs/bpf/membrane/" + session.id])
+                check(ctx, True, component + ": active policy needs no pin directory")
+                os.kill(session.process.pid, signal.SIGSTOP)
+                try:
+                    # Process namespace PIDs, read from the actual direct children.
+                    run(ctx, ["docker", "exec", handler, "python3", "-c", r"""from pathlib import Path
+import os, signal, sys
+wanted = 'mitmdump' if sys.argv[1] == 'mitmproxy' else sys.argv[1]
+pids = []
+for pid in Path('/proc/1/task/1/children').read_text().split():
+    args = Path('/proc/' + pid + '/cmdline').read_bytes().split(b'\0')
+    if any(Path(arg.decode()).name == wanted for arg in args if arg):
+        pids.append(int(pid))
+assert len(pids) == 1, pids
+os.kill(pids[0], signal.SIGKILL)
+""", component], expected=None)
+                    status = run(ctx, ["docker", "wait", handler], timeout=15).stdout.strip()
+                    check(ctx, status.isdigit() and int(status) != 0, component + ": handler exits nonzero without CLI help")
+                    events = run(ctx, [*host_root(), "cat", cgroup + "/cgroup.events"]).stdout
+                    check(ctx, "populated 0" in events.splitlines(), component + ": workload subtree drained before handler exit")
+                    before = (session.directory / "alive").read_text()
+                    time.sleep(0.1)
+                    check(ctx, (session.directory / "alive").read_text() == before
+                          and not (session.directory / "completed").exists(), component + ": workload killed")
+                    events_b = run(ctx, [*host_root(), "cat", survivor_cgroup + "/cgroup.events"]).stdout
+                    check(ctx, "populated 1" in events_b.splitlines(), component + ": session B stays populated")
+                    before_b = (survivor.directory / "alive").read_text()
+                    time.sleep(0.1)
+                    check(ctx, (survivor.directory / "alive").read_text() != before_b, component + ": session B remains running")
+                    denied = run(ctx, ["docker", "exec", "membrane-agent-" + survivor.id, "cat", "/workspace/protected"], expected=None)
+                    check(ctx, denied.returncode != 0 and "Permission denied" in denied.stderr,
+                          component + ": session B filesystem enforcement remains attached")
+                finally:
+                    os.kill(session.process.pid, signal.SIGCONT)
+                session.wait(expected=None)
+                check(ctx, session.process.returncode != 0, component + ": host reports session failure")
+                cleaned(ctx, session)
+        survivor.release()
+        survivor.wait()
+        cleaned(ctx, survivor)
+
+    with lifecycle_session(ctx, "handler-killed", policy=True) as session:
+        session.wait_for("ready")
+        run(ctx, ["docker", "kill", "--signal=KILL", "membrane-handler-" + session.id])
+        session.wait(expected=None, timeout=45)
+        check(ctx, session.process.returncode != 0 and not (session.directory / "completed").exists(),
+              "host notices handler death and kills workload")
+        cleaned(ctx, session)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        with lifecycle_session(ctx, "cli-" + sig.name, policy=True) as session:
+            session.wait_for("ready")
+            session.process.send_signal(sig)
+            session.wait(expected=None, timeout=45)
+            check(ctx, not (session.directory / "completed").exists(), sig.name + ": workload terminated")
+            cleaned(ctx, session)
+            path = Path.home() / ".membrane/logs" / ("membrane-handler-" + session.id + ".log.gz")
+            with gzip.open(path, "rt") as log:
+                text = log.read()
+            check(ctx, "tracer exited cleanly" in text and "exited unexpectedly" not in text,
+                  sig.name + ": orderly loader shutdown")
 
 
 @dataclass(frozen=True)
@@ -1055,6 +1156,7 @@ GROUPS = {
     28: TestGroup("tracing modes and failure handling", group_28),
     29: TestGroup("traced workload lifecycle and terminal I/O", group_29),
     30: TestGroup("filesystem LSM isolation, lifecycle and startup snapshot", group_30),
+    31: TestGroup("security supervisor fail-stop, cgroup isolation and signals", group_31),
 }
 
 
@@ -1138,8 +1240,8 @@ def main():
             return 1
         print(result.stdout + result.stderr, end="", flush=True)
 
-    if sys.platform == "linux" and os.geteuid() != 0 and selected.intersection({14, 25, 26, 27, 28, 29, 30}):
-        print("membrane tests: requesting sudo for BPF session setup and cleanup", file=sys.stderr, flush=True)
+    if sys.platform == "linux" and os.geteuid() != 0:
+        print("membrane tests: requesting sudo for workload cgroup setup and cleanup", file=sys.stderr, flush=True)
         # Authenticate after the build, in the foreground before workers
         # redirect I/O. Native workers retain this terminal via start_process().
         try:

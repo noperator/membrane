@@ -198,12 +198,12 @@ func run(ctx context.Context, cgroupPath, traceFile string) (retErr error) {
 		if len(entries) == 0 {
 			return errors.New("mandatory policy manifest is empty")
 		}
-		closePolicy, err := loadFilesystemPolicy(ctx, cgroupPath, os.Getenv("MEMBRANE_POLICY_WORKSPACE"), os.Getenv("MEMBRANE_POLICY_PINS"), entries)
+		closePolicy, err := loadFilesystemPolicy(ctx, cgroupPath, os.Getenv("MEMBRANE_POLICY_WORKSPACE"), entries)
 		if err != nil {
 			return err
 		}
 		defer closePolicy()
-		log.Printf("filesystem policy seeded, attached and pinned: %d startup objects", len(entries))
+		log.Printf("filesystem policy seeded and attached: %d startup objects", len(entries))
 	}
 	if traceFile == "" {
 		if err := ctx.Err(); err != nil {
@@ -216,8 +216,8 @@ func run(ctx context.Context, cgroupPath, traceFile string) (retErr error) {
 		<-ctx.Done()
 		return nil
 	}
-	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
-		return fmt.Errorf("tracing requires the host cgroup v2 filesystem: %w", err)
+	if _, err := os.Stat(filepath.Join(cgroupPath, "cgroup.controllers")); err != nil {
+		return fmt.Errorf("tracing requires a workload cgroup v2 mount: %w", err)
 	}
 
 	objs := probeObjects{}
