@@ -33,9 +33,9 @@ enable_sysbox() {
     for unit in sysbox-mgr.service sysbox-fs.service sysbox.service; do
         state=$(systemctl is-enabled "$unit" 2>/dev/null) || true
         case "$state" in
-            enabled) sudo systemctl start "$unit" ;;
-            disabled|enabled-runtime|linked|linked-runtime) sudo systemctl enable --now "$unit" ;;
-            *) error "Cannot persist $unit (state: $state); inspect the installed package's systemd units." ;;
+        enabled) sudo systemctl start "$unit" ;;
+        disabled | enabled-runtime | linked | linked-runtime) sudo systemctl enable --now "$unit" ;;
+        *) error "Cannot persist $unit (state: $state); inspect the installed package's systemd units." ;;
         esac
         systemctl is-active --quiet "$unit" || error "sysbox-runc is installed but its backing service $unit is not active."
         [[ "$(systemctl is-enabled "$unit")" == enabled ]] || error "$unit is not enabled across reboot."

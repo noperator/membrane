@@ -21,7 +21,7 @@ check_children() {
 
 drain_workload() {
     local cgroup=${MEMBRANE_TARGET_CGROUP:?workload cgroup is required}
-    echo 1 > "$cgroup/cgroup.kill" || return 1
+    echo 1 >"$cgroup/cgroup.kill" || return 1
     local deadline=$((SECONDS + 30))
     while ! grep -qx 'populated 0' "$cgroup/cgroup.events"; do
         [ -r "$cgroup/cgroup.events" ] && [ "$SECONDS" -lt "$deadline" ] || return 1

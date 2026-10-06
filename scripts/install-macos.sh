@@ -129,9 +129,9 @@ printf '%s\n' "$status" > "$1/status"
 EOF
 setup_status=$(colima ssh --profile "$COLIMA_PROFILE" -- cat "$VM_SETUP/status")
 case "$setup_status" in
-    0) ;;
-    75) restart_required=1 ;;
-    *) error "Linux setup failed (exit $setup_status); the VM was not restarted." ;;
+0) ;;
+75) restart_required=1 ;;
+*) error "Linux setup failed (exit $setup_status); the VM was not restarted." ;;
 esac
 
 if [[ "$restart_required" == 1 ]]; then

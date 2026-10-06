@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Installed at this path by the handler Dockerfile.
+# shellcheck source=/dev/null
 source /supervisor.sh
 rm -f /tmp/handler-ready /tmp/dns-proxy-ready /tmp/mitmproxy-addon-loaded /tmp/tracer-ready
 # Fail startup before creating services if the scoped control mount is unusable.
@@ -201,7 +203,10 @@ for i in $(seq 1 150); do
     [ -f /tmp/dns-proxy-ready ] && break
     sleep 0.1
 done
-[ -f /tmp/dns-proxy-ready ] || { echo "ERROR: DNS proxy did not become ready within 15s"; exit 1; }
+[ -f /tmp/dns-proxy-ready ] || {
+    echo "ERROR: DNS proxy did not become ready within 15s"
+    exit 1
+}
 
 # Generate ephemeral CA keypair
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
