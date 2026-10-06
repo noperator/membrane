@@ -11,15 +11,14 @@
 
 Membrane is a lightweight, agent-agnostic, cross-platform sandbox that gives you real-time visibility into everything that your agent does.
 
-The most important property of a secure sandbox is that you can clearly understand what it's doing. As it gets bigger and more complex, it introduces more potential failure points. Membrane is deliberately minimal. It covers the core features you'd expect from an agent sandbox (namely, network and filesystem isolation) and omits everything else. At the time of this writing, **membrane's codebase is 362X smaller than [OpenShell](https://github.com/NVIDIA/OpenShell)**, or about 0.2% the size. Simplicity is a feature.
+The most important property of a secure sandbox is that you can clearly understand what it's doing. As it gets bigger and more complex, it introduces more potential failure points. Membrane is deliberately minimal. It covers the core features you'd expect from an agent sandbox (namely, network and filesystem isolation) and omits everything else. At the time of this writing, **Membrane has about 1% as many lines of code as [OpenShell](https://github.com/NVIDIA/OpenShell)**. Simplicity is a feature.
 
-```
-$ find OpenShell/ -name '*.rs' -exec cat {} \; | wc -c
-20171064
-$ find membrane/ -name '*.go' -exec cat {} \; | wc -c
-55689
-$ echo 20171064 / 55689 | bc -l
-362.21
+```text
+$ tokei -o json membrane/  | jq .Total.code
+6727
+
+$ tokei -o json OpenShell/ | jq .Total.code
+659714
 ```
 
 ### Features
@@ -37,7 +36,7 @@ $ echo 20171064 / 55689 | bc -l
 
 ### Prerequisites
 
-Membrane has been tested on macOS and Ubuntu Linux. On **macOS**, [Homebrew](https://brew.sh) must be installed for the first-run install script to install Colima and Docker CLI (if needed). On **Linux**, [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) must be installed and running; the first-run install script installs Sysbox on top of an existing Docker installation.
+Membrane has been tested on macOS and Ubuntu Linux. The Linux Docker host must use cgroup v2 and have BPF LSM active. On **macOS**, [Homebrew](https://brew.sh) must be installed; Membrane runs in a dedicated [Colima](https://github.com/abiosoft/colima) VM that provides the Linux kernel. On **Linux**, [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) must be installed; the first-run setup configures BPF LSM when supported and installs Sysbox on top of the existing Docker installation.
 
 ### Install
 
@@ -47,11 +46,11 @@ go install github.com/noperator/membrane/cmd/membrane@latest
 
 <details><summary>Initial setup</summary>
 
-On first run, membrane checks that all dependencies are present (or otherwise offers to install them). It then clones the repo to `~/.membrane/src/`, builds the `membrane-agent` and `membrane-handler` Docker images, and writes a default config to `~/.membrane/config.yaml`. Subsequent runs check for updates automatically. Initial install takes about 2 minutes.
+On first run, membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, builds the `membrane-agent` and `membrane-handler` Docker images, and writes a default config to `~/.membrane/config.yaml`. Subsequent runs check for updates automatically. Initial install takes about 2 minutes.
 
-On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If these aren't present, membrane will offer to run [`scripts/install-macos.sh`](scripts/install-macos.sh) which installs Colima and Docker CLI via Homebrew, creates a dedicated Colima VM, and installs Sysbox inside the VM and registers it as a Docker runtime. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
+On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
 
-On **Linux**, membrane uses the system Docker daemon directly. If Sysbox isn't installed, membrane will offer to run [`scripts/install-linux.sh`](scripts/install-linux.sh) which installs and registers it automatically.
+On **Linux**, membrane uses the system Docker daemon directly. If setup is incomplete, membrane offers to run [`scripts/install-linux.sh`](scripts/install-linux.sh), which activates BPF LSM when supported and installs, registers, enables, and verifies Sysbox. Enabling BPF LSM can require a GRUB update and reboot; membrane asks before changing native Linux boot configuration.
 
 </details>
 
@@ -74,7 +73,7 @@ Config:
   -a, --allow stringArray      allow rule: hostname, IP, CIDR, or URL (repeatable)
       --arg stringArray        extra docker run argument (repeatable)
       --dns-resolver string    DNS resolver (overrides config file)
-  -i, --ignore stringArray     ignore pattern (repeatable)
+  -s, --sealed stringArray     sealed pattern (repeatable)
   -r, --readonly stringArray   readonly pattern (repeatable)
 ```
 
@@ -134,9 +133,9 @@ membrane --reset=ci    # containers and images only
 
 ### Trace execution
 
-By default, membrane records an eBPF trace of everything the agent does. The built-in tracer records process executions, file opens, and network connection attempts across the agent's complete session cgroup, including nested containers.
+By default, membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers.
 
-Membrane creates the session cgroup and installs and scopes the eBPF probes before starting any workload code. If the probes cannot be loaded or attached, setup fails before the workload starts.
+Membrane creates the workload cgroup and installs and scopes the eBPF probes before starting any workload code. If required probes or filesystem policy cannot be loaded or attached, setup fails before the workload starts.
 
 In this example, I just tell Codex to go download the homepage of my blog.
 
@@ -224,22 +223,24 @@ exec  ls: ls -lh blog.html
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, ignore patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, sealed patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# `ignore` lists patterns matched against filenames or relative paths.
-# Matching files and directories are shadowed with an empty placeholder
-# inside the container; the agent can see they exist but cannot read
-# their contents.
-ignore:
+# For both `sealed` and `readonly` below: These filesystem policies are based
+# on a startup *snapshot*. Selectors (e.g., a path like `.env`) are evaluated
+# before workload code runs against objects that already exist. An enrolled
+# object remains protected if it is renamed; a newly created or replacement
+# inode is not automatically enrolled just because its pathname matches a
+# selector.
+
+# `sealed` paths remain visible (e.g., `stat` still works), but file contents
+# cannot be read or modified.
+sealed:
   - secrets/
   - "*.pem"
 
-# `readonly` lists patterns mounted into the container as read-only. Use
-# this for things like .git (so the agent can read history but not
-# rewrite it) or credential files that should be visible but not
-# writable.
+# `readonly` paths may have their contents read, but cannot be modified.
 readonly:
   - config/
 
@@ -315,9 +316,10 @@ allow:
     http:
       - methods: [GET]
 
-# `args` lists raw arguments appended to the `docker run` command.
+# `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
-# its argument must be separate items.
+# its argument must be separate items. Treat this as trusted host-level
+# configuration, especially in a workspace .membrane.yaml.
 args:
   - -e
   - MY_API_KEY=abc123
@@ -351,6 +353,7 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 - [ ] return error messages from proxy
 - [ ] add debug flag
 - [ ] BYO container
+- [ ] require explicit trust/approval for workspace `.membrane.yaml`
 
 <details><summary>Completed</summary>
 
@@ -369,7 +372,7 @@ See [`config-default.yaml`](config-default.yaml) for the full default allow list
 - [x] git-aware read-only mounts
 - [x] refresh firewall on DNS resolution (dns-proxy)
 - [x] quiet down logging a bit
-- [x] make ignore/readonly configurable
+- [x] make sealed/readonly configurable
 - [x] allow reading from host stdin (to be used in pipeline)
 - [x] auto-install prerequisites on first run
 
