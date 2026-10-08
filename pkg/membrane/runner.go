@@ -22,9 +22,9 @@ import (
 	"golang.org/x/term"
 )
 
-// writeAllowFile serialises allow rules to a temp file and returns its path.
+// writeNetworkRulesFile serialises allow and deny rules to a temp file and returns its path.
 // The caller is responsible for removing the file when done.
-func writeAllowFile(allow []AllowRule) (string, error) {
+func writeNetworkRulesFile(allow, deny []NetworkRule) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("get home dir: %w", err)
@@ -33,17 +33,20 @@ func writeAllowFile(allow []AllowRule) (string, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create tmp dir: %w", err)
 	}
-	f, err := os.CreateTemp(dir, "membrane-allow-*.json")
+	f, err := os.CreateTemp(dir, "membrane-network-rules-*.json")
 	if err != nil {
-		return "", fmt.Errorf("create allow file: %w", err)
+		return "", fmt.Errorf("create network rules file: %w", err)
 	}
 	defer f.Close()
 	if allow == nil {
-		allow = []AllowRule{}
+		allow = []NetworkRule{}
 	}
-	if err := json.NewEncoder(f).Encode(allow); err != nil {
+	if deny == nil {
+		deny = []NetworkRule{}
+	}
+	if err := json.NewEncoder(f).Encode(map[string][]NetworkRule{"allow": allow, "deny": deny}); err != nil {
 		os.Remove(f.Name())
-		return "", fmt.Errorf("write allow file: %w", err)
+		return "", fmt.Errorf("write network rules file: %w", err)
 	}
 	return f.Name(), nil
 }
@@ -241,14 +244,14 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		return err
 	}
 
-	allowFile, err := writeAllowFile(cfg.Allow)
+	networkRulesFile, err := writeNetworkRulesFile(cfg.Allow, cfg.Deny)
 	if err != nil {
-		return cleanup, "", fmt.Errorf("write allow file: %w", err)
+		return cleanup, "", fmt.Errorf("write network rules file: %w", err)
 	}
 	prevCleanup := cleanup
 	cleanup = func() error {
 		err := prevCleanup()
-		os.Remove(allowFile)
+		os.Remove(networkRulesFile)
 		return err
 	}
 
@@ -260,7 +263,7 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		"--cap-add=NET_ADMIN",
 		"--sysctl", "net.ipv4.ip_forward=1",
 		"-v", s.caVolume + ":/membrane-ca",
-		"-v", allowFile + ":/etc/membrane/allow.json:ro",
+		"-v", networkRulesFile + ":/etc/membrane/network-rules.json:ro",
 		"-e", "MEMBRANE_DNS_RESOLVER=" + cfg.dnsResolver(),
 		"-e", fmt.Sprintf("MEMBRANE_SSL_INSECURE=%v", cfg.SSLInsecure),
 	}

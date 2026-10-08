@@ -20,10 +20,17 @@ type portRule struct {
 	Proto string `json:"proto"` // "tcp" or "udp"
 }
 
-type allowRule struct {
+type networkRule struct {
 	Type  string     `json:"type"`
 	Host  string     `json:"host"`
 	Ports []portRule `json:"ports"`
+	Path  string     `json:"path"`
+	HTTP  []struct {
+		Methods []string `json:"methods"`
+		Paths   []struct {
+			Path string `json:"path"`
+		} `json:"paths"`
+	} `json:"http"`
 }
 
 type patternEntry struct {
@@ -47,14 +54,7 @@ func unionPorts(dst []portRule, src []portRule) []portRule {
 	return appendUniquePorts(dst, src...)
 }
 
-// buildAllowedHosts parses MEMBRANE_ALLOW JSON and returns an allowedSet
-// containing exact hosts, wildcard patterns, and the any-host flag.
-func buildAllowedHosts(allowJSON string) *allowedSet {
-	var rules []allowRule
-	if err := json.Unmarshal([]byte(allowJSON), &rules); err != nil {
-		log.Printf("dns-proxy: parse MEMBRANE_ALLOW: %v", err)
-		return &allowedSet{exact: make(map[string][]portRule)}
-	}
+func buildHostSet(rules []networkRule) *allowedSet {
 	as := &allowedSet{exact: make(map[string][]portRule)}
 	for _, r := range rules {
 		switch r.Type {
@@ -108,6 +108,34 @@ func buildAllowedHosts(allowJSON string) *allowedSet {
 	return as
 }
 
+// Only transport-only hostname rules belong in firewall sets. HTTP and URL
+// path constraints are evaluated by the proxy, never by refusing DNS answers.
+func buildDeniedHosts(rules []networkRule) []allowedSet {
+	var transport []allowedSet
+	for _, rule := range rules {
+		if len(rule.HTTP) == 0 && (rule.Path == "" || rule.Path == "/") &&
+			(rule.Type == "host" || rule.Type == "url" || rule.Type == "host-pattern") {
+			transport = append(transport, *buildHostSet([]networkRule{rule}))
+		}
+	}
+	return transport
+}
+
+func addDeniedIP(ip net.IP, ports []portRule) error {
+	if len(ports) == 0 {
+		return exec.Command("nft", "add", "element", "ip", "membrane",
+			"denied-any-port", "{", ip.String()+"/32", "}").Run()
+	}
+	for _, pr := range ports {
+		elem := fmt.Sprintf("%s . %s . %d", ip.String(), pr.Proto, pr.Port)
+		if err := exec.Command("nft", "add", "element", "ip", "membrane",
+			"denied", "{", elem, "}").Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func updateReverseMap(ip, hostname string) {
 	existing := map[string]string{}
 	if data, err := os.ReadFile(reverseMapFile); err == nil {
@@ -151,15 +179,26 @@ func main() {
 		upstream += ":53"
 	}
 
-	allowFile := os.Getenv("MEMBRANE_ALLOW_FILE")
-	if allowFile == "" {
-		allowFile = "/etc/membrane/allow.json"
+	rulesFile := os.Getenv("MEMBRANE_NETWORK_RULES_FILE")
+	if rulesFile == "" {
+		rulesFile = "/etc/membrane/network-rules.json"
 	}
-	data, err := os.ReadFile(allowFile)
+	data, err := os.ReadFile(rulesFile)
 	if err != nil {
-		log.Fatalf("dns-proxy: read allow file: %v", err)
+		log.Fatalf("dns-proxy: read network rules: %v", err)
 	}
-	allowed := buildAllowedHosts(string(data))
+	var rules struct {
+		Allow []networkRule `json:"allow"`
+		Deny  []networkRule `json:"deny"`
+	}
+	if err := json.Unmarshal(data, &rules); err != nil {
+		log.Fatalf("dns-proxy: parse network rules: %v", err)
+	}
+	if rules.Allow == nil || rules.Deny == nil {
+		log.Fatal("dns-proxy: network rules must contain allow and deny lists")
+	}
+	allowed := buildHostSet(rules.Allow)
+	denied := buildDeniedHosts(rules.Deny)
 	log.Printf("dns-proxy: tracking %d hostnames, %d patterns, anyHost=%v, upstream=%s",
 		len(allowed.exact), len(allowed.patterns), allowed.anyHost, upstream)
 
@@ -188,7 +227,7 @@ func main() {
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		go handleQuery(pkt, clientAddr, conn, upstream, *allowed)
+		go handleQuery(pkt, clientAddr, conn, upstream, *allowed, denied)
 	}
 }
 
@@ -203,30 +242,9 @@ func extractQueryName(pkt []byte) string {
 	return strings.TrimRight(strings.ToLower(name), ".")
 }
 
-func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed allowedSet) {
-	// Reject packets with more than one question — we only validate the
-	// first question name, so additional questions are an exfiltration
-	// channel. Standard DNS always uses QDCOUNT=1.
-	if len(query) >= 6 && binary.BigEndian.Uint16(query[4:6]) != 1 {
-		resp := make([]byte, len(query))
-		copy(resp, query)
-		resp[2] = (query[2] & 0x01) | 0x80
-		resp[3] = 0x83
-		resp[6], resp[7] = 0, 0
-		resp[8], resp[9] = 0, 0
-		resp[10], resp[11] = 0, 0
-		conn.WriteToUDP(resp, clientAddr)
-		log.Printf("dns-proxy: blocked multi-question packet from %s", clientAddr)
-		return
-	}
-
-	name := extractQueryName(query)
-
-	// Determine if name is allowed and collect union of ports.
+// match preserves the allow resolver's exact/pattern union and any-host fallback.
+func (allowed allowedSet) match(name string) (ports []portRule, matched, populateSets bool) {
 	// populateSets indicates whether resolved IPs should be added to nftables.
-	var ports []portRule
-	matched := false
-	populateSets := false
 
 	// 1. Exact match
 	if p, ok := allowed.exact[name]; ok {
@@ -254,6 +272,30 @@ func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstr
 		matched = true
 		populateSets = false
 	}
+
+	return
+}
+
+func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstream string, allowed allowedSet, denied []allowedSet) {
+	// Reject packets with more than one question — we only validate the
+	// first question name, so additional questions are an exfiltration
+	// channel. Standard DNS always uses QDCOUNT=1.
+	if len(query) >= 6 && binary.BigEndian.Uint16(query[4:6]) != 1 {
+		resp := make([]byte, len(query))
+		copy(resp, query)
+		resp[2] = (query[2] & 0x01) | 0x80
+		resp[3] = 0x83
+		resp[6], resp[7] = 0, 0
+		resp[8], resp[9] = 0, 0
+		resp[10], resp[11] = 0, 0
+		conn.WriteToUDP(resp, clientAddr)
+		log.Printf("dns-proxy: blocked multi-question packet from %s", clientAddr)
+		return
+	}
+
+	name := extractQueryName(query)
+
+	ports, matched, populateSets := allowed.match(name)
 
 	if !matched {
 		resp := make([]byte, len(query))
@@ -296,6 +338,19 @@ func handleQuery(query []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, upstr
 
 	// Parse response and update nftables before returning to client
 	respName, ips := extractARecords(resp)
+	for _, ip := range ips {
+		for _, policy := range denied {
+			denyPorts, denyMatch, _ := policy.match(name)
+			if !denyMatch {
+				continue
+			}
+			if err := addDeniedIP(ip, denyPorts); err != nil {
+				// Never release a usable answer before its veto is installed.
+				log.Printf("dns-proxy: install deny for %s: %v", name, err)
+				return
+			}
+		}
+	}
 	if respName != "" && len(ips) > 0 && populateSets {
 		respName = strings.ToLower(strings.TrimRight(respName, "."))
 		for _, ip := range ips {

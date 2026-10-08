@@ -14,12 +14,13 @@ import (
 )
 
 type config struct {
-	DNSResolver string      `yaml:"dns_resolver"`
-	SSLInsecure bool        `yaml:"ssl_insecure"`
-	Sealed      []string    `yaml:"sealed"`
-	Readonly    []string    `yaml:"readonly"`
-	Args        []string    `yaml:"args"`
-	Allow       []AllowRule `yaml:"allow"`
+	DNSResolver string        `yaml:"dns_resolver"`
+	SSLInsecure bool          `yaml:"ssl_insecure"`
+	Sealed      []string      `yaml:"sealed"`
+	Readonly    []string      `yaml:"readonly"`
+	Args        []string      `yaml:"args"`
+	Allow       []NetworkRule `yaml:"allow"`
+	Deny        []NetworkRule `yaml:"deny"`
 }
 
 func (c *config) dnsResolver() string {
@@ -36,9 +37,9 @@ type portRule struct {
 	Proto string `json:"proto"` // "tcp" or "udp"
 }
 
-// AllowRule represents a single entry in the allow list.
+// NetworkRule represents a single entry in an allow or deny list.
 // Type is one of "cidr", "host", "url", "any", or "host-pattern".
-type AllowRule struct {
+type NetworkRule struct {
 	Type   string     `json:"type"`
 	CIDR   string     `json:"cidr,omitempty"`
 	Host   string     `json:"host,omitempty"`
@@ -57,7 +58,7 @@ type PathRule struct {
 	Path string `json:"path"`
 }
 
-func (r *AllowRule) UnmarshalYAML(value *yaml.Node) error {
+func (r *NetworkRule) UnmarshalYAML(value *yaml.Node) error {
 	switch value.Kind {
 	case yaml.ScalarNode:
 		return r.parseAuto(value.Value)
@@ -80,7 +81,7 @@ func validateHostPattern(s string) error {
 	return nil
 }
 
-func (r *AllowRule) parseAuto(s string) error {
+func (r *NetworkRule) parseAuto(s string) error {
 	// 0a. Bare * → any host
 	if s == "*" {
 		r.Type = "any"
@@ -150,7 +151,7 @@ func (r *AllowRule) parseAuto(s string) error {
 	return nil
 }
 
-func (r *AllowRule) parseMappingNode(value *yaml.Node) error {
+func (r *NetworkRule) parseMappingNode(value *yaml.Node) error {
 	var destStr string
 	var portsNode *yaml.Node
 	var httpNode *yaml.Node
@@ -238,9 +239,9 @@ func appendUniquePort(s []portRule, pr portRule) []portRule {
 	return append(s, pr)
 }
 
-// ParseAllowEntry parses a raw CLI --allow string into an AllowRule.
-func ParseAllowEntry(raw string) (AllowRule, error) {
-	var r AllowRule
+// ParseAllowEntry parses a raw CLI --allow string into a NetworkRule.
+func ParseAllowEntry(raw string) (NetworkRule, error) {
+	var r NetworkRule
 	return r, r.parseAuto(raw)
 }
 
@@ -281,6 +282,7 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
 		base.Args = append(base.Args, workspace.Args...)
 		base.Allow = append(base.Allow, workspace.Allow...)
+		base.Deny = append(base.Deny, workspace.Deny...)
 	}
 
 	expandArgs(base.Args)
@@ -297,6 +299,38 @@ func loadConfigFile(path string) (*config, error) {
 	decoder.KnownFields(true)
 	if err := decoder.Decode(cfg); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	// Pointer entries retain YAML nulls that []NetworkRule would silently skip.
+	// Validate denies separately so existing allow parsing stays unchanged.
+	var entries struct {
+		Deny []*NetworkRule `yaml:"deny"`
+	}
+	if err := yaml.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	for i, rule := range entries.Deny {
+		if rule == nil || rule.Type == "" || (rule.Type != "any" && rule.CIDR == "" && rule.Host == "") {
+			return nil, fmt.Errorf("parse %s: deny[%d]: missing destination", path, i)
+		}
+		for _, http := range rule.HTTP {
+			for _, method := range http.Methods {
+				if method == "" {
+					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP method", path, i)
+				}
+			}
+			for _, prefix := range http.Paths {
+				if prefix.Path == "" {
+					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP path", path, i)
+				}
+			}
+		}
+		if len(rule.HTTP) > 0 || strings.TrimRight(rule.Path, "/") != "" {
+			for _, port := range rule.Ports {
+				if port.Proto == "udp" {
+					return nil, fmt.Errorf("parse %s: deny[%d]: UDP ports cannot be combined with HTTP or path constraints", path, i)
+				}
+			}
+		}
 	}
 	return cfg, nil
 }

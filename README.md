@@ -219,11 +219,13 @@ exec  bash: /bin/bash -c ls -lh blog.html
 exec  ls: ls -lh blog.html
 ```
 
+</details>
+
 ### Configure
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, sealed patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow and deny lists, sealed patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
@@ -327,6 +329,14 @@ args:
   - $HOME/.aws:/home/agent/.aws:ro
   - -e
   - AWS_PROFILE=myprofile
+
+# Block DELETE at /api and its descendants, overriding the github.com allow.
+# Query strings do not affect path matching.
+deny:
+  - dest: https://github.com
+    http:
+      - methods: [DELETE]
+        paths: [/api]
 ```
 
 See [`config-default.yaml`](config-default.yaml) for the full default allow list.

@@ -1,5 +1,5 @@
 # Workspace .membrane.yaml entries are appended to the global list, not
-# replaced. This applies to all list keys: sealed, readonly, allow, and args.
+# replaced. This applies to sealed, readonly, allow, deny, and args.
 
 # `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
 # Defaults to 1.1.1.1 if not set.
@@ -236,9 +236,7 @@ allow:
       - methods: [GET, HEAD]
   - dest: https://auth.docker.io
     http:
-      # Query-bearing /token?service=... cannot currently match /token.
-      # GET-only host access is an explicit exception until the matcher handles
-      # the path separately from the query. Do not add arbitrary HEAD here.
+      # Token requests retain host-wide GET access; HEAD is not granted.
       - methods: [GET]
   - dest: https://hub.docker.com
     http:
@@ -257,6 +255,9 @@ allow:
     http:
       - methods: [GET, HEAD]
         paths: [/registry-v2]
+
+# Matching deny rules veto any allow rule.
+deny: []
 
 # `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and

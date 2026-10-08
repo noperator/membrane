@@ -1160,6 +1160,215 @@ os.kill(pids[0], signal.SIGKILL)
                   sig.name + ": orderly loader shutdown")
 
 
+def group_32(ctx):
+    denied = """  - dest: https://httpbin.org
+    http:
+      - methods: [DELETE, PATCH]
+        paths: [/v1/items, /anything/other]
+"""
+    config(ctx, 'allow: [httpbin.org]\ndeny:\n' + denied)
+    for flag, version in (('--http1.1', '1.1'), ('--http2', '2')):
+        result = membrane(ctx, ['curl', '-sS', '-m', '5', flag, '-o', '/dev/null',
+                               '-w', '%{http_version} %{http_code}', '-X', 'DELETE',
+                               'https://httpbin.org/v1/items'])
+        check(ctx, result.stdout.strip() == version + ' 403',
+              f'32 HTTP/{version} deny under bare-host allow (got {result.stdout.strip()!r})')
+    for method, path, expected in (
+        ('DELETE', '/v1/items?anything=1', '403'),
+        ('DELETE', '/v1/items/child?x=/../../public', '403'),
+        ('DELETE', '/v1/items/', '403'),
+        ('PATCH', '/anything/other', '403'),
+        ('GET', '/v1/items?anything=1', '404'),
+        ('DELETE', '/v1/items-extra', '404'),
+        ('GET', '/anything/other', '200'),
+    ):
+        http(ctx, f'32 HTTP deny {method} {path}', expected,
+             'https://httpbin.org' + path, method=method, curl_options=['--path-as-is'])
+    for rules in ('  - unrelated.example\n' + denied, denied + '  - unrelated.example\n'):
+        config(ctx, 'allow: [httpbin.org]\ndeny:\n' + rules)
+        http(ctx, '32 deny order and CLI allow cannot bypass veto', '403',
+             'https://httpbin.org/v1/items?anything=1', method='DELETE',
+             options=['--allow=https://httpbin.org/v1/items'])
+
+    config(ctx, """allow: [httpbin.org]
+deny:
+  - dest: httpbin.org
+    ports: [8443]
+    http:
+      - methods: [GET]
+""")
+    http(ctx, '32 HTTP deny on a different port leaves HTTPS usable', '200',
+         'https://httpbin.org/anything/other')
+    config(ctx, """allow: [https://httpbin.org/anything/other]
+deny:
+  - dest: '*'
+    http:
+      - methods: [GET]
+""")
+    http(ctx, '32 broad deny vetoes narrow allow', '403',
+         'https://httpbin.org/anything/other')
+
+    # Queries do not change allow matching either, and still reach the server.
+    config(ctx, 'allow: [https://httpbin.org/anything/items]\ndeny: []\n')
+    result = membrane(ctx, ['curl', '-fsS', '--path-as-is',
+                           'https://httpbin.org/anything/items?x=/../../public'])
+    body = json.loads(result.stdout)
+    check(ctx, body['args']['x'] == '/../../public' and '/anything/items?' in body['url'],
+          '32 pathname-only matching preserves the forwarded query')
+
+
+def group_33(ctx):
+    config(ctx, 'allow: [github.com]\ndeny: [{dest: github.com, http: [{methods: [DELETE]}]}]\n')
+    exit_status(ctx, '33 HTTP deny preserves allowed raw SSH', 0,
+                ['bash', '-c', 'sleep 3 | ncat -w3 github.com 22 2>&1 | grep -q SSH'])
+
+    config(ctx, """allow: [github.com]
+deny:
+  - dest: github.com
+    ports: [22]
+""")
+    exit_status(ctx, '33 hostname TCP deny blocks SSH with broad allow', 0,
+                ['bash', '-c', '! { sleep 3 | ncat -w3 github.com 22 2>&1 | grep -q SSH; }'])
+    http(ctx, '33 hostname TCP deny leaves port 443 usable', '200', 'https://github.com/')
+
+    config(ctx, 'allow: [{dest: 8.8.8.8, ports: [53/udp]}]\ndeny: []\n')
+    exit_status(ctx, '33 UDP opt-in works without denies', 0, ['dig', '@8.8.8.8', 'github.com'])
+    config(ctx, """allow:
+  - dest: 8.8.8.8
+    ports: [53/udp]
+deny:
+  - dest: 8.8.8.0/24
+    ports: [53/udp]
+""")
+    exit_status(ctx, '33 CIDR UDP deny vetoes UDP opt-in', 0,
+                ['bash', '-c', 'dig @8.8.8.8 github.com; test "$?" -eq 9'])
+
+    config(ctx, """allow: ['*']
+deny:
+  - dest: '*.github.com'
+    ports: [443]
+""")
+    exit_status(ctx, '33 wildcard transport deny beats any-host allow', 0,
+                ['bash', '-c', 'curl -sf -m 5 https://api.github.com/; test "$?" -eq 28'])
+    http(ctx, '33 wildcard transport deny leaves apex usable', '200', 'https://github.com/')
+
+    config(ctx, """deny: [httpbin.org]
+""")
+    dns(ctx, '33 deny-only hostname does not authorize DNS', 'NXDOMAIN', ['dig', 'httpbin.org'])
+    config(ctx, """allow: [https://httpbin.org/anything/root]
+deny: ['*']
+""")
+    exit_status(ctx, '33 broad transport deny vetoes narrow URL allow', 0,
+                ['bash', '-c', 'curl -sf -m 5 https://httpbin.org/anything/root; test "$?" -eq 28'])
+
+
+def group_34(ctx):
+    policy_home = ctx.workdir / 'policy-home'
+    (policy_home / '.membrane').mkdir(parents=True)
+    (policy_home / '.membrane/src').symlink_to(REPO_ROOT, target_is_directory=True)
+    global_file = policy_home / '.membrane/config.yaml'
+    env = dict(ctx.environment, HOME=str(policy_home))
+    # Isolate Membrane's global policy while retaining access to the existing
+    # Docker context and Colima VM, whose defaults also depend on HOME.
+    env.setdefault('DOCKER_CONFIG', str(Path.home() / '.docker'))
+    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
+        colima_home = Path.home() / '.colima'
+        if not colima_home.is_dir():
+            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
+        env['COLIMA_HOME'] = str(colima_home)
+    global_file.write_text("""allow: [httpbin.org]
+deny:
+  - dest: httpbin.org
+    http: [{methods: [DELETE], paths: [/anything/global]}]
+""")
+    config(ctx, """allow: [httpbin.org]
+deny:
+  - dest: httpbin.org
+    http: [{methods: [DELETE], paths: [/anything/workspace]}]
+""")
+    for path, skip, expected in (('global', False, '403'), ('workspace', False, '403'),
+                                 ('global', True, '200'), ('workspace', True, '403')):
+        result = membrane(ctx, ['curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+                                '-X', 'DELETE', 'https://httpbin.org/anything/' + path], env=env,
+                          options=['--no-global-config=' + str(skip).lower(), '--allow=httpbin.org'])
+        check(ctx, result.stdout.strip() == expected,
+              f'34 {path} deny with no-global-config={skip}, workspace/global/CLI allows')
+
+    for rule in ('{dest: httpbin.org, ports: [53/udp], http: [{methods: [GET]}]}',
+                 '{dest: https://httpbin.org/v1, ports: [443, 443/udp], http: []}'):
+        config(ctx, 'allow: [httpbin.org]\ndeny: [' + rule + ']\n')
+        result = membrane(ctx, ['echo', 'workload-started'], expected=None)
+        check(ctx, result.returncode != 0 and 'UDP ports cannot be combined' in result.stderr
+              and 'workload-started' not in result.stdout,
+              '34 unsupported UDP HTTP/path deny fails before workload starts')
+
+
+def group_35(ctx):
+    config(ctx, """allow: [httpbin.org]
+deny:
+  - dest: httpbin.org
+    http: [{methods: [DELETE], paths: [/anything/private]}]
+""")
+    # Real sockets through the handler: split both the TLS ClientHello and the
+    # HTTP method, without disabling certificate verification.
+    result = membrane(ctx, ['python3', '-c', r'''
+import socket, ssl, time
+for secure, method, expected in ((False, 'DELETE', b'403'), (True, 'DELETE', b'403'),
+                                  (True, 'GET', b'200')):
+    with socket.create_connection(('httpbin.org', 443 if secure else 80), timeout=10) as sock:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if secure:
+            incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+            tls = ssl.create_default_context().wrap_bio(incoming, outgoing, server_hostname='httpbin.org')
+            first = True
+            def flush():
+                global first
+                data = outgoing.read()
+                if first and data:
+                    sock.sendall(data[:1])
+                    time.sleep(0.2)
+                    data, first = data[1:], False
+                if data:
+                    sock.sendall(data)
+            while True:
+                try:
+                    tls.do_handshake()
+                    flush()
+                    break
+                except ssl.SSLWantReadError:
+                    flush()
+                    incoming.write(sock.recv(65536))
+            def send(data):
+                tls.write(data)
+                flush()
+            def recv():
+                while True:
+                    try:
+                        return tls.read(65536)
+                    except ssl.SSLWantReadError:
+                        flush()
+                        data = sock.recv(65536)
+                        if not data:
+                            return b''
+                        incoming.write(data)
+        else:
+            send, recv = sock.sendall, lambda: sock.recv(65536)
+        request = (method + ' /anything/private?x=/../../public HTTP/1.1\r\n'
+                   'Host: httpbin.org\r\nConnection: close\r\n\r\n').encode()
+        send(request[:1])
+        time.sleep(0.2)
+        send(request[1:])
+        response = b''
+        while b'\r\n' not in response:
+            chunk = recv()
+            assert chunk, response
+            response += chunk
+        assert response.split(b' ')[1] == expected, response
+        print('PASS', 'TLS' if secure else 'HTTP', method)
+'''])
+    check(ctx, result.stdout.count('PASS') == 3, '35 fragmented HTTP/TLS denies and allowed GET')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -1198,6 +1407,10 @@ GROUPS = {
     29: TestGroup("traced workload lifecycle and terminal I/O", group_29),
     30: TestGroup("filesystem LSM isolation, lifecycle and startup snapshot", group_30),
     31: TestGroup("security supervisor fail-stop, cgroup isolation and signals", group_31),
+    32: TestGroup("HTTP deny precedence, methods, paths and ports", group_32),
+    33: TestGroup("transport denies, DNS, wildcards and UDP", group_33),
+    34: TestGroup("deny config merging, CLI precedence and unsupported UDP constraints", group_34),
+    35: TestGroup("fragmented HTTP/TLS deny inspection", group_35),
 }
 
 

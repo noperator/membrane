@@ -87,3 +87,75 @@ func TestLoadEmptyConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestDenyConfig(t *testing.T) {
+	home, workspace := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.Mkdir(filepath.Join(home, ".membrane"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	global := "allow: ['*']\ndeny: [https://api.example.com/v1/]\n"
+	local := "allow: [api.example.com]\ndeny: [{dest: '*.example.com', ports: [443], http: [{methods: [GET, POST], paths: [v1, /v2]}]}]\n"
+	for path, contents := range map[string]string{
+		filepath.Join(home, ".membrane/config.yaml"): global,
+		filepath.Join(workspace, ".membrane.yaml"):   local,
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, skip := range []bool{false, true} {
+		cfg, err := loadConfig(workspace, skip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 2
+		if skip {
+			want = 1
+		}
+		if len(cfg.Deny) != want || len(cfg.Allow) != want {
+			t.Fatalf("skip=%v: %+v", skip, cfg)
+		}
+		if !skip && (cfg.Deny[0].Path != "/v1/" || cfg.Deny[0].Ports[0] != (portRule{443, "tcp"})) {
+			t.Fatalf("URL deny: %+v", cfg.Deny[0])
+		}
+		rule := cfg.Deny[want-1]
+		if rule.Type != "host-pattern" || rule.Ports[0] != (portRule{443, "tcp"}) || len(rule.HTTP[0].Methods) != 2 || len(rule.HTTP[0].Paths) != 2 {
+			t.Fatalf("object deny: %+v", rule)
+		}
+	}
+	for _, rules := range []string{"[example.com, 192.0.2.1, 192.0.2.0/24, '*', https://api.example.com/v1]", "[]", "null"} {
+		path := filepath.Join(workspace, "rules.yaml")
+		if err := os.WriteFile(path, []byte("allow: "+rules+"\ndeny: "+rules+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfigFile(path)
+		if err != nil || !reflect.DeepEqual(cfg.Allow, cfg.Deny) {
+			t.Fatalf("same grammar: cfg=%+v err=%v", cfg, err)
+		}
+	}
+}
+
+// Deny-only validation must not tighten the existing allow grammar.
+func TestDenyValidation(t *testing.T) {
+	for _, rules := range []string{
+		"[null]", "['']", "[{dest: example.com, http: [{methods: [{}]}]}]",
+		"[{dest: example.com, ports: [53/udp], http: [{methods: [GET]}]}]",
+		"[{dest: https://example.com/v1, ports: [443/udp], http: []}]",
+		"[{dest: example.com, ports: [443, 443/udp], http: [{paths: [/v1]}]}]",
+	} {
+		for _, key := range []string{"allow", "deny"} {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(key+": "+rules+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := loadConfigFile(path)
+			if (err != nil) != (key == "deny") {
+				t.Fatalf("%s: %s: %v", key, rules, err)
+			}
+			if key == "deny" && strings.Contains(rules, "/udp") && !strings.Contains(err.Error(), "UDP ports cannot be combined") {
+				t.Fatalf("unclear UDP error: %v", err)
+			}
+		}
+	}
+}
