@@ -47,16 +47,40 @@ echo "Interfaces: external=$DEFAULT_GW_IF internal=$INTERNAL_IF"
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
 DNS_RESOLVER="${MEMBRANE_DNS_RESOLVER:-1.1.1.1}"
-ALLOW_FILE="${MEMBRANE_ALLOW_FILE:-/etc/membrane/allow.json}"
+NETWORK_RULES_FILE="${MEMBRANE_NETWORK_RULES_FILE:-/etc/membrane/network-rules.json}"
 
-# Extract CIDRs from allow file for initial nftables population.
+# Extract transport rules for initial nftables population.
 # CIDRs without ports → @allowed-any-port (TCP only via forward rule).
 # CIDRs with ports → @allowed (ip . proto . port).
 # Hostnames are resolved dynamically by dns-proxy at query time.
 read -r -d '' _EXTRACT_RULES <<'PYEOF' || true
-import json, sys
+import ipaddress, json, sys
 with open(sys.argv[1]) as f:
-    rules = json.load(f)
+    policy = json.load(f)
+if not isinstance(policy, dict) or any(not isinstance(policy.get(k), list) for k in ('allow', 'deny')):
+    raise ValueError('network rules must contain allow and deny lists')
+rules, denies = policy['allow'], policy['deny']
+transport_denies = []
+for r in denies:
+    if r.get('http') or r.get('path', '') not in ('', '/'):
+        if any(p['proto'] == 'udp' for p in r.get('ports', [])):
+            raise ValueError('UDP deny ports cannot be combined with HTTP or path constraints')
+        continue
+    if r['type'] == 'cidr':
+        cidr = r['cidr']
+    elif r['type'] == 'any':
+        cidr = '0.0.0.0/0'
+    else:
+        try:
+            cidr = str(ipaddress.IPv4Address(r.get('host', ''))) + '/32'
+        except ipaddress.AddressValueError:
+            continue  # Named destinations are populated by dns-proxy.
+    ports = r.get('ports') or []
+    if not ports:
+        transport_denies.append(f"ip daddr {cidr} meta l4proto tcp drop")
+    for p in ports:
+        transport_denies.append(f"ip daddr {cidr} {p['proto']} dport {p['port']} drop")
+print('TRANSPORT_DENIES=' + '; '.join(transport_denies))
 any_port = []
 port_constrained = []
 any_host = False
@@ -89,7 +113,8 @@ print('ANY_HOST=' + ('1' if any_host else ''))
 print('ANY_HOST_TCP_PORTS=' + (','.join(str(p) for p in any_host_tcp_ports) if any_host_tcp_ports else ''))
 print('ANY_HOST_UDP_PORTS=' + (','.join(str(p) for p in any_host_udp_ports) if any_host_udp_ports else ''))
 PYEOF
-_EXTRACT_OUTPUT=$(python3 -c "$_EXTRACT_RULES" "$ALLOW_FILE" 2>/dev/null)
+_EXTRACT_OUTPUT=$(python3 -c "$_EXTRACT_RULES" "$NETWORK_RULES_FILE")
+TRANSPORT_DENIES=$(echo "$_EXTRACT_OUTPUT" | grep '^TRANSPORT_DENIES=' | cut -d= -f2-)
 ANY_PORT=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_PORT=' | cut -d= -f2-)
 PORT_CONSTRAINED=$(echo "$_EXTRACT_OUTPUT" | grep '^PORT_CONSTRAINED=' | cut -d= -f2-)
 ANY_HOST=$(echo "$_EXTRACT_OUTPUT" | grep '^ANY_HOST=' | cut -d= -f2-)
@@ -118,6 +143,35 @@ nft -f - <<EOF
 table ip membrane
 delete table ip membrane
 table ip membrane {
+    set denied {
+        type ipv4_addr . inet_proto . inet_service
+    }
+
+    set denied-any-port {
+        type ipv4_addr
+    }
+
+    chain deny {
+        # Static CIDRs can overlap; hostname sets contain individual IPs.
+        $TRANSPORT_DENIES
+        ip daddr @denied-any-port meta l4proto tcp drop
+        ip daddr . meta l4proto . th dport @denied drop
+    }
+
+    # Filter every packet before DNAT, including established connections.
+    chain deny-prerouting {
+        type filter hook prerouting priority -150; policy accept;
+        # The local DNS control service still applies the allow list itself.
+        iifname "$INTERNAL_IF" fib daddr type local udp dport 53 return
+        iifname "$INTERNAL_IF" jump deny
+    }
+
+    # Apply newly resolved denies to existing proxy upstream connections too.
+    chain deny-output {
+        type filter hook output priority filter; policy accept;
+        oifname "$DEFAULT_GW_IF" meta l4proto tcp jump deny
+    }
+
     set allowed {
         type ipv4_addr . inet_proto . inet_service
         flags interval
@@ -193,7 +247,7 @@ ip6tables -P FORWARD DROP 2>/dev/null || true
 ip6tables -P OUTPUT DROP 2>/dev/null || true
 
 # Start DNS proxy (updates nftables sets on resolution)
-MEMBRANE_DNS_RESOLVER="$DNS_RESOLVER" MEMBRANE_ALLOW_FILE="$ALLOW_FILE" dns-proxy &
+MEMBRANE_DNS_RESOLVER="$DNS_RESOLVER" MEMBRANE_NETWORK_RULES_FILE="$NETWORK_RULES_FILE" dns-proxy &
 DNS_PROXY_PID=$!
 supervise dns-proxy "$DNS_PROXY_PID"
 echo "DNS proxy started (PID $DNS_PROXY_PID)."
@@ -219,7 +273,7 @@ cat /tmp/ca.key /membrane-ca/ca.crt >/tmp/mitmproxy/mitmproxy-ca.pem
 echo "CA cert generated."
 
 # Start mitmproxy in transparent mode
-PYTHONUNBUFFERED=1 mitmdump \
+PYTHONUNBUFFERED=1 MEMBRANE_NETWORK_RULES_FILE="$NETWORK_RULES_FILE" mitmdump \
     --mode transparent \
     --listen-port "$MITMPROXY_PORT" \
     --set confdir=/tmp/mitmproxy \

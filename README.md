@@ -219,11 +219,13 @@ exec  bash: /bin/bash -c ls -lh blog.html
 exec  ls: ls -lh blog.html
 ```
 
+</details>
+
 ### Configure
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow list, sealed patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow and deny lists, sealed patterns, and readonly patterns.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
@@ -273,17 +275,17 @@ allow:
   - dest: github.com
     http:
       - methods: [GET, POST]
-        paths: [/api/]
+        paths: [/api]
   - dest: github.com   # second entry adds port 22
     ports: [22/tcp]
 
   # 5. URL entry: shorthand for hostname + port from scheme + path
-  # prefix. All methods allowed under /v1/.
-  - https://api.openai.com/v1/
+  # prefix. All methods allowed at /v1 and its descendants.
+  - https://api.openai.com/v1
 
   # 6. URL entry with http rules: the most specific form. Port from
   # scheme enforced at L3, method and path enforced at L7.
-  - dest: https://api.example.com/v1/
+  - dest: https://api.example.com/v1
     http:
       - methods: [POST]
         paths:
@@ -297,7 +299,7 @@ allow:
   - dest: 192.168.3.0/24
     http:
       - methods: [GET]
-        paths: [/api/]
+        paths: [/api]
 
   # 8. UDP opt-in: bare port numbers default to TCP. Append /udp to
   # explicitly allow UDP on a specific port.
@@ -327,6 +329,14 @@ args:
   - $HOME/.aws:/home/agent/.aws:ro
   - -e
   - AWS_PROFILE=myprofile
+
+# Block DELETE at /api and its descendants, overriding the github.com allow.
+# Query strings do not affect path matching.
+deny:
+  - dest: https://github.com
+    http:
+      - methods: [DELETE]
+        paths: [/api]
 ```
 
 See [`config-default.yaml`](config-default.yaml) for the full default allow list.
