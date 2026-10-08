@@ -8,6 +8,93 @@ import (
 	"testing"
 )
 
+func TestWriteDefaultFiles(t *testing.T) {
+	for _, configState := range []string{"missing", "file", "symlink"} {
+		for _, agentsState := range []string{"missing", "file", "symlink"} {
+			t.Run(configState+"/"+agentsState, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(dir, "src"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				states := map[string]string{"config.yaml": configState, "AGENTS.md": agentsState}
+				for name, state := range states {
+					if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("shipped "+name), 0644); err != nil {
+						t.Fatal(err)
+					}
+					dest := filepath.Join(dir, name)
+					if state == "symlink" {
+						if err := os.Symlink(name+".user", dest); err != nil {
+							t.Fatal(err)
+						}
+						dest += ".user"
+					}
+					if state != "missing" {
+						if err := os.WriteFile(dest, []byte("user "+name), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				for start := 0; start < 2; start++ {
+					if err := writeDefaultFiles(dir); err != nil {
+						t.Fatal(err)
+					}
+					for name, state := range states {
+						want := "user " + name
+						if state == "missing" {
+							want = "shipped " + name
+						}
+						data, err := os.ReadFile(filepath.Join(dir, name))
+						if err != nil || string(data) != want {
+							t.Fatalf("%s on start %d: %q, %v", name, start, data, err)
+						}
+						if state == "symlink" {
+							target, err := os.Readlink(filepath.Join(dir, name))
+							if err != nil || target != name+".user" {
+								t.Fatalf("replaced symlink %s: %s, %v", name, target, err)
+							}
+						}
+						// A subsequent repository update must not refresh either copy.
+						if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("updated"), 0644); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
+	for _, name := range []string{"config.yaml", "AGENTS.md"} {
+		for _, target := range []string{"missing", name, "src"} {
+			t.Run(name+"/"+target, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(dir, "src"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				for _, source := range []string{"config.yaml", "AGENTS.md"} {
+					if err := os.WriteFile(filepath.Join(dir, "src", source), []byte("shipped"), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				link := filepath.Join(dir, name)
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeDefaultFiles(dir); err == nil || !strings.Contains(err.Error(), link) {
+					t.Fatalf("expected error identifying unusable link %s: %v", link, err)
+				}
+				if got, err := os.Readlink(link); err != nil || got != target {
+					t.Fatalf("modified unusable link: %s, %v", got, err)
+				}
+				if _, err := os.Lstat(filepath.Join(dir, "missing")); !os.IsNotExist(err) {
+					t.Fatalf("created a dangling link's target: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestLoadConfigSealed(t *testing.T) {
 	home, workspace := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)

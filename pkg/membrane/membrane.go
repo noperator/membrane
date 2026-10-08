@@ -42,22 +42,21 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return err
 	}
 
-	// Write default config if it doesn't exist yet. Safe to call every run.
-	// Must run after ensureRepo — reads config-default.yaml from the cloned repo.
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("get home dir: %w", err)
 	}
 	membraneDir := filepath.Join(home, ".membrane")
-	if err := writeDefaultConfig(membraneDir); err != nil {
-		return err
-	}
 
 	if !noUpdate {
 		if err := checkAndUpdate(repoDir); err != nil {
 			// Non-fatal: warn and continue.
 			fmt.Fprintf(os.Stderr, "Warning: update check failed: %v\n", err)
 		}
+	}
+	// Initialize from the available repository, preserving user edits on updates.
+	if err := writeDefaultFiles(membraneDir); err != nil {
+		return err
 	}
 
 	if err := ensureImages(repoDir); err != nil {
@@ -131,6 +130,67 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		}
 		defer os.Remove(policyFile)
 	}
+
+	instructionsPath, err := filepath.EvalSymlinks(filepath.Join(membraneDir, "AGENTS.md"))
+	if err != nil {
+		return fmt.Errorf("resolve user instructions: %w", err)
+	}
+	instructions, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		return fmt.Errorf("read user instructions: %w", err)
+	}
+	s.agentFileMounts = append(s.agentFileMounts,
+		"-v", instructionsPath+":/etc/membrane/AGENTS.md:ro",
+		"-v", instructionsPath+":/etc/claude-code/CLAUDE.md:ro")
+	if !noGlobalConfig {
+		globalPath, err := filepath.EvalSymlinks(filepath.Join(membraneDir, "config.yaml"))
+		if err != nil {
+			return fmt.Errorf("resolve global configuration: %w", err)
+		}
+		s.agentFileMounts = append(s.agentFileMounts, "-v", globalPath+":/etc/membrane/config.yaml:ro")
+	}
+	// Append user-managed guidance to the active Codex global file, keeping the
+	// shared originals intact. Create parents as the host user, rather than Docker.
+	codexDir := filepath.Join(membraneDir, "home", ".codex")
+	if err := os.MkdirAll(codexDir, 0755); err != nil {
+		return fmt.Errorf("create Codex directory: %w", err)
+	}
+	codexName, codexInstructions := "AGENTS.md", ""
+	for _, name := range []string{"AGENTS.override.md", "AGENTS.md"} {
+		data, err := os.ReadFile(filepath.Join(codexDir, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read Codex %s: %w", name, err)
+		}
+		if name == "AGENTS.override.md" && strings.TrimSpace(string(data)) == "" {
+			continue
+		}
+		codexName, codexInstructions = name, string(data)+"\n\n"
+		break
+	}
+	tmpDir := filepath.Join(membraneDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0700); err != nil {
+		return fmt.Errorf("create session tmp dir: %w", err)
+	}
+	f, err := os.CreateTemp(tmpDir, "membrane-instructions-*.md")
+	if err != nil {
+		return fmt.Errorf("create Codex instruction copy: %w", err)
+	}
+	defer os.Remove(f.Name()) // Registered before workload teardown.
+	_, err = f.WriteString(codexInstructions + string(instructions))
+	if err == nil {
+		err = f.Chmod(0644)
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("write Codex instruction copy: %w", err)
+	}
+	s.agentFileMounts = append(s.agentFileMounts, "-v", f.Name()+":/home/agent/.codex/"+codexName+":ro")
 
 	var setupSpinner *spinner
 	if trace && term.IsTerminal(int(os.Stdin.Fd())) {

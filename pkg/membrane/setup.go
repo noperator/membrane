@@ -264,19 +264,45 @@ func buildImageFromDir(name, dir string) error {
 	return nil
 }
 
-// writeDefaultConfig writes ~/.membrane/config.yaml if it doesn't already exist,
-// reading the template from ~/.membrane/src/config-default.yaml.
-func writeDefaultConfig(membraneHomeDir string) error {
-	dest := filepath.Join(membraneHomeDir, "config.yaml")
-	if _, err := os.Stat(dest); err == nil {
-		return nil // already exists, never overwrite
+// writeDefaultFiles initializes independent user-managed copies, never replacing
+// existing files or symlinks, including dangling links.
+func writeDefaultFiles(membraneHomeDir string) error {
+	for _, name := range []string{"config.yaml", "AGENTS.md"} {
+		dest := filepath.Join(membraneHomeDir, name)
+		if _, err := os.Lstat(dest); err == nil {
+			info, err := os.Stat(dest)
+			if err != nil {
+				return fmt.Errorf("unusable existing %s (check symlink target): %w", dest, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("%s must resolve to a regular file", dest)
+			}
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect %s: %w", dest, err)
+		}
+		data, err := os.ReadFile(filepath.Join(membraneHomeDir, "src", name))
+		if err != nil {
+			return fmt.Errorf("read default %s: %w", name, err)
+		}
+		// Exclusive creation also protects originals during concurrent starts.
+		f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("create %s: %w", dest, err)
+		}
+		_, err = f.Write(data)
+		closeErr := f.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return fmt.Errorf("write %s: %w", dest, err)
+		}
 	}
-	src := filepath.Join(membraneHomeDir, "src", "config-default.yaml")
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("read default config: %w", err)
-	}
-	return os.WriteFile(dest, data, 0644)
+	return nil
 }
 
 // isDirty returns true if the git repo at dir has uncommitted changes.

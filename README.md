@@ -46,7 +46,7 @@ go install github.com/noperator/membrane/cmd/membrane@latest
 
 <details><summary>Initial setup</summary>
 
-On first run, membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, builds the `membrane-agent` and `membrane-handler` Docker images, and writes a default config to `~/.membrane/config.yaml`. Subsequent runs check for updates automatically. Initial install takes about 2 minutes.
+On first run, membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, initializes missing configuration and instruction files in `~/.membrane/`, and builds the `membrane-agent` and `membrane-handler` Docker images. Subsequent runs check for updates automatically while preserving user-managed files. Initial install takes about 2 minutes.
 
 On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
 
@@ -339,7 +339,7 @@ deny:
         paths: [/api]
 ```
 
-See [`config-default.yaml`](config-default.yaml) for the full default allow list.
+See [`config.yaml`](config.yaml) for the full default allow list.
 
 ### Troubleshooting
 

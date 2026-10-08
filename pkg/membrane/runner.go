@@ -68,6 +68,8 @@ type sessionNames struct {
 	internalNetwork  string
 	externalNetwork  string
 	caVolume         string
+
+	agentFileMounts []string
 }
 
 // createSessionCgroup establishes the scope before any container workload can
@@ -410,6 +412,7 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
 	)
 
+	args = append(args, s.agentFileMounts...)
 	// Extra args from config.
 	args = append(args, cfg.Args...)
 	// Session identity takes precedence over a configured Docker parent.
