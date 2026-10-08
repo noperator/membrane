@@ -153,7 +153,7 @@ def group_1(ctx):
 
 def group_2(ctx):
     config(ctx, """allow:
-  - dest: https://httpbin.org/anything/posts/
+  - dest: https://httpbin.org/anything/posts
 """)
     http(ctx, '2A bare URL entry GET /anything/posts/ allowed', '200',
          'https://httpbin.org/anything/posts/')
@@ -177,7 +177,7 @@ def group_3(ctx):
 
 def group_4(ctx):
     config(ctx, """allow:
-  - dest: https://httpbin.org/anything/posts/
+  - dest: https://httpbin.org/anything/posts
     http:
       - methods: [GET]
 """)
@@ -197,7 +197,7 @@ def group_5(ctx):
     http:
       - methods: [GET]
         paths:
-          - /anything/posts/
+          - /anything/posts
 """)
     http(ctx, '5A absolute path GET /anything/posts/ allowed', '200',
          'https://httpbin.org/anything/posts/')
@@ -209,11 +209,11 @@ def group_5(ctx):
 
 def group_6(ctx):
     config(ctx, """allow:
-  - dest: https://httpbin.org/anything/posts/
+  - dest: https://httpbin.org/anything/posts
     http:
       - methods: [GET]
         paths:
-          - on-the-money/
+          - on-the-money
 """)
     http(ctx, '6A relative path GET /anything/posts/on-the-money/ allowed', '200',
          'https://httpbin.org/anything/posts/on-the-money/')
@@ -227,10 +227,14 @@ def group_7(ctx):
     http:
       - methods: [GET]
         paths:
-          - /anything/posts/
+          - /anything/posts
       - methods: [GET]
         paths:
           - /anything/about
+      - methods: [GET, POST]
+        paths:
+          - /anything/edit
+          - /anything/update
 """)
     http(ctx, '7A multiple rules GET /anything/posts/ allowed (rule 1)', '200',
          'https://httpbin.org/anything/posts/')
@@ -240,11 +244,17 @@ def group_7(ctx):
          'https://httpbin.org/')
     http(ctx, '7D multiple rules POST /anything/posts/ blocked (wrong method)', '403',
          'https://httpbin.org/anything/posts/', method='POST')
+    for method in ('GET', 'POST'):
+        for path in ('/anything/edit', '/anything/update'):
+            http(ctx, f'7E multiple methods/paths {method} {path} allowed', '200',
+                 'https://httpbin.org' + path, method=method)
+    http(ctx, '7F multiple methods/paths PUT blocked (wrong method)', '403',
+         'https://httpbin.org/anything/edit', method='PUT')
 
 
 def group_8(ctx):
     config(ctx, """allow:
-  - dest: https://httpbin.org/anything/posts/
+  - dest: https://httpbin.org/anything/posts
   - dest: https://httpbin.org/anything/about
 """)
     http(ctx, '8A multiple entries GET /anything/posts/ allowed', '200',
@@ -263,9 +273,9 @@ def group_9(ctx):
 
 def group_10(ctx):
     http(ctx, '10A CLI bare URL GET /anything/posts/ allowed', '200',
-         'https://httpbin.org/anything/posts/', options=['--allow=https://httpbin.org/anything/posts/'])
+         'https://httpbin.org/anything/posts/', options=['--allow=https://httpbin.org/anything/posts'])
     http(ctx, '10B CLI bare URL GET / blocked', '403',
-         'https://httpbin.org/', options=['--allow=https://httpbin.org/anything/posts/'])
+         'https://httpbin.org/', options=['--allow=https://httpbin.org/anything/posts'])
     http(ctx, '10C CLI plain hostname GET / passthrough', '200',
          'https://httpbin.org/anything/root', options=['--allow=httpbin.org'])
 
@@ -283,19 +293,50 @@ def group_11(ctx):
 
 
 def group_12(ctx):
-    config(ctx, """allow:
-  - dest: https://httpbin.org
+    for trailing_slash in ('', '/'):
+        prefix = '/anything/v1' + trailing_slash
+        for name, rule, restricted in (
+            ('absolute', f"""  - dest: https://httpbin.org
     http:
       - methods: [GET]
-        paths:
-          - /anything/posts/
-""")
-    http(ctx, '12A path boundary GET /anything/posts/ allowed', '200',
-         'https://httpbin.org/anything/posts/')
-    http(ctx, '12B path boundary GET /anything/posts/on-the-money/ allowed (subpath)', '200',
-         'https://httpbin.org/anything/posts/on-the-money/')
-    http(ctx, '12C path boundary GET /anything/posts-evil blocked (no boundary)', '403',
-         'https://httpbin.org/anything/posts-evil')
+        paths: [{prefix}]
+""", True),
+            ('relative', f"""  - dest: https://httpbin.org/anything{trailing_slash}
+    http:
+      - methods: [GET]
+        paths: [v1{trailing_slash}]
+""", True),
+            ('URL-only', f"  - dest: https://httpbin.org{prefix}\n", False),
+            ('URL with methods', f"""  - dest: https://httpbin.org{prefix}
+    http:
+      - methods: [GET]
+""", True),
+            # An explicit empty list exercises the addon's no-HTTP-rules branch.
+            ('URL without HTTP constraints', f"""  - dest: https://httpbin.org{prefix}
+    http: []
+""", False),
+        ):
+            config(ctx, 'allow:\n' + rule)
+            for path, expected in (
+                ('/anything/v1', '200'),
+                ('/anything/v1/', '200'),
+                ('/anything/v1/models', '200'),
+                ('/anything/v10', '403'),
+                ('/anything/v1extra', '403'),
+                ('/anything/v1-evil', '403'),
+            ):
+                http(ctx, f'12 {name} prefix {prefix!r} GET {path}', expected,
+                     'https://httpbin.org' + path)
+            http(ctx, f'12 {name} prefix {prefix!r} POST method check',
+                 '403' if restricted else '200',
+                 'https://httpbin.org/anything/v1/', method='POST')
+
+    for constraints in ('http: [{methods: [GET], paths: [/]}]',
+                        'http: [{methods: [GET]}]', 'http: []'):
+        config(ctx, f'allow:\n  - dest: https://httpbin.org/\n    {constraints}\n')
+        for path in ('/', '/anything/root', '/anything/root/'):
+            http(ctx, f'12 root prefix with {constraints} GET {path}', '200',
+                 'https://httpbin.org' + path)
 
 
 def group_13(ctx):
@@ -304,7 +345,7 @@ def group_13(ctx):
     http:
       - methods: [GET]
         paths:
-          - /anything/posts/
+          - /anything/posts
 """)
     http(ctx, '13A host-type http rules GET /anything/posts/ allowed', '200',
          'https://httpbin.org/anything/posts/')
@@ -325,7 +366,7 @@ def group_15(ctx):
     http:
       - methods: [GET]
         paths:
-          - /anything/posts/
+          - /anything/posts
 """)
     http(ctx, '15A CIDR http rules GET /anything/posts/ allowed', '200',
          'https://httpbin.org/anything/posts/', curl_options=['--resolve', f'httpbin.org:443:{ip}'])
@@ -379,7 +420,7 @@ def group_18(ctx):
     http:
       - methods: [GET]
         paths:
-          - /anything/posts/
+          - /anything/posts
 """)
     http(ctx, '18A dot-segment traversal blocked', '403',
          'https://httpbin.org/anything/posts/../', curl_options=['--path-as-is'])
@@ -423,11 +464,11 @@ def group_19(ctx):
 
 def group_20(ctx):
     config(ctx, """allow:
-  - dest: https://httpbin.org/anything/posts/
+  - dest: https://httpbin.org/anything/posts
     http:
       - methods: [GET]
         paths:
-          - on-the-money/
+          - on-the-money
 """)
     http(ctx, '20A URL+http GET /anything/posts/on-the-money/ allowed', '200',
          'https://httpbin.org/anything/posts/on-the-money/')
@@ -460,7 +501,7 @@ def group_22(ctx):
     http:
       - methods: [GET]
         paths:
-          - /allowed/
+          - /allowed
 """)
     http(ctx, '22A http rules enforced on non-standard port 8443', '403',
          'https://portquiz.takao-tech.com:8443/')

@@ -224,6 +224,12 @@ def _effective_path(url_path, rule_path):
     return url_path.rstrip("/") + "/" + rule_path
 
 
+def _matches_prefix(path, prefix):
+    """Match the base path or a descendant, ignoring prefix trailing slashes."""
+    prefix = prefix.rstrip("/")
+    return path == prefix or path.startswith(prefix + "/")
+
+
 def _matches_rule(url_path, rule, method, path):
     """Return True if the request matches this http rule."""
     # Method check
@@ -236,15 +242,12 @@ def _matches_rule(url_path, rule, method, path):
     if paths:
         for p in paths:
             effective = _effective_path(url_path, p["path"])
-            if path == effective or path.startswith(effective.rstrip("/") + "/"):
+            if _matches_prefix(path, effective):
                 return True
         return False
 
     # No path constraint — check url_path as prefix
-    if path != url_path and not path.startswith(url_path.rstrip("/") + "/"):
-        return False
-
-    return True
+    return _matches_prefix(path, url_path)
 
 
 def normalize_path(path):
@@ -283,7 +286,7 @@ def request(flow: mhttp.HTTPFlow) -> None:
         for url_path, http_rules in rule_list:
             if not http_rules:
                 # No http constraints — permit anything under url_path
-                if path == url_path or path.startswith(url_path.rstrip("/") + "/"):
+                if _matches_prefix(path, url_path):
                     return
             else:
                 for rule in http_rules:

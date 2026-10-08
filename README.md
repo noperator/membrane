@@ -273,17 +273,17 @@ allow:
   - dest: github.com
     http:
       - methods: [GET, POST]
-        paths: [/api/]
+        paths: [/api]
   - dest: github.com   # second entry adds port 22
     ports: [22/tcp]
 
   # 5. URL entry: shorthand for hostname + port from scheme + path
-  # prefix. All methods allowed under /v1/.
-  - https://api.openai.com/v1/
+  # prefix. All methods allowed at /v1 and its descendants.
+  - https://api.openai.com/v1
 
   # 6. URL entry with http rules: the most specific form. Port from
   # scheme enforced at L3, method and path enforced at L7.
-  - dest: https://api.example.com/v1/
+  - dest: https://api.example.com/v1
     http:
       - methods: [POST]
         paths:
@@ -297,7 +297,7 @@ allow:
   - dest: 192.168.3.0/24
     http:
       - methods: [GET]
-        paths: [/api/]
+        paths: [/api]
 
   # 8. UDP opt-in: bare port numbers default to TCP. Append /udp to
   # explicitly allow UDP on a specific port.

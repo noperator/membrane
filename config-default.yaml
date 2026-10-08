@@ -10,16 +10,20 @@ dns_resolver:
 # CA certs. Disabled by default.
 ssl_insecure: false
 
-# `sealed` lists patterns matched against filenames or relative paths.
-# Existing matching objects are sealed when the session starts.
+# For both `sealed` and `readonly` below: These filesystem policies are based
+# on a startup *snapshot*. Selectors (e.g., a path like `.env`) are evaluated
+# before workload code runs against objects that already exist. An enrolled
+# object remains protected if it is renamed; a newly created or replacement
+# inode is not automatically enrolled just because its pathname matches a
+# selector.
+
+# `sealed` paths remain visible (e.g., `stat` still works), but file contents
+# cannot be read or modified.
 sealed:
   - "*.bak"
   - "*.tmp"
 
-# `readonly` enrolls existing matching objects READONLY at startup. Use
-# this for things like .git (so the agent can read history but not
-# rewrite it) or credential files that should be visible but not
-# writable.
+# `readonly` paths may have their contents read, but cannot be modified.
 readonly:
   - .git
   - .env
@@ -29,96 +33,233 @@ readonly:
 # auto-detected from its value: hostname, IP, CIDR, or URL. Object
 # form supports additional constraints via ports: and http: keys.
 allow:
+
+  # --[ Inference providers
+
   # Anthropic
-  - statsig.anthropic.com
   - api.anthropic.com
   - platform.claude.com
-  - statsig.com
-  - sentry.io
-
-  # Node.js/npm
-  - registry.npmjs.org
-  - deb.nodesource.com
-
-  # Python packages
-  - files.pythonhosted.org
-  - pypi.org
-
-  # Go packages
-  - golang.org
-  - google.golang.org
-  - sum.golang.org
-  - proxy.golang.org
-  - dl.google.com
-  - storage.googleapis.com
-  - gopkg.in
-  - goproxy.io
-  - go.dev
-  - pkg.go.dev
-
-  # Rust packages
-  - crates.io
-  - static.crates.io
-  - index.crates.io
-
-  # Ubuntu/Debian packages
-  - deb.debian.org
-  - archive.ubuntu.com
-  - ports.ubuntu.com
-  - security.ubuntu.com
-
-  # Ubuntu PPAs (deadsnakes, golang-backports, etc.)
-  - launchpad.net
-  - api.launchpad.net
-  - ppa.launchpadcontent.net
-
-  # GitHub
-  - api.github.com
-  - api.github.com
-  - codeload.github.com
-  - github.com
-  - objects.githubusercontent.com
-  - raw.githubusercontent.com
-  - release-assets.githubusercontent.com
-
-  # GitLab
-  - gitlab.com
-
-  # Bitbucket
-  - bitbucket.org
+  - statsig.anthropic.com
 
   # OpenAI
   - ab.chatgpt.com
   - api.openai.com
+  - auth.openai.com
   - chatgpt.com
 
-  # OpenRouter
-  - openrouter.ai
+  # OpenRouter model discovery and the usual inference protocols.
+  - dest: https://openrouter.ai
+    http:
+      - methods: [GET]
+        paths: [/api/v1]
+      - methods: [POST]
+        paths: [/api/v1/chat/completions, /api/v1/responses, /api/v1/messages]
 
-  # Docker Hub
-  - docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
-  - hub.docker.com
-  - production.cloudflare.docker.com
-  - registry-1.docker.io
-  - auth.docker.io
+  # Bedrock inference/counting uses POST under /model/.
+  - dest: https://bedrock-runtime.us-east-1.amazonaws.com/model
+    http:
+      - methods: [POST]
+  - dest: https://bedrock-runtime.us-west-1.amazonaws.com/model
+    http:
+      - methods: [POST]
+  - dest: https://bedrock-runtime.us-east-2.amazonaws.com/model
+    http:
+      - methods: [POST]
+  - dest: https://bedrock-runtime.us-west-2.amazonaws.com/model
+    http:
+      - methods: [POST]
+  # Bedrock control-plane discovery only; no model/job/configuration writes.
+  - dest: https://bedrock.us-east-1.amazonaws.com
+    http:
+      - methods: [GET]
+        paths: [/foundation-models, /inference-profiles, /custom-models, /provisioned-model-throughputs]
+  - dest: https://bedrock.us-west-1.amazonaws.com
+    http:
+      - methods: [GET]
+        paths: [/foundation-models, /inference-profiles, /custom-models, /provisioned-model-throughputs]
+  - dest: https://bedrock.us-east-2.amazonaws.com
+    http:
+      - methods: [GET]
+        paths: [/foundation-models, /inference-profiles, /custom-models, /provisioned-model-throughputs]
+  - dest: https://bedrock.us-west-2.amazonaws.com
+    http:
+      - methods: [GET]
+        paths: [/foundation-models, /inference-profiles, /custom-models, /provisioned-model-throughputs]
 
-  # Cloudflare
-  - cloudflare-dns.com
+  # --[ Package providers
 
-  # AWS STS
-  - sts.amazonaws.com
+  # npm metadata/tarballs use /<package>, not a shared /packages prefix.
+  # Generic installs therefore retain host-wide GET as an explicit exception.
+  # HEAD is not granted by default. Audit POST is limited to its API routes.
+  # To tighten further, enumerate project packages, including transitive deps.
+  - dest: https://registry.npmjs.org
+    http:
+      - methods: [GET]
+      - methods: [POST]
+        paths:
+          - /-/npm/v1/security/advisories/bulk
+          - /-/npm/v1/security/audits/quick
+  - dest: https://deb.nodesource.com
+    http:
+      - methods: [GET]
+        paths: [/setup_22.x, /node_22.x, /gpgkey]
 
-  # AWS Bedrock - North America
-  - bedrock-runtime.us-east-1.amazonaws.com
-  - bedrock.us-east-1.amazonaws.com
-  - bedrock-runtime.us-west-1.amazonaws.com
-  - bedrock.us-west-1.amazonaws.com
-  - bedrock-runtime.us-east-2.amazonaws.com
-  - bedrock.us-east-2.amazonaws.com
-  - bedrock-runtime.us-west-2.amazonaws.com
-  - bedrock.us-west-2.amazonaws.com
+  # Python index/JSON metadata and package files.
+  - dest: https://pypi.org
+    http:
+      - methods: [GET, HEAD]
+        paths: [/simple, /pypi]
+  - dest: https://files.pythonhosted.org/packages
+    http:
+      - methods: [GET, HEAD]
 
-# `args` lists raw arguments appended to the `docker run` command.
+  # Go modules and documentation.
+  - dest: https://golang.org
+    http:
+      - methods: [GET]
+        paths: [/x, /dl, /doc, /ref]
+  - dest: https://sum.golang.org
+    http:
+      - methods: [GET]
+        paths: [/lookup, /tile, /latest]
+  # Module names start at the URL root: retain GET as an explicit exception
+  # for arbitrary module downloads. Project policies may enumerate modules.
+  - dest: https://proxy.golang.org
+    http:
+      - methods: [GET]
+  - dest: https://dl.google.com/go
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://go.dev
+    http:
+      - methods: [GET]
+        paths: [/dl, /doc, /ref, /pkg, /src, /blog, /learn]
+  - dest: https://pkg.go.dev
+    http:
+      - methods: [GET]
+        paths: [/github.com, /golang.org, /google.golang.org, /gopkg.in, /std, /builtin, /api]
+  - dest: https://gopkg.in
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://google.golang.org
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://goproxy.io
+    http:
+      - methods: [GET, HEAD]
+
+  # Rust registry metadata and crate downloads; cargo publish is blocked.
+  - dest: https://crates.io/api/v1
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://static.crates.io/crates
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://index.crates.io
+    http:
+      # Cargo's sparse index has /config.json and name-derived top-level paths.
+      # Generic Cargo installs retain GET as an explicit exception; no HEAD.
+      - methods: [GET]
+
+  # APT sources commonly use HTTP; retain both mirror ports.
+  - dest: deb.debian.org
+    ports: [80, 443]
+    http:
+      - methods: [GET, HEAD]
+        paths: [/debian, /debian-security]
+  - dest: archive.ubuntu.com
+    ports: [80, 443]
+    http:
+      - methods: [GET, HEAD]
+        paths: [/ubuntu]
+  - dest: ports.ubuntu.com
+    ports: [80, 443]
+    http:
+      - methods: [GET, HEAD]
+        paths: [/ubuntu-ports]
+  - dest: security.ubuntu.com
+    ports: [80, 443]
+    http:
+      - methods: [GET, HEAD]
+        paths: [/ubuntu]
+
+  # Selected PPAs; add more owner/archive prefixes when needed.
+  - dest: https://launchpad.net
+    http:
+      - methods: [GET]
+        paths: [/~deadsnakes/+archive/ubuntu/ppa, /~longsleep/+archive/ubuntu/golang-backports]
+  - dest: https://api.launchpad.net
+    http:
+      - methods: [GET]
+        paths: [/1.0, /devel, /beta]
+  - dest: https://ppa.launchpadcontent.net
+    http:
+      - methods: [GET, HEAD]
+        paths: [/deadsnakes/ppa/ubuntu, /longsleep/golang-backports/ubuntu]
+
+  # --[ Code hosting
+
+  # GitHub API, source, and artifact reads.
+  # HTTPS Git clone/fetch may need POST opt-in.
+  - dest: https://api.github.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://github.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://codeload.github.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://raw.githubusercontent.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://release-assets.githubusercontent.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://objects.githubusercontent.com
+    http:
+      - methods: [GET, HEAD]
+
+  # GitLab and Bitbucket.
+  - dest: https://gitlab.com
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://bitbucket.org
+    http:
+      - methods: [GET, HEAD]
+
+  # --[ Docker
+
+  # Docker pulls only. Blob CDN paths remain broad for signed redirects.
+  - dest: https://registry-1.docker.io/v2
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://auth.docker.io
+    http:
+      # Query-bearing /token?service=... cannot currently match /token.
+      # GET-only host access is an explicit exception until the matcher handles
+      # the path separately from the query. Do not add arbitrary HEAD here.
+      - methods: [GET]
+  - dest: https://hub.docker.com
+    http:
+      - methods: [GET]
+        paths: [/v2, /api]
+  - dest: https://production.cloudflare.docker.com
+    http:
+      - methods: [GET, HEAD]
+        paths: [/registry-v2]
+  # Observed current Docker Hub blob redirect for library/busybox.
+  - dest: https://production.cloudfront.docker.com
+    http:
+      - methods: [GET, HEAD]
+        paths: [/registry-v2]
+  - dest: https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com
+    http:
+      - methods: [GET, HEAD]
+        paths: [/registry-v2]
+
+# `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
-# its argument must be separate items.
+# its argument must be separate items. Treat this as trusted host-level
+# configuration, especially in a workspace .membrane.yaml.
 args:
