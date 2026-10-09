@@ -51,7 +51,11 @@ func TestResolveMounts(t *testing.T) {
 		if err := os.Mkdir(path, 0000); err != nil {
 			t.Fatal(err)
 		}
-		defer os.Chmod(path, 0700)
+		t.Cleanup(func() {
+			if err := os.Chmod(path, 0700); err != nil {
+				t.Errorf("restore mount fixture permissions: %v", err)
+			}
+		})
 		if _, err := resolveMounts(root, []directoryMount{{Path: path, Mode: "rw"}}); err == nil {
 			t.Fatal("unreadable mount accepted")
 		}
