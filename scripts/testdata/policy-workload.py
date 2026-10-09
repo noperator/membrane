@@ -188,34 +188,35 @@ def snapshot():
         old.close(); ordinary.close()
 
 
-mode = sys.argv[1]
-if mode == "prepare":
-    prepare()
-elif mode in ("sealed", "readonly"):
-    semantics(mode == "sealed")
-elif mode == "snapshot":
-    snapshot()
-elif mode == "precedence":
-    access("config/settings.yaml", False)
-    access("config/secrets.txt", True)
-    access("sealed/readonly/child", True)
-elif mode == "hold":
-    denied("policy active at first workload operation", lambda: Path("protected").read_bytes())
-    gate()
-    denied("held policy remains active", lambda: Path("protected").read_bytes())
-elif mode == "ordinary":
-    check(bool(Path("protected").read_bytes()), "second session can read same inode")
-    Path("protected").write_text("other session write\n")
-    gate()
-elif mode == "late-only":
-    gate()
-    check(Path(".env").read_text() == "late\n", "empty snapshot: late matching inode is normal")
-    Path(".env").write_text("agent write\n")
-    Path("agent").mkdir()
-    Path("agent/.env").write_text("agent-created matching inode\n")
-    check(bool(Path("agent/.env").read_bytes()), "agent-created matching inode remains normal")
-    # The host runner cannot unlink children of this root-owned directory.
-    Path("agent/.env").unlink()
-    Path("agent").rmdir()
-else:
-    raise RuntimeError("unknown workload mode: " + mode)
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    if mode == "prepare":
+        prepare()
+    elif mode in ("sealed", "readonly"):
+        semantics(mode == "sealed")
+    elif mode == "snapshot":
+        snapshot()
+    elif mode == "precedence":
+        access("config/settings.yaml", False)
+        access("config/secrets.txt", True)
+        access("sealed/readonly/child", True)
+    elif mode == "hold":
+        denied("policy active at first workload operation", lambda: Path("protected").read_bytes())
+        gate()
+        denied("held policy remains active", lambda: Path("protected").read_bytes())
+    elif mode == "ordinary":
+        check(bool(Path("protected").read_bytes()), "second session can read same inode")
+        Path("protected").write_text("other session write\n")
+        gate()
+    elif mode == "late-only":
+        gate()
+        check(Path(".env").read_text() == "late\n", "empty snapshot: late matching inode is normal")
+        Path(".env").write_text("agent write\n")
+        Path("agent").mkdir()
+        Path("agent/.env").write_text("agent-created matching inode\n")
+        check(bool(Path("agent/.env").read_bytes()), "agent-created matching inode remains normal")
+        # The host runner cannot unlink children of this root-owned directory.
+        Path("agent/.env").unlink()
+        Path("agent").rmdir()
+    else:
+        raise RuntimeError("unknown workload mode: " + mode)

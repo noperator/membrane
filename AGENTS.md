@@ -9,11 +9,10 @@ For unexpected file-access or network failures, inspect:
 - `.membrane.yaml` in the session's starting workspace, if present: workspace configuration.
 
 A few notes:
-- Global and workspace configuration lists are combined. `--no-global-config` skips the global configuration.
-- CLI overrides may add or change settings that are not shown in these files.
+- Global and workspace configuration lists are combined. CLI overrides may add or change settings that are not shown in these files.
 - Network egress requires a matching allow-list entry. Matching deny rules take precedence.
 - Readonly objects can be read but not modified. Sealed objects remain visible, but their contents cannot be read or modified.
-- Filesystem selectors protect existing objects enrolled at startup; newly created or replacement objects are not automatically enrolled.
+- Filesystem selectors and readonly mount modes protect existing objects enrolled at startup, including readonly root directories. Newly created or replacement objects are not automatically enrolled; enrolled directories still prevent child creation/removal by the agent.
 - Configuration is loaded at startup. Editing a config file does not reload the running session.
 - Not every access failure is a policy denial.
 

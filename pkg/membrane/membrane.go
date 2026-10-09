@@ -92,12 +92,21 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		cfg.DNSResolver = cli.DNSResolver
 	}
 
-	policy, err := resolveFilesystemPolicy(workspaceDir, cfg)
+	mounts, err := resolveMounts(workspaceDir, cfg.Mounts)
+	if err != nil {
+		return err
+	}
+	policy, err := resolveFilesystemPolicy(workspaceDir, cfg, mounts)
 	if err != nil {
 		return err
 	}
 
 	s := newSessionNames()
+	s.directoryMounts = mounts
+	s.policyRoots = make(map[int]string)
+	for _, entry := range policy {
+		s.policyRoots[entry.Root] = mounts[entry.Root].Path
+	}
 
 	if sessionIDFile != "" {
 		if err := os.WriteFile(sessionIDFile, []byte(s.id), 0o644); err != nil {
@@ -197,7 +206,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		setupSpinner = newSpinner()
 		setupSpinner.Start("Setting up sandbox...")
 	}
-	cleanup, gatewayIP, err := startSession(ctx, &s, cfg, trace, traceLogFile, workspaceDir, policyFile)
+	cleanup, gatewayIP, err := startSession(ctx, &s, cfg, trace, traceLogFile, policyFile)
 	if setupSpinner != nil {
 		setupSpinner.Stop()
 	}

@@ -1,5 +1,13 @@
 # Workspace .membrane.yaml entries are appended to the global list, not
-# replaced. This applies to sealed, readonly, allow, deny, and args.
+# replaced. This applies to mounts, sealed, readonly, allow, deny, and args.
+
+# `mounts` selects additional existing directories at canonical host paths.
+# Entries require path; mode is ro or rw (default rw). Relative paths in either
+# global/workspace config resolve against the canonical primary workspace. The
+# primary workspace remains the working directory, with an implicit rw
+# baseline. The most specific containing mount sets the baseline, independent
+# of order.
+mounts: []
 
 # `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
 # Defaults to 1.1.1.1 if not set.
@@ -9,13 +17,6 @@ dns_resolver:
 # mitmproxy. Useful for internal services with self-signed or private
 # CA certs. Disabled by default.
 ssl_insecure: false
-
-# For both `sealed` and `readonly` below: These filesystem policies are based
-# on a startup *snapshot*. Selectors (e.g., a path like `.env`) are evaluated
-# before workload code runs against objects that already exist. An enrolled
-# object remains protected if it is renamed; a newly created or replacement
-# inode is not automatically enrolled just because its pathname matches a
-# selector.
 
 # `sealed` paths remain visible (e.g., `stat` still works), but file contents
 # cannot be read or modified.

@@ -14,13 +14,19 @@ import (
 )
 
 type config struct {
-	DNSResolver string        `yaml:"dns_resolver"`
-	SSLInsecure bool          `yaml:"ssl_insecure"`
-	Sealed      []string      `yaml:"sealed"`
-	Readonly    []string      `yaml:"readonly"`
-	Args        []string      `yaml:"args"`
-	Allow       []NetworkRule `yaml:"allow"`
-	Deny        []NetworkRule `yaml:"deny"`
+	DNSResolver string           `yaml:"dns_resolver"`
+	SSLInsecure bool             `yaml:"ssl_insecure"`
+	Sealed      []string         `yaml:"sealed"`
+	Readonly    []string         `yaml:"readonly"`
+	Mounts      []directoryMount `yaml:"mounts"`
+	Args        []string         `yaml:"args"`
+	Allow       []NetworkRule    `yaml:"allow"`
+	Deny        []NetworkRule    `yaml:"deny"`
+}
+
+type directoryMount struct {
+	Path string `yaml:"path"`
+	Mode string `yaml:"mode"`
 }
 
 func (c *config) dnsResolver() string {
@@ -280,6 +286,7 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	if !workspaceMissing {
 		base.Sealed = append(base.Sealed, workspace.Sealed...)
 		base.Readonly = append(base.Readonly, workspace.Readonly...)
+		base.Mounts = append(base.Mounts, workspace.Mounts...)
 		base.Args = append(base.Args, workspace.Args...)
 		base.Allow = append(base.Allow, workspace.Allow...)
 		base.Deny = append(base.Deny, workspace.Deny...)
@@ -302,11 +309,26 @@ func loadConfigFile(path string) (*config, error) {
 	}
 	// Pointer entries retain YAML nulls that []NetworkRule would silently skip.
 	// Validate denies separately so existing allow parsing stays unchanged.
+	// Mount nodes distinguish omitted modes from explicit empty/null values.
 	var entries struct {
-		Deny []*NetworkRule `yaml:"deny"`
+		Deny   []*NetworkRule         `yaml:"deny"`
+		Mounts []map[string]yaml.Node `yaml:"mounts"`
 	}
 	if err := yaml.Unmarshal(data, &entries); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	for i, entry := range entries.Mounts {
+		node := entry["path"]
+		if node.ShortTag() != "!!str" || cfg.Mounts[i].Path == "" {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: path must be a nonempty string", path, i)
+		}
+		mount := &cfg.Mounts[i]
+		mode, present := entry["mode"]
+		if !present {
+			mount.Mode = "rw"
+		} else if mode.ShortTag() != "!!str" || (mount.Mode != "ro" && mount.Mode != "rw") {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: invalid mode %q: must be ro or rw", path, i, mount.Mode)
+		}
 	}
 	for i, rule := range entries.Deny {
 		if rule == nil || rule.Type == "" || (rule.Type != "any" && rule.CIDR == "" && rule.Host == "") {

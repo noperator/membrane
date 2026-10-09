@@ -46,11 +46,11 @@ go install github.com/noperator/membrane/cmd/membrane@latest
 
 <details><summary>Initial setup</summary>
 
-On first run, membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, initializes missing configuration and instruction files in `~/.membrane/`, and builds the `membrane-agent` and `membrane-handler` Docker images. Subsequent runs check for updates automatically while preserving user-managed files. Initial install takes about 2 minutes.
+On first run, Membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, initializes missing configuration and instruction files in `~/.membrane/`, and builds the `membrane-agent` and `membrane-handler` Docker images. Subsequent runs check for updates automatically while preserving user-managed files. Initial install takes about 2 minutes.
 
-On **macOS**, membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps membrane's containers and images isolated from your existing Docker setup.
+On **macOS**, Membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, Membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps Membrane's containers and images isolated from your existing Docker setup.
 
-On **Linux**, membrane uses the system Docker daemon directly. If setup is incomplete, membrane offers to run [`scripts/install-linux.sh`](scripts/install-linux.sh), which activates BPF LSM when supported and installs, registers, enables, and verifies Sysbox. Enabling BPF LSM can require a GRUB update and reboot; membrane asks before changing native Linux boot configuration.
+On **Linux**, Membrane uses the system Docker daemon directly. If setup is incomplete, Membrane offers to run [`scripts/install-linux.sh`](scripts/install-linux.sh), which activates BPF LSM when supported and installs, registers, enables, and verifies Sysbox. Enabling BPF LSM can require a GRUB update and reboot; Membrane asks before changing native Linux boot configuration.
 
 </details>
 
@@ -77,7 +77,7 @@ Config:
   -r, --readonly stringArray   readonly pattern (repeatable)
 ```
 
-Optionally pass a specific command to be executed, using `--` to separate membrane options from the command to run inside the container.
+Optionally pass a specific command to be executed, using `--` to separate Membrane options from the command to run inside the container.
 
 ```bash
 # Drop into a shell
@@ -89,11 +89,9 @@ membrane -- claude -p "just say hello"
 membrane -- bash -c "echo hello"
 ```
 
-The shell or command starts at the workspace's canonical absolute host path. For example, launching from `/Users/noperator/git/project` starts there inside the container too. Only the selected workspace directory is mounted; its host parents and siblings are not exposed. Symlinked launch paths resolve to their canonical target. The agent's home remains `/home/agent`, and `.membrane.yaml` and filesystem selectors remain workspace-relative. External Git worktree metadata is not made accessible by preserving absolute paths.
-
 #### Non-interactive mode
 
-When stdin is not a terminal, membrane automatically skips PTY allocation and wires stdin/stdout/stderr directly. This lets you pipe input, capture output, and use membrane in scripts or tools like GNU parallel.
+When stdin is not a terminal, Membrane automatically skips PTY allocation and wires stdin/stdout/stderr directly. This lets you pipe input, capture output, and use Membrane in scripts or tools like GNU parallel.
 
 ```bash
 # Pipe input
@@ -122,7 +120,7 @@ docker build -t membrane-agent ~/.membrane/src/docker/agent/
 docker build -t membrane-handler ~/.membrane/src/docker/handler/
 ```
 
-If you've made local edits and an update is available, membrane will back up `~/.membrane/src/` to a timestamped directory before pulling.
+If you've made local edits and an update is available, Membrane will back up `~/.membrane/src/` to a timestamped directory before pulling.
 
 #### Reset
 
@@ -135,11 +133,11 @@ membrane --reset=ci    # containers and images only
 
 ### Trace execution
 
-By default, membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers.
+By default, Membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers.
 
 Membrane creates the workload cgroup and installs and scopes the eBPF probes before starting any workload code. If required probes or filesystem policy cannot be loaded or attached, setup fails before the workload starts.
 
-In this example, I just tell Codex to go download the homepage of my blog.
+In this example, I instruct Codex to go download the homepage of my blog.
 
 ```bash
 membrane --trace-log=blog.jsonl.gz -- \
@@ -227,26 +225,35 @@ exec  ls: ls -lh blog.html
 
 Configuration is YAML and works at two levels:
 
-- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your baseline allow and deny lists, sealed patterns, and readonly patterns.
+- **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your additional mounts, baseline allow and deny lists, sealed patterns, and readonly patterns. `--no-global-config` skips this entire global configuration and otherwise relies on a local workspace configuration.
 - **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
 
 ```yaml
-# For both `sealed` and `readonly` below: These filesystem policies are based
-# on a startup *snapshot*. Selectors (e.g., a path like `.env`) are evaluated
-# before workload code runs against objects that already exist. An enrolled
-# object remains protected if it is renamed; a newly created or replacement
-# inode is not automatically enrolled just because its pathname matches a
-# selector.
+# `mounts` selects additional existing directories at canonical host paths.
+# Entries require path; mode is ro or rw (default rw). Relative paths in either
+# global/workspace config resolve against the canonical primary workspace. The
+# primary workspace remains the working directory, with an implicit rw
+# baseline. The most specific containing mount sets the baseline, independent
+# of order.
+mounts:
+  - path: ../main-repo
+    mode: ro
+  - path: ../shared-library
+    mode: rw
 
 # `sealed` paths remain visible (e.g., `stat` still works), but file contents
 # cannot be read or modified.
 sealed:
-  - secrets/
+  - .env
+  - secrets/credentials.json
+  - ./private/
   - "*.pem"
 
 # `readonly` paths may have their contents read, but cannot be modified.
 readonly:
-  - config/
+  - .git/
+  - ../shared-library/config/
+  - /absolute/project/settings.yaml
 
 # `allow` lists what the agent is allowed to reach. Each entry is
 # auto-detected from its value: hostname, IP, CIDR, or URL. Object
@@ -320,6 +327,13 @@ allow:
     http:
       - methods: [GET]
 
+# Matching deny rules veto any allow rule.
+deny:
+  - dest: https://github.com
+    http:
+      - methods: [DELETE]
+        paths: [/api]
+
 # `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
 # its argument must be separate items. Treat this as trusted host-level
@@ -331,14 +345,6 @@ args:
   - $HOME/.aws:/home/agent/.aws:ro
   - -e
   - AWS_PROFILE=myprofile
-
-# Block DELETE at /api and its descendants, overriding the github.com allow.
-# Query strings do not affect path matching.
-deny:
-  - dest: https://github.com
-    http:
-      - methods: [DELETE]
-        paths: [/api]
 ```
 
 See [`config.yaml`](config.yaml) for the full default allow list.

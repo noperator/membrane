@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -70,6 +73,22 @@ type sessionNames struct {
 	caVolume         string
 
 	agentFileMounts []string
+	directoryMounts []directoryMount
+	policyRoots     map[int]string
+}
+
+// --mount refuses missing bind sources, unlike -v which can create them. CSV
+// encoding preserves source and destination paths as individual fields.
+func directoryBind(source, destination string, readonly bool) string {
+	fields := []string{"type=bind", "src=" + source, "dst=" + destination}
+	if readonly {
+		fields = append(fields, "readonly")
+	}
+	var b strings.Builder
+	w := csv.NewWriter(&b)
+	_ = w.Write(fields)
+	w.Flush()
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // createSessionCgroup establishes the scope before any container workload can
@@ -185,7 +204,7 @@ func removeDockerUserRule(bridge string) {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, workspace, policyFile string) (func() error, string, error) {
+func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, policyFile string) (func() error, string, error) {
 	cleanupCgroup, cgroupErr := createSessionCgroup(ctx, s)
 	cleanup := func() error {
 		// Remove all workload processes before detaching BPF, including DinD.
@@ -287,11 +306,18 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 			"-v", traceDir+":/trace")
 	}
 	if policyFile != "" {
+		roots := make([]int, 0, len(s.policyRoots))
+		for root := range s.policyRoots {
+			roots = append(roots, root)
+		}
+		sort.Ints(roots)
+		for _, root := range roots {
+			handlerArgs = append(handlerArgs, "--mount", directoryBind(s.policyRoots[root], "/policy-roots/"+strconv.Itoa(root), true))
+		}
 		handlerArgs = append(handlerArgs,
-			"-v", workspace+":/policy-workspace:ro",
 			"-v", policyFile+":/etc/membrane/policy.json:ro",
 			"-e", "MEMBRANE_POLICY_FILE=/etc/membrane/policy.json",
-			"-e", "MEMBRANE_POLICY_WORKSPACE=/policy-workspace")
+			"-e", "MEMBRANE_POLICY_ROOTS=/policy-roots")
 	}
 
 	handlerArgs = append(handlerArgs, handlerImageName)
@@ -390,9 +416,13 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"--cap-add=CAP_SETPCAP",
 		"--network", s.internalNetwork,
 		"-e", "MEMBRANE_GATEWAY="+gatewayIP,
-		"-v", workspaceDir+":"+workspaceDir,
 		"--workdir", workspaceDir,
 	)
+	for _, mount := range s.directoryMounts {
+		// Both modes use writable binds. Readonly is enforced by the inode
+		// snapshot, including aliases and after workload mount manipulation.
+		args = append(args, "--mount", directoryBind(mount.Path, mount.Path, false))
+	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {

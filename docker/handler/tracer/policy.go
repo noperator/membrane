@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -18,6 +19,7 @@ import (
 // The manifest contains paths and policy, never file contents. Modes match
 // inode_policy in policy.c. Selectors are evaluated only before startup.
 type policyEntry struct {
+	Root     int    `json:"root"`
 	Path     string `json:"path"`
 	Mode     uint32 `json:"mode"`
 	NoFollow bool   `json:"no_follow,omitempty"`
@@ -26,7 +28,7 @@ type policyEntry struct {
 // loadFilesystemPolicy enrolls the startup snapshot before attaching any hooks.
 // The loader owns the collection, links, and O_PATH inode references. Orderly
 // session shutdown stops the entire workload before calling closePolicy.
-func loadFilesystemPolicy(ctx context.Context, cgroupPath, workspace string, entries []policyEntry) (closePolicy func(), retErr error) {
+func loadFilesystemPolicy(ctx context.Context, cgroupPath, rootsPath string, entries []policyEntry) (closePolicy func(), retErr error) {
 	// Retain every enrolled inode until teardown. Raise only the soft limit,
 	// within the existing hard limit; this requires no additional capability.
 	var limit unix.Rlimit
@@ -80,24 +82,42 @@ func loadFilesystemPolicy(ctx context.Context, cgroupPath, workspace string, ent
 	if err := objects.Maps["policy_cgroup"].Put(uint32(0), uint32(cgroup.Fd())); err != nil {
 		return closePolicy, fmt.Errorf("scope filesystem policy: %w", err)
 	}
-	root, err := unix.Open(workspace, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return closePolicy, fmt.Errorf("open policy workspace: %w", err)
-	}
-	defer unix.Close(root)
+	// The manifest is grouped by root; keep only the current root descriptor
+	// in addition to the inode references retained for the session.
+	root, rootID := -1, -1
+	defer func() {
+		if root >= 0 {
+			unix.Close(root)
+		}
+	}()
 	inodes := objects.Maps["policy_inodes"]
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return closePolicy, err
 		}
-		if !filepath.IsLocal(entry.Path) || entry.Path == "." || entry.Mode < 1 || entry.Mode > 2 {
+		if entry.Root < 0 || !filepath.IsLocal(entry.Path) || entry.Mode < 1 || entry.Mode > 2 {
 			return closePolicy, fmt.Errorf("invalid filesystem policy entry: %+v", entry)
+		}
+		if rootID != entry.Root {
+			if root >= 0 {
+				unix.Close(root)
+			}
+			root, err = unix.Open(filepath.Join(rootsPath, strconv.Itoa(entry.Root)), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+			if err != nil {
+				return closePolicy, fmt.Errorf("open policy root %d: %w", entry.Root, err)
+			}
+			rootID = entry.Root
 		}
 		flags := unix.O_PATH | unix.O_CLOEXEC
 		if entry.NoFollow {
 			flags |= unix.O_NOFOLLOW
 		}
-		fd, err := unix.Openat(root, entry.Path, flags, 0)
+		// Resolve beneath the declared root even if a host path changes between
+		// snapshot and enrollment. Protected links themselves use O_NOFOLLOW;
+		// resolved targets have their own entries. Any escape fails startup.
+		fd, err := unix.Openat2(root, entry.Path, &unix.OpenHow{
+			Flags: uint64(flags), Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS,
+		})
 		if err != nil {
 			return closePolicy, fmt.Errorf("enroll filesystem policy path %q: %w", entry.Path, err)
 		}

@@ -703,8 +703,10 @@ def check_handler(ctx, session, traced=True, policy=False):
     check(ctx, "/policy-pins" not in mounts and "/sys/fs/bpf" not in mounts,
           "no bpffs or policy pin mount")
     if policy:
+        roots = [m for path, m in mounts.items() if path.startswith("/policy-roots/")]
         check(ctx, "/sys/kernel/security" not in mounts
-              and all(p in mounts and not mounts[p]["RW"] for p in ("/policy-workspace", "/etc/membrane/policy.json")),
+              and roots and all(not m["RW"] for m in roots)
+              and "/etc/membrane/policy.json" in mounts and not mounts["/etc/membrane/policy.json"]["RW"],
               "trusted enrollment mounts")
     return data
 
@@ -998,8 +1000,12 @@ def group_30(ctx):
         copy_policy_workload(directory)
     a_dir, b_dir = ctx.workdir / "a", ctx.workdir / "b"
     (a_dir / "protected").write_text("sealed\n")
-    (a_dir / "readonly").write_text("readonly\n")
-    (a_dir / ".membrane.yaml").write_text("sealed: [protected]\nreadonly: [readonly]\n")
+    readonly_dir = ctx.workdir / "additional readonly"
+    readonly_dir.mkdir()
+    (readonly_dir / "readonly").write_text("readonly\n")
+    os.link(readonly_dir / "readonly", a_dir / "readonly")
+    os.link(a_dir / "protected", readonly_dir / "sealed-alias")
+    (a_dir / ".membrane.yaml").write_text("sealed: [protected]\nmounts: [{path: '../additional readonly', mode: ro}]\n")
     (b_dir / "other").write_text("B sealed\n")
     os.link(a_dir / "protected", b_dir / "protected")
     os.link(b_dir / "other", a_dir / "other")
@@ -1023,6 +1029,10 @@ def group_30(ctx):
         # Explicit original exploit, executing as sandbox root through sudo.
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mkdir", "-p", "/tmp/workspace-copy"])
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", str(a_dir.resolve()), "/tmp/workspace-copy"])
+        # Use the alias without spaces for remount (mount's target lookup can
+        # fail on escaped paths), with explicit source and target arguments.
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "-o", "remount,rw,bind",
+                  str(a_dir.resolve()), "/tmp/workspace-copy"])
         probe = """import errno, os
 for name, readable in [('protected', False), ('readonly', True)]:
  for flags, allowed in [(os.O_RDONLY, readable), (os.O_WRONLY, False)]:
@@ -1034,7 +1044,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
    if not allowed: raise RuntimeError('mount alias bypass: ' + name)
 """
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "python3", "-c", probe])
-        check(ctx, True, "F-005 sudo bind-mount alias preserves sealed/readonly policy")
+        check(ctx, True, "F-005 sudo bind-mount alias and rw remount preserve selectors and additional readonly mount policy")
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", str(a_dir.resolve() / "policy-dind")], timeout=90)
         check(ctx, True, "inner Docker descendant remains subject to policy")
         b.release(); b.wait(); trace_events(ctx, b_dir / "trace.jsonl.gz"); cleaned(ctx, b)
@@ -1499,6 +1509,248 @@ print('editable-instructions-ok')
         check(ctx, not list((state / "tmp").glob("membrane-instructions-*")), "session copy cleaned up")
 
 
+def group_37(ctx):
+    base = ctx.workdir.resolve()
+    workspace = base / 'primary workspace'
+    shared = base / 'shared library'
+    readonly = base / 'readonly directory'
+    empty = base / 'empty readonly'
+    global_dir = base / 'global library'
+    unselected = base / 'unselected'
+    for directory in (workspace, shared, readonly, empty, global_dir, unselected):
+        directory.mkdir()
+    (base / 'parent-only').write_text('outside\n')
+    (unselected / 'file').write_text('outside\n')
+    (base / 'shared link').symlink_to(shared, target_is_directory=True)
+    (shared / 'outside').symlink_to(unselected, target_is_directory=True)
+    for root in (workspace, shared, global_dir):
+        for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json',
+                     'nested/mysecrets/credentials.json', 'unrelated', 'workspace-readonly',
+                     'global-only', 'global-readonly', 'global-anchor'):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('fixture data\n')
+    (shared / '.membrane.yaml').write_text(json.dumps({
+        'sealed': ['*'], 'mounts': [{'path': str(unselected)}]}))
+    (shared / 'linked tree').mkdir()
+    (shared / 'linked tree/child').write_text('symlink target\n')
+    (shared / 'linked tree/back').symlink_to('.', target_is_directory=True)
+    (workspace / 'selected-link').symlink_to(shared / 'linked tree', target_is_directory=True)
+    (workspace / 'shared-alias').symlink_to(shared, target_is_directory=True)
+    (shared / 'sealed-dangling').symlink_to('missing-target')
+    (shared / 'parent-target').write_text('parent anchored\n')
+    (shared / 'absolute-target.txt').write_text('absolute anchored\n')
+    (shared / 'only-alias').write_text('not traversed via alias\n')
+    (readonly / '.env').write_text('sealed over readonly baseline\n')
+    (readonly / 'file').write_text('readonly\n')
+    copy_policy_workload(workspace)
+    policy_home = base / 'policy-home'
+    (policy_home / '.membrane').mkdir(parents=True)
+    (policy_home / '.membrane/src').symlink_to(REPO_ROOT, target_is_directory=True)
+    (policy_home / '.membrane/config.yaml').write_text(
+        "mounts: [{path: '../global library'}, {path: '../shared library'}]\n"
+        "sealed: [global-only, './global-anchor']\nreadonly: [global-readonly, .env]\n")
+    env = dict(ctx.environment, HOME=str(policy_home))
+    env.setdefault('DOCKER_CONFIG', str(Path.home() / '.docker'))
+    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
+        colima_home = Path.home() / '.colima'
+        if not colima_home.is_dir():
+            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
+        env['COLIMA_HOME'] = str(colima_home)
+    # JSON is YAML; quoting preserves absolute paths and spaces on both hosts.
+    mounts = [{'path': '../shared link'}, {'path': str(shared), 'mode': 'rw'},
+              {'path': str(readonly), 'mode': 'ro'}, {'path': '../empty readonly', 'mode': 'ro'},
+              {'path': '.', 'mode': 'rw'}]
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts, 'sealed': ['.env', 'secrets/credentials.json', 'selected-link', 'sealed-dangling'],
+        'readonly': ['workspace-readonly']}))
+    command = ['sudo', 'python3', '-c', '''import runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+workspace, shared, readonly, empty, global_dir = map(Path, sys.argv[1:6])
+assert Path.cwd() == workspace
+assert not (workspace.parent / 'parent-only').exists()
+assert not (workspace.parent / 'unselected').exists()
+assert not (workspace.parent / 'shared link').exists()
+assert not (shared / 'outside/file').exists()
+assert global_dir.exists() == (sys.argv[6] == 'false')
+if global_dir.exists(): (global_dir / 'written').write_text('global writeback')
+for root in [workspace, shared] + ([global_dir] if global_dir.exists() else []):
+    for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json'):
+        path = root / name
+        p['denied']('unanchored selector: ' + str(path), path.read_bytes)
+    for name in ('unrelated', 'nested/mysecrets/credentials.json'):
+        (root / name).write_text('ordinary writeback')
+    assert (root / 'workspace-readonly').read_bytes()
+    p['denied']('workspace readonly across roots', lambda: (root / 'workspace-readonly').write_text('bad'))
+    if sys.argv[6] == 'false':
+        p['denied']('global sealed across roots', (root / 'global-only').read_bytes)
+        assert (root / 'global-readonly').read_bytes()
+        p['denied']('global readonly across roots', lambda: (root / 'global-readonly').write_text('bad'))
+    else:
+        (root / 'global-only').write_text('global skipped')
+        (root / 'global-readonly').write_text('global skipped')
+if sys.argv[6] == 'false':
+    p['denied']('global relative anchor uses primary workspace', (workspace / 'global-anchor').read_bytes)
+else:
+    (workspace / 'global-anchor').write_text('global skipped')
+(shared / 'global-anchor').write_text('anchor excludes additional root')
+p['denied']('sealed beats readonly mount baseline', (readonly / '.env').read_bytes)
+p['denied']('protected link into selected root', (workspace / 'selected-link/child').read_bytes)
+p['denied']('resolved selected target', (shared / 'linked tree/child').read_bytes)
+p['denied']('protected symlink itself', (workspace / 'selected-link').unlink)
+p['denied']('dangling protected symlink', (shared / 'sealed-dangling').unlink)
+p['denied']('alias cannot clear selected target policy', (workspace / 'shared-alias/.env').read_bytes)
+(shared / 'written').write_text('additional writeback')
+(workspace / 'written').write_text('primary writeback')
+p['access'](readonly / 'file', False)
+p['denied']('readonly child creation', lambda: (readonly / 'new').touch())
+p['denied']('empty readonly root creation', lambda: (empty / 'new').touch())
+p['gate']()
+''', str(workspace), str(shared), str(readonly), str(empty), str(global_dir)]
+    for skip in (False, True):
+        # Check HOME before sudo, which may choose root's HOME.
+        probe = ['bash', '-c', 'test "$HOME" = /home/agent && exec "$@"', 'mount-check',
+                 *command, str(skip).lower()]
+        with Session(ctx, workspace, probe, env=env,
+                     options=['--no-trace', '--no-global-config=' + str(skip).lower()]) as session:
+            session.wait_for('ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            expected = {str(p) for p in (workspace, shared, readonly, empty)}
+            if not skip:
+                expected.add(str(global_dir))
+            selected = [m for m in agent['Mounts'] if m['Source'] in expected]
+            check(ctx, len(selected) == len(expected)
+                  and all(m['Source'] == m['Destination'] for m in selected)
+                  and agent['Config']['WorkingDir'] == str(workspace),
+                  f'37 skip global={skip}: canonical mounts, deduplication and primary working directory')
+            handler = inspect(ctx, 'membrane-handler-' + session.id)
+            roots = [m for m in handler['Mounts'] if m['Destination'].startswith('/policy-roots/')]
+            check(ctx, {m['Source'] for m in roots} == expected
+                  and all(not m['RW'] for m in roots), 'handler gets only selected roots needed for enrollment')
+            session.release()
+            output = session.wait()
+            ctx.output.extend(line for line in output.splitlines() if line.startswith('PASS '))
+            cleaned(ctx, session)
+        for name in ('ready', 'continue'):
+            (workspace / name).unlink()
+        check(ctx, (shared / 'written').read_text() == 'additional writeback'
+              and (workspace / 'written').read_text() == 'primary writeback', '37 rw host writeback')
+    check(ctx, (global_dir / 'written').read_text() == 'global writeback', '37 relative global mount writeback')
+    # Anchors select locations without adding mounts or following directory aliases.
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts,
+        'sealed': ['./.env', './secrets/credentials.json', '../shared library/nested/../parent-target',
+                   str(shared / 'nested/../absolute-*.txt'), '../unselected/file', str(unselected / 'file'),
+                   './shared-alias/only-alias', './missing']}))
+    result = membrane(ctx, ['sudo', 'python3', '-c', """import runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+workspace, shared = map(Path, sys.argv[1:])
+for root in (workspace, shared):
+    for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json'):
+        path = root / name
+        if root == workspace and name in ('.env', 'secrets/credentials.json'):
+            p['denied']('primary anchored selector: ' + name, path.read_bytes)
+        else:
+            assert path.read_bytes()
+            path.write_text('outside primary anchor')
+for name in ('parent-target', 'absolute-target.txt'):
+    p['denied']('additional anchored selector: ' + name, (shared / name).read_bytes)
+assert (workspace / 'shared-alias/only-alias').read_bytes()
+(shared / 'only-alias').write_text('directory alias is not a traversal root')
+assert not (workspace.parent / 'unselected').exists()
+assert not (shared / 'outside/file').exists()
+assert not (workspace / 'missing').exists()
+print('PASS anchors, component boundaries and selected-tree containment', flush=True)
+""", str(workspace), str(shared)], cwd=workspace, env=env)
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts, 'sealed': ['../shared library/outside']}))
+    result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
+    check(ctx, result.returncode != 0 and 'must resolve within a selected directory' in result.stderr
+          and 'workload-started' not in result.stdout, '37 protected symlink escape rejected before startup')
+    for entries, message in (
+        ([{'path': '../shared library', 'mode': 'invalid'}], 'must be ro or rw'),
+        ([{'path': '../missing'}], 'no such file'),
+        ([{'path': '../parent-only'}], 'not a directory'),
+        ([{'path': '.', 'mode': 'ro'}], 'conflicting modes'),
+        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], 'conflicting modes'),
+    ):
+        (workspace / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
+        check(ctx, result.returncode != 0 and message in result.stderr and 'workload-started' not in result.stdout,
+              '37 invalid mount fails before workload: ' + message)
+    check(ctx, not (base / 'missing').exists(), '37 missing source was not created')
+
+
+def group_38(ctx):
+    repo = (ctx.workdir / 'repo').resolve()
+    repo.mkdir()
+    # Host-only fixture setup must not run personal hooks or require signing.
+    # Command-local options leave the agent's Git operations below unchanged.
+    git = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false']
+    run(ctx, [*git, 'init', str(repo)])
+    (repo / 'tracked').write_text('original\n')
+    run(ctx, [*git, '-C', str(repo), 'add', 'tracked'])
+    run(ctx, [*git, '-C', str(repo), '-c', 'user.name=Membrane Test', '-c',
+              'user.email=membrane@example.invalid', 'commit', '-m', 'fixture'])
+    workspace = repo / '.worktrees/fix'
+    sibling = repo / '.worktrees/sibling'
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'fix', str(workspace)])
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'sibling', str(sibling)])
+    for directory in ('readonly/rw', 'sealed/rw', 'rw/ro', 'rw/ro-sibling'):
+        (workspace / directory).mkdir(parents=True)
+        (workspace / directory / 'file').write_text('fixture\n')
+    # Unanchored selectors also match outside the primary worktree.
+    (repo / 'sealed').write_text('additional sealed file\n')
+    (repo / 'readonly/rw').mkdir(parents=True)
+    (repo / 'readonly/rw/file').write_text('inherited additional readonly\n')
+    (repo / 'worktree-alias').symlink_to('.worktrees/fix', target_is_directory=True)
+    copy_policy_workload(workspace)
+    mounts = [{'path': str(repo), 'mode': 'ro'}, {'path': '.', 'mode': 'rw'},
+              {'path': 'readonly/rw', 'mode': 'rw'}, {'path': 'sealed/rw', 'mode': 'rw'},
+              {'path': 'rw', 'mode': 'rw'}, {'path': 'rw/ro', 'mode': 'ro'},
+              {'path': str(repo / 'readonly/rw'), 'mode': 'rw'}]
+    for reverse in (False, True):
+        (workspace / '.membrane.yaml').write_text(json.dumps({
+            'mounts': list(reversed(mounts)) if reverse else mounts,
+            'readonly': ['readonly/', 'sealed/'], 'sealed': ['sealed/']}))
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import runpy, subprocess, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo = Path(sys.argv[1])
+assert str(Path.cwd()) == sys.argv[2]
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+Path('tracked').write_text('edited\\n')
+Path('created').write_text('new file\\n')
+assert '+edited' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
+Path('rw/ordinary').write_text('ordinary\\n')
+Path('rw/ro-sibling/file').write_text('prefix sibling writable\\n')
+p['access'](repo / 'sealed', True)
+p['access'](repo / 'readonly/rw/file', False)
+p['access'](repo / 'tracked', False)
+p['access'](repo / '.worktrees/sibling/tracked', False)
+p['denied']('readonly repo root', lambda: (repo / 'new').touch())
+p['denied']('readonly child', lambda: Path('rw/ro/new').touch())
+p['access']('rw/ro/file', False)
+p['access']('readonly/rw/file', False)
+p['access']('sealed/rw/file', True)
+p['access'](repo / 'worktree-alias/readonly/rw/file', False)
+p['access'](repo / 'worktree-alias/sealed/rw/file', True)
+(repo / 'worktree-alias/tracked').write_text('edited through ancestor alias\\n')
+for args in (['add', 'tracked'], ['update-ref', 'refs/heads/must-not-exist', 'HEAD']):
+    result = subprocess.run(['git', *args], text=True, capture_output=True)
+    assert result.returncode != 0 and 'Permission denied' in result.stderr, result
+print('PASS linked-worktree history, diff and edits; metadata writes denied', flush=True)
+''', str(repo), str(workspace)], cwd=workspace)
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, (workspace / 'tracked').read_text() == 'edited through ancestor alias\n'
+              and (workspace / 'created').read_text() == 'new file\n'
+              and (sibling / 'tracked').read_text() == 'original\n',
+              f'38 reverse={reverse}: both overlap directions, inherited selectors and linked worktree')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -1542,6 +1794,8 @@ GROUPS = {
     34: TestGroup("deny config merging, CLI precedence and unsupported UDP constraints", group_34),
     35: TestGroup("fragmented HTTP/TLS deny inspection", group_35),
     36: TestGroup("editable agent instructions and global configuration mounts", group_36),
+    37: TestGroup("additional directory mounts, configuration and readonly roots", group_37),
+    38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
 }
 
 

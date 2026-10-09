@@ -102,8 +102,8 @@ func TestLoadConfigSealed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, data := range map[string]string{
-		filepath.Join(home, ".membrane/config.yaml"): "sealed: [.env]\nreadonly: [config/]\n",
-		filepath.Join(workspace, ".membrane.yaml"):   "sealed: [secrets/, '*.pem']\n",
+		filepath.Join(home, ".membrane/config.yaml"): "sealed: [.env]\nreadonly: [config/]\nmounts: [{path: ../global, mode: ro}]\n",
+		filepath.Join(workspace, ".membrane.yaml"):   "sealed: [secrets/, '*.pem']\nmounts: [{path: ../local}]\n",
 	} {
 		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 			t.Fatal(err)
@@ -115,18 +115,42 @@ func TestLoadConfigSealed(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []string{"secrets/", "*.pem"}
+		wantMounts := []directoryMount{{Path: "../local", Mode: "rw"}}
 		if !skipGlobal {
+			wantMounts = append([]directoryMount{{Path: "../global", Mode: "ro"}}, wantMounts...)
 			want = append([]string{".env"}, want...)
 			if !reflect.DeepEqual(cfg.Readonly, []string{"config/"}) {
 				t.Fatalf("Readonly = %v", cfg.Readonly)
 			}
 		}
+		if !reflect.DeepEqual(cfg.Mounts, wantMounts) {
+			t.Fatalf("skipGlobal=%v: Mounts = %v, want %v", skipGlobal, cfg.Mounts, wantMounts)
+		}
 		if !reflect.DeepEqual(cfg.Sealed, want) {
 			t.Fatalf("skipGlobal=%v: Sealed = %v, want %v", skipGlobal, cfg.Sealed, want)
 		}
-		if got := effectiveFilesystemPolicy(cfg, "secrets", "secrets", policyReadonly); got != policySealed {
+		if got := effectiveFilesystemPolicy(cfg, workspace, filepath.Join(workspace, "secrets"), "secrets", policyReadonly); got != policySealed {
 			t.Fatalf("loaded sealed selector = %d, want SEALED over READONLY", got)
 		}
+	}
+}
+
+func TestMountValidation(t *testing.T) {
+	for _, mounts := range []string{
+		"[null]", "[{}]", "[{mode: ro}]", "[{path: ''}]", "[{path: null}]", "[{path: 1}]",
+		"[{path: ., mode: ''}]", "[{path: ., mode: null}]", "[{path: ., mode: RO}]",
+		"[{path: ., mode: read}]", "[{path: ., mode: true}]", "[{path: ., typo: ro}]",
+		"[.]", "{path: .}", "[{path: []}]", "[{path: ., mode: []}]",
+	} {
+		t.Run(mounts, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("mounts: "+mounts+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfigFile(path); err == nil || !strings.Contains(err.Error(), path) {
+				t.Fatalf("invalid mounts must identify config file: %v", err)
+			}
+		})
 	}
 }
 
