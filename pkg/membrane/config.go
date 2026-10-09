@@ -26,6 +26,7 @@ type config struct {
 
 type directoryMount struct {
 	Path string `yaml:"path"`
+	Type string `yaml:"type"`
 	Mode string `yaml:"mode"`
 }
 
@@ -309,7 +310,7 @@ func loadConfigFile(path string) (*config, error) {
 	}
 	// Pointer entries retain YAML nulls that []NetworkRule would silently skip.
 	// Validate denies separately so existing allow parsing stays unchanged.
-	// Mount nodes distinguish omitted modes from explicit empty/null values.
+	// Mount nodes preserve key presence and distinguish strings from nulls.
 	var entries struct {
 		Deny   []*NetworkRule         `yaml:"deny"`
 		Mounts []map[string]yaml.Node `yaml:"mounts"`
@@ -318,11 +319,23 @@ func loadConfigFile(path string) (*config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	for i, entry := range entries.Mounts {
-		node := entry["path"]
-		if node.ShortTag() != "!!str" || cfg.Mounts[i].Path == "" {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: path must be a nonempty string", path, i)
+		_, hasPath := entry["path"]
+		_, hasType := entry["type"]
+		if hasPath == hasType {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: specify exactly one of path or type", path, i)
 		}
 		mount := &cfg.Mounts[i]
+		field, value := "path", mount.Path
+		if hasType {
+			field, value = "type", mount.Type
+		}
+		node := entry[field]
+		if node.ShortTag() != "!!str" || value == "" {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: %s must be a nonempty string", path, i, field)
+		}
+		if hasType && mount.Type != "git-root" {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: unsupported type %q: must be git-root", path, i, mount.Type)
+		}
 		mode, present := entry["mode"]
 		if !present {
 			mount.Mode = "rw"

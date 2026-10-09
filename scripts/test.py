@@ -1685,7 +1685,7 @@ print('PASS anchors, component boundaries and selected-tree containment', flush=
 
 
 def group_38(ctx):
-    repo = (ctx.workdir / 'repo').resolve()
+    repo = (ctx.workdir / 'main repo').resolve()
     repo.mkdir()
     # Host-only fixture setup must not run personal hooks or require signing.
     # Command-local options leave the agent's Git operations below unchanged.
@@ -1699,6 +1699,12 @@ def group_38(ctx):
     sibling = repo / '.worktrees/sibling'
     run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'fix', str(workspace)])
     run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'sibling', str(sibling)])
+    external = ctx.workdir.resolve() / 'external worktree'
+    unselected = ctx.workdir.resolve() / 'unselected worktree'
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'external', str(external)])
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '--detach', str(unselected)])
+    (repo / '.membrane.yaml').write_text(json.dumps({
+        'sealed': ['*'], 'mounts': [{'path': str(unselected)}]}))
     for directory in ('readonly/rw', 'sealed/rw', 'rw/ro', 'rw/ro-sibling'):
         (workspace / directory).mkdir(parents=True)
         (workspace / directory / 'file').write_text('fixture\n')
@@ -1708,7 +1714,7 @@ def group_38(ctx):
     (repo / 'readonly/rw/file').write_text('inherited additional readonly\n')
     (repo / 'worktree-alias').symlink_to('.worktrees/fix', target_is_directory=True)
     copy_policy_workload(workspace)
-    mounts = [{'path': str(repo), 'mode': 'ro'}, {'path': '.', 'mode': 'rw'},
+    mounts = [{'type': 'git-root', 'mode': 'ro'}, {'path': '.', 'mode': 'rw'},
               {'path': 'readonly/rw', 'mode': 'rw'}, {'path': 'sealed/rw', 'mode': 'rw'},
               {'path': 'rw', 'mode': 'rw'}, {'path': 'rw/ro', 'mode': 'ro'},
               {'path': str(repo / 'readonly/rw'), 'mode': 'rw'}]
@@ -1749,6 +1755,45 @@ print('PASS linked-worktree history, diff and edits; metadata writes denied', fl
               and (workspace / 'created').read_text() == 'new file\n'
               and (sibling / 'tracked').read_text() == 'original\n',
               f'38 reverse={reverse}: both overlap directions, inherited selectors and linked worktree')
+
+    # The main repository need not be an ancestor of the starting worktree.
+    copy_policy_workload(external)
+    (external / '.membrane.yaml').write_text(json.dumps({
+        'mounts': [{'type': 'git-root', 'mode': 'rw'}, {'path': str(repo), 'mode': 'rw'}],
+        'sealed': ['sealed/'], 'readonly': ['readonly/']}))
+    result = membrane(ctx, ['sudo', 'python3', '-c', '''import runpy, subprocess, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo, workspace, unselected = map(Path, sys.argv[1:])
+assert Path.cwd() == workspace
+assert not unselected.exists()
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+Path('tracked').write_text('external edit\\n')
+assert '+external edit' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
+(repo / 'tracked').write_text('main repository writeback\\n')
+p['access'](repo / 'sealed', True)
+p['access'](repo / 'readonly/rw/file', False)
+print('PASS external worktree discovers writable main repo; selectors and mount scope preserved', flush=True)
+''', str(repo), str(external), str(unselected)], cwd=external)
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+    check(ctx, (repo / 'tracked').read_text() == 'main repository writeback\n'
+          and (external / 'tracked').read_text() == 'external edit\n', '38 typed rw mount host writeback')
+
+    (repo / '.membrane.yaml').write_text(json.dumps({
+        'mounts': [{'type': 'git-root'}, {'path': str(repo)}]}))
+    membrane(ctx, ['python3', '-c', 'import os, sys; assert os.getcwd() == sys.argv[1]', str(repo)], cwd=repo)
+    check(ctx, True, '38 default rw typed mount deduplicates with primary workspace and explicit path')
+    nonrepo = ctx.workdir.resolve() / 'not a repository'
+    nonrepo.mkdir()
+    for directory, entries, message in (
+        (repo, [{'type': 'git-root', 'mode': 'ro'}], 'conflicting modes'),
+        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}], 'conflicting modes'),
+        (nonrepo, [{'type': 'git-root'}], 'type "git-root": git worktree list'),
+    ):
+        (directory / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=directory, expected=None)
+        check(ctx, result.returncode != 0 and 'mounts[' in result.stderr and message in result.stderr
+              and 'workload-started' not in result.stdout, '38 typed mount fails before workload: ' + message)
 
 
 @dataclass(frozen=True)

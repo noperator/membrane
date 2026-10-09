@@ -230,16 +230,18 @@ Configuration is YAML and works at two levels:
 
 ```yaml
 # `mounts` selects additional existing directories at canonical host paths.
-# Entries require path; mode is ro or rw (default rw). Relative paths in either
-# global/workspace config resolve against the canonical primary workspace. The
-# primary workspace remains the working directory, with an implicit rw
-# baseline. The most specific containing mount sets the baseline, independent
-# of order.
+# Entries require exactly one nonempty string: path or type. mode is ro or rw
+# (default rw) for either form. Relative paths in either config resolve from
+# the canonical primary workspace. The only supported type, git-root, uses host
+# Git to discover the main working tree (or bare repository), even from a
+# linked worktree or its subdirectory. The primary workspace remains the
+# working directory, with an implicit rw baseline. The most specific containing
+# mount sets the baseline, independent of order. Explicit readonly/sealed
+# selectors still apply to either form.
 mounts:
-  - path: ../main-repo
+  - type: git-root
     mode: ro
   - path: ../shared-library
-    mode: rw
 
 # `sealed` paths remain visible (e.g., `stat` still works), but file contents
 # cannot be read or modified.
