@@ -132,7 +132,7 @@ def semantics(sealed):
             finally:
                 libc.munmap(address, 4096)
     Path("/tmp/workspace-copy").mkdir(exist_ok=True)
-    subprocess.run(["mount", "--bind", "/workspace", "/tmp/workspace-copy"], check=True)
+    subprocess.run(["mount", "--bind", ".", "/tmp/workspace-copy"], check=True)
     try:
         access("/tmp/workspace-copy/protected", sealed)
     finally:

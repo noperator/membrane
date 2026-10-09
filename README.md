@@ -81,13 +81,15 @@ Optionally pass a specific command to be executed, using `--` to separate membra
 
 ```bash
 # Drop into a shell
-cd /your/workspace
+cd /Users/noperator/git/project
 membrane
 
 # Run a specific command
 membrane -- claude -p "just say hello"
 membrane -- bash -c "echo hello"
 ```
+
+The shell or command starts at the workspace's canonical absolute host path. For example, launching from `/Users/noperator/git/project` starts there inside the container too. Only the selected workspace directory is mounted; its host parents and siblings are not exposed. Symlinked launch paths resolve to their canonical target. The agent's home remains `/home/agent`, and `.membrane.yaml` and filesystem selectors remain workspace-relative. External Git worktree metadata is not made accessible by preserving absolute paths.
 
 #### Non-interactive mode
 
@@ -145,12 +147,12 @@ membrane --trace-log=blog.jsonl.gz -- \
     'Download the homepage of my blog noperator.dev and save it to blog.html.'
 ```
 
-Codex uses curl to download the page and saves it to `/workspace/blog.html`.
+Codex uses curl to download the page and saves it to `blog.html` in the workspace (for example, `/Users/noperator/git/project/blog.html`).
 
 The raw trace is intentionally comprehensive, so we can use a reproducible jq filter to show the commands Codex launches to carry out its actions, along with their workspace file activity and network connections:
 
 ```bash
-𝄢 gzip -dc blog.jsonl.gz | jq -rs '
+𝄢 gzip -dc blog.jsonl.gz | jq --arg workspace "$(pwd -P)" -rs '
   sort_by(.timestamp) as $e |
 
   # Find the Codex process(es).
@@ -187,7 +189,7 @@ The raw trace is intentionally comprehensive, so we can use a reproducible jq fi
       or .type == "socket_connect"
       or (
         .type == "file_open"
-        and (.path | startswith("/workspace"))
+        and (.path | startswith($workspace + "/"))
       )
     )
 
@@ -203,7 +205,7 @@ The raw trace is intentionally comprehensive, so we can use a reproducible jq fi
 '
 ```
 
-We see that Codex launches curl, curl resolves and connects to the site, opens `/workspace/blog.html` for writing, and Codex verifies the result.
+We see that Codex launches curl, curl resolves and connects to the site, opens `blog.html` at its absolute workspace path for writing, and Codex verifies the result.
 
 ```text
 exec  bash: /bin/bash -c curl --fail --location --silent --show-error https://noperator.dev/ --output blog.html
@@ -214,7 +216,7 @@ conn  curl: AF_INET6 2606:4700:3030::6815:5b07:443
 conn  curl: AF_INET 172.67.163.253:443
 conn  curl: AF_INET 104.21.91.7:443
 conn  curl: AF_INET 172.67.163.253:443
-file  curl: flags=131649 /workspace/blog.html
+file  curl: flags=131649 /Users/noperator/git/project/blog.html
 exec  bash: /bin/bash -c ls -lh blog.html
 exec  ls: ls -lh blog.html
 ```

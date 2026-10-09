@@ -5,13 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
 
-func TestAgentCgroupParentDockerArgument(t *testing.T) {
+func TestAgentDockerArguments(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	workspace := t.TempDir()
+	workspace := filepath.Join(t.TempDir(), "workspace with spaces")
 	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent"}}
 	for _, parent := range []string{"/membrane-test", ""} {
 		args, err := buildAgentArgs(workspace, cfg, nil,
@@ -26,8 +27,13 @@ func TestAgentCgroupParentDockerArgument(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(args, " ")
-		if strings.Contains(joined, "/workspace/") || strings.Contains(joined, "empty-file") || strings.Contains(joined, "empty-dir") {
+		if strings.Contains(joined, "empty-file") || strings.Contains(joined, "empty-dir") {
 			t.Fatalf("per-path filesystem policy mount returned: %v", args)
+		}
+		mount := slices.Index(args, "-v")
+		workdir := slices.Index(args, "--workdir")
+		if mount < 0 || args[mount+1] != workspace+":"+workspace || workdir < 0 || args[workdir+1] != workspace {
+			t.Fatalf("workspace mount and working directory must preserve the host path: %v", args)
 		}
 		if args[0] != "create" || !strings.Contains(joined, "--cgroup-parent="+parent) {
 			t.Fatalf("missing traced create/parent: %v", args)

@@ -390,7 +390,8 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"--cap-add=CAP_SETPCAP",
 		"--network", s.internalNetwork,
 		"-e", "MEMBRANE_GATEWAY="+gatewayIP,
-		"-v", workspaceDir+":/workspace",
+		"-v", workspaceDir+":"+workspaceDir,
+		"--workdir", workspaceDir,
 	)
 
 	home, err := os.UserHomeDir()

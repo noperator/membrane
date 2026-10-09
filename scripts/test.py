@@ -656,7 +656,7 @@ def trace_events(ctx, path):
     return events
 
 
-def check_events(ctx, events, token, port, output, executable="/workspace/trace-workload"):
+def check_events(ctx, events, token, port, output, executable="./trace-workload"):
     check(ctx, any(e.get("type") == "process_exec" and e.get("argv", "").startswith(executable + " " + token + " ")
               for e in events), token + ": first exec")
     check(ctx, any(e.get("type") == "file_open" and e.get("path") == "/tmp/" + token + ".write"
@@ -772,7 +772,7 @@ def trace_session(ctx, token, port, *, traced=True, dind=False, env=None, termin
     options = ["--trace-log=" + str(directory / "trace.jsonl.gz")]
     if not traced:
         options.append("--no-trace")
-    command = ["/workspace/trace-workload", token, str(port), "tty" if terminal else "hold"]
+    command = ["./trace-workload", token, str(port), "tty" if terminal else "hold"]
     if dind:
         command.append("dind")
     return Session(ctx, directory, command, options=options, env=env, terminal=terminal)
@@ -812,6 +812,8 @@ def group_25(ctx):
         events_a, events_b = trace_events(ctx, a.directory / "trace.jsonl.gz"), trace_events(ctx, b.directory / "trace.jsonl.gz")
         check_events(ctx, events_a, "trace-a", 45101, output_a)
         check_events(ctx, events_b, "trace-b", 45102, output_b)
+        check(ctx, any(e.get("type") == "file_open" and e.get("path") == str(a.directory.resolve() / "trace-a.first")
+                  for e in events_a), "workspace file opens use the canonical host path")
         check(ctx, any(e.get("type") == "file_open" and e.get("path") == "/etc/hostname"
                   and e["flags"] & 3 == 0 for e in events_a), "read-only file opens recorded")
         check(ctx, "trace-b" not in json.dumps(events_a) and "trace-a" not in json.dumps(events_b)
@@ -833,7 +835,7 @@ def group_27(ctx):
         target.write_text("fixture data\n")
     config(ctx, "readonly:\n  - config/\n  - sealed/readonly/\nsealed:\n  - config/secrets.txt\n  - sealed/\n")
     copy_policy_workload(ctx.workdir)
-    result = membrane(ctx, ["sudo", "python3", "/workspace/policy-workload.py", "precedence"])
+    result = membrane(ctx, ["sudo", "python3", "policy-workload.py", "precedence"])
     ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith("PASS "))
     check(ctx, True, "27A overlapping rules start successfully; SEALED dominates READONLY")
 
@@ -856,11 +858,11 @@ def filesystem_case(ctx, sealed):
     copy_policy_workload(base)
     # Linux xattr APIs are absent from macOS Python. Prepare metadata using
     # Linux's view of the same workspace, outside any Membrane policy session.
-    prepared = run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(base) + ":/workspace",
-                         "-w", "/workspace", "--entrypoint=python3", "membrane-agent",
-                         "/workspace/policy-workload.py", "prepare"])
+    prepared = run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(base.resolve()) + ":" + str(base.resolve()),
+                         "-w", str(base.resolve()), "--entrypoint=python3", "membrane-agent",
+                         "policy-workload.py", "prepare"])
     ctx.output.extend(line for line in prepared.stdout.splitlines() if line.startswith(("PASS ", "SKIP ")))
-    with Session(ctx, base, ["sudo", "python3", "/workspace/policy-workload.py",
+    with Session(ctx, base, ["sudo", "python3", "policy-workload.py",
                             "sealed" if sealed else "readonly"], options=["--no-trace"]) as session:
         session.wait_for("ready")
         check(ctx, (base / "protected").read_text() == "protected data\n", "host can read protected object")
@@ -897,6 +899,50 @@ def group_28(ctx):
 
 
 def group_29(ctx):
+    directory = (ctx.workdir / "workspace with spaces").resolve()
+    directory.mkdir()
+    link = ctx.workdir / "launch link"
+    link.symlink_to(directory, target_is_directory=True)
+    (ctx.workdir / "parent-only").write_text("outside workspace\n")
+    sibling = ctx.workdir / "sibling"
+    sibling.mkdir()
+    (sibling / "host-only").write_text("outside workspace\n")
+    command = ["bash", "-c", r'''set -eu
+test "$PWD" = "$1"
+test "$HOME" = /home/agent
+test ! -e /workspace
+test ! -L /workspace
+test ! -e ../parent-only
+test ! -e ../sibling
+test ! -e '../launch link'
+printf '%s\n' "$PWD" > 'written by agent'
+touch ready
+while [ ! -e continue ]; do sleep 0.1; done
+''', "workspace-check", str(directory)]
+    for launch in (directory, link):
+        # Preserve the logical launch path so Run's existing EvalSymlinks is exercised.
+        terminal = launch == link
+        with Session(ctx, launch, [] if terminal else command, options=["--no-trace"], terminal=terminal,
+                     env=dict(ctx.environment, PWD=str(launch))) as session:
+            if terminal:
+                os.write(session.terminal[0], (shlex.join(command) + "\nexit\n").encode())
+            session.wait_for("ready")
+            agent = inspect(ctx, "membrane-agent-" + session.id)
+            mounts = {m["Destination"]: m for m in agent["Mounts"]}
+            check(ctx, agent["Config"]["WorkingDir"] == str(directory)
+                  and str(directory) in mounts and mounts[str(directory)]["Source"] == str(directory)
+                  and mounts[str(directory)]["RW"], launch.name + ": canonical writable mount and working directory")
+            check(ctx, "/workspace" not in mounts
+                  and not any(m["Source"] in {str(p) for p in directory.parents} for m in agent["Mounts"]),
+                  launch.name + ": no workspace alias or host parent mount")
+            check(ctx, (directory / "written by agent").read_text() == str(directory) + "\n",
+                  launch.name + ": command writes to host workspace with spaces; parents and siblings stay isolated")
+            session.release()
+            session.wait()
+            cleaned(ctx, session)
+        for name in ("ready", "continue", "written by agent"):
+            (directory / name).unlink()
+
     build_trace_workload(ctx)
     run(ctx, [ctx.membrane_cmd, "--no-update", "--no-global-config",
               "--trace-log=" + str(ctx.workdir / "exit37.gz"), "--", "bash", "-c", "exit 37"],
@@ -960,9 +1006,9 @@ def group_30(ctx):
     (b_dir / ".membrane.yaml").write_text("sealed: [other]\n")
     shutil.copy2(ctx.workdir / "policy-dind", a_dir / "policy-dind")
     with ExitStack() as stack:
-        a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]))
+        a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "policy-workload.py", "hold"], options=["--no-trace"]))
         a.wait_for("ready")
-        b = stack.enter_context(Session(ctx, b_dir, ["sudo", "python3", "/workspace/policy-workload.py", "ordinary"], options=["--trace-log=" + str(b_dir / "trace.jsonl.gz")]))
+        b = stack.enter_context(Session(ctx, b_dir, ["sudo", "python3", "policy-workload.py", "ordinary"], options=["--trace-log=" + str(b_dir / "trace.jsonl.gz")]))
         b.wait_for("ready")
         check_handler(ctx, a, traced=False, policy=True)
         check_handler(ctx, b, traced=True, policy=True)
@@ -970,13 +1016,13 @@ def group_30(ctx):
         check(ctx, a.id != b.id and agent_a["HostConfig"]["CgroupParent"] != agent_b["HostConfig"]["CgroupParent"], "concurrent policy sessions have distinct cgroups")
         run(ctx, ["docker", "exec", "membrane-handler-" + a.id, "test", "!", "-d", "/trace"])
         check(ctx, (a_dir / "protected").read_text() == "other session write\n", "other session can mutate the same inode")
-        run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", "/workspace/other"])
+        run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", str(a_dir.resolve() / "other")])
         run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(a_dir) + ":/data", "--entrypoint=python3", "membrane-agent", "-c",
                   "from pathlib import Path; p=Path('/data/protected'); p.read_bytes(); p.write_text('unrelated write\\n')"])
         check(ctx, True, "unrelated Docker container remains unrestricted")
         # Explicit original exploit, executing as sandbox root through sudo.
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mkdir", "-p", "/tmp/workspace-copy"])
-        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", "/workspace", "/tmp/workspace-copy"])
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", str(a_dir.resolve()), "/tmp/workspace-copy"])
         probe = """import errno, os
 for name, readable in [('protected', False), ('readonly', True)]:
  for flags, allowed in [(os.O_RDONLY, readable), (os.O_WRONLY, False)]:
@@ -989,7 +1035,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
 """
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "python3", "-c", probe])
         check(ctx, True, "F-005 sudo bind-mount alias preserves sealed/readonly policy")
-        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "/workspace/policy-dind"], timeout=90)
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", str(a_dir.resolve() / "policy-dind")], timeout=90)
         check(ctx, True, "inner Docker descendant remains subject to policy")
         b.release(); b.wait(); trace_events(ctx, b_dir / "trace.jsonl.gz"); cleaned(ctx, b)
         a.release(); a.wait(); cleaned(ctx, a)
@@ -998,7 +1044,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     failed_dir = ctx.workdir / "failed"
     (failed_dir / "protected").write_text("secret\n")
     (failed_dir / ".membrane.yaml").write_text("sealed: [protected]\n")
-    with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(failed_dir))) as failed:
+    with Session(ctx, failed_dir, ["touch", "first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(failed_dir))) as failed:
         output = failed.wait(expected=None)
         check(ctx, failed.process.returncode != 0 and "load filesystem policy BPF" in output, "LSM setup failure aborts clearly")
         check(ctx, not (failed_dir / "first-instruction").exists(), "failed policy never starts workload")
@@ -1015,7 +1061,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     (directory / "ordinary").write_text("ordinary\n")
     (directory / "readonly-old").write_text("readonly original\n")
     (directory / ".membrane.yaml").write_text("sealed: [.env, tree/]\nreadonly: [readonly-old]\n")
-    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
+    with Session(ctx, directory, ["sudo", "python3", "policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
         snapshot.wait_for("ready")
         update_snapshot_workspace(ctx, snapshot, r'''
 (directory / ".env").rename(directory / "renamed-env")
@@ -1032,7 +1078,7 @@ os.replace(directory / "temp", directory / "readonly-old")
 
     directory = ctx.workdir / "late"
     (directory / ".membrane.yaml").write_text("sealed: [.env]\n")
-    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "late-only"], options=["--no-trace"]) as late:
+    with Session(ctx, directory, ["sudo", "python3", "policy-workload.py", "late-only"], options=["--no-trace"]) as late:
         late.wait_for("ready")
         check_handler(ctx, late, traced=False)
         check(ctx, bool(inspect(ctx, "membrane-agent-" + late.id)["HostConfig"]["CgroupParent"]), "empty snapshot still has a supervised workload cgroup")
@@ -1064,11 +1110,11 @@ def lifecycle_session(ctx, token, *, policy=False, env=None):
     # Record workload liveness without relying on Docker's daemon state.
     command = ["python3", "-c", """import os, time
 from pathlib import Path
-Path('/workspace/ready').write_text('ready')
-while not Path('/workspace/continue').exists():
-    Path('/workspace/alive').write_text(str(time.monotonic_ns()))
+Path('ready').write_text('ready')
+while not Path('continue').exists():
+    Path('alive').write_text(str(time.monotonic_ns()))
     time.sleep(0.02)
-Path('/workspace/completed').touch()
+Path('completed').touch()
 """]
     return Session(ctx, directory, command, options=["--no-trace"], env=env)
 
@@ -1126,7 +1172,7 @@ os.kill(pids[0], signal.SIGKILL)
                     before_b = (survivor.directory / "alive").read_text()
                     time.sleep(0.1)
                     check(ctx, (survivor.directory / "alive").read_text() != before_b, component + ": session B remains running")
-                    denied = run(ctx, ["docker", "exec", "membrane-agent-" + survivor.id, "cat", "/workspace/protected"], expected=None)
+                    denied = run(ctx, ["docker", "exec", "membrane-agent-" + survivor.id, "cat", str(survivor.directory.resolve() / "protected")], expected=None)
                     check(ctx, denied.returncode != 0 and "Permission denied" in denied.stderr,
                           component + ": session B filesystem enforcement remains attached")
                 finally:
@@ -1488,7 +1534,7 @@ GROUPS = {
     26: TestGroup("readonly filesystem paths", group_26),
     27: TestGroup("filesystem policy precedence", group_27),
     28: TestGroup("tracing modes and failure handling", group_28),
-    29: TestGroup("traced workload lifecycle and terminal I/O", group_29),
+    29: TestGroup("workspace paths, traced workload lifecycle and terminal I/O", group_29),
     30: TestGroup("filesystem LSM isolation, lifecycle and startup snapshot", group_30),
     31: TestGroup("security supervisor fail-stop, cgroup isolation and signals", group_31),
     32: TestGroup("HTTP deny precedence, methods, paths and ports", group_32),
