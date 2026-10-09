@@ -1369,6 +1369,90 @@ for secure, method, expected in ((False, 'DELETE', b'403'), (True, 'DELETE', b'4
     check(ctx, result.stdout.count('PASS') == 3, '35 fragmented HTTP/TLS denies and allowed GET')
 
 
+def group_36(ctx):
+    # Isolate user-managed files and shared client home from the real user.
+    home = ctx.workdir / "host-home"
+    state = home / ".membrane"
+    state.mkdir(parents=True)
+    (state / "src").symlink_to(REPO_ROOT, target_is_directory=True)
+    env = dict(ctx.environment, HOME=str(home))
+    env.setdefault("DOCKER_CONFIG", str(Path.home() / ".docker"))
+    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
+        colima_home = Path.home() / '.colima'
+        if not colima_home.is_dir():
+            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
+        env['COLIMA_HOME'] = str(colima_home)
+    membrane(ctx, ["true"], env=env)
+    check(ctx, all((state / name).read_bytes() == (REPO_ROOT / name).read_bytes()
+                   and not (state / name).is_symlink() for name in ("config.yaml", "AGENTS.md")),
+          "both missing user files initialized as independent copies")
+    global_yaml = "# User policy\nallow: [192.0.2.0/24]\ndeny: [192.0.2.128/25]\nargs: [-e, VISIBLE_LITERAL=fixture]\n"
+    (state / "config.yaml").write_text(global_yaml)
+    config(ctx, "allow: [198.51.100.0/24]\nreadonly: [.membrane.yaml]\n")
+    project = {name: "project " + name + "\n" for name in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md")}
+    for name, content in project.items():
+        (ctx.workdir / name).write_text(content)
+    codex = state / "home/.codex"
+    base = "Existing Codex instructions.\n"
+    (codex / "AGENTS.md").write_text(base)
+    shipped = (REPO_ROOT / "AGENTS.md").read_text()
+    for number, (override, skip) in enumerate(((None, False), ("User override.\n", False), (" \n", True))):
+        if number == 1:
+            for name in ("config.yaml", "AGENTS.md"):
+                (state / name).rename(state / (name + ".user"))
+                (state / name).symlink_to(name + ".user")
+        guidance = shipped + f"\nUser guidance revision {number}\n"
+        (state / "AGENTS.md").write_text(guidance)
+        if override is not None:
+            (codex / "AGENTS.override.md").write_text(override)
+        active = "AGENTS.override.md" if override and override.strip() else "AGENTS.md"
+        original = override if active == "AGENTS.override.md" else base
+        result = membrane(ctx, ["python3", "-c", r"""import errno, json, sys
+from pathlib import Path
+active, original, guidance, global_yaml, skip, project = sys.argv[1:]
+canonical = Path('/etc/membrane/AGENTS.md')
+claude = Path('/etc/claude-code/CLAUDE.md')
+codex = Path('/home/agent/.codex') / active
+assert canonical.read_text() == guidance
+assert claude.read_text() == guidance
+assert codex.read_text() == original + '\n\n' + guidance
+files = [canonical, claude, codex]
+global_file = Path('/etc/membrane/config.yaml')
+if skip == 'true':
+    assert not global_file.exists()
+else:
+    assert global_file.read_text() == global_yaml
+    files.append(global_file)
+for name in ('effective-policy.json', 'effective-policy.yaml', 'global-policy.yaml'):
+    assert not (Path('/etc/membrane') / name).exists()
+for filename, content in json.loads(project).items():
+    assert Path(filename).read_text() == content
+assert Path('.membrane.yaml').is_file()
+for file in files:
+    try:
+        with file.open('a'):
+            pass
+    except OSError as error:
+        assert error.errno == errno.EROFS, (file, error)
+    else:
+        raise AssertionError(str(file) + ' is writable')
+print('editable-instructions-ok')
+""", active, original, guidance, global_yaml, str(skip).lower(), json.dumps(project)], env=env,
+            options=["--no-global-config=" + str(skip).lower(), "--allow=203.0.113.0/24"])
+        check(ctx, "editable-instructions-ok" in result.stdout,
+              f"revision {number}: latest guidance, readonly files, Codex {active}, skip global={skip}")
+        check(ctx, (codex / "AGENTS.md").read_text() == base and
+              (override is None or (codex / "AGENTS.override.md").read_text() == override),
+              "shared Codex originals unchanged")
+        check(ctx, all((ctx.workdir / name).read_text() == content for name, content in project.items()),
+              "project instructions unchanged")
+        check(ctx, (state / "config.yaml").read_text() == global_yaml and
+              (state / "AGENTS.md").read_text() == guidance and
+              (number == 0 or all(os.readlink(state / name) == name + ".user" for name in ("config.yaml", "AGENTS.md"))),
+              "user edits and symlinks preserved on subsequent starts")
+        check(ctx, not list((state / "tmp").glob("membrane-instructions-*")), "session copy cleaned up")
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -1411,6 +1495,7 @@ GROUPS = {
     33: TestGroup("transport denies, DNS, wildcards and UDP", group_33),
     34: TestGroup("deny config merging, CLI precedence and unsupported UDP constraints", group_34),
     35: TestGroup("fragmented HTTP/TLS deny inspection", group_35),
+    36: TestGroup("editable agent instructions and global configuration mounts", group_36),
 }
 
 
