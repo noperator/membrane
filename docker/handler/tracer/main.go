@@ -198,7 +198,7 @@ func run(ctx context.Context, cgroupPath, traceFile string) (retErr error) {
 		if len(entries) == 0 {
 			return errors.New("mandatory policy manifest is empty")
 		}
-		closePolicy, err := loadFilesystemPolicy(ctx, cgroupPath, os.Getenv("MEMBRANE_POLICY_WORKSPACE"), entries)
+		closePolicy, err := loadFilesystemPolicy(ctx, cgroupPath, os.Getenv("MEMBRANE_POLICY_ROOTS"), entries)
 		if err != nil {
 			return err
 		}

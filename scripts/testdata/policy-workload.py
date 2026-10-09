@@ -16,11 +16,12 @@ def check(ok, label):
     print("PASS " + label, flush=True)
 
 
-def denied(label, operation):
+def denied(label, operation, *, readonly_mount=False):
     try:
         operation()
     except OSError as error:
-        check(error.errno == errno.EACCES, f"{label}: EACCES (got {error})")
+        expected = (errno.EACCES, errno.EROFS) if readonly_mount else (errno.EACCES,)
+        check(error.errno in expected, f"{label}: {'/'.join(errno.errorcode[e] for e in expected)} (got {error})")
     else:
         raise RuntimeError(label + ": unexpectedly allowed")
 
@@ -31,7 +32,7 @@ def mapped(path, writable=False):
             return view[:1]
 
 
-def access(path, sealed):
+def access(path, sealed, *, readonly_mount=False):
     path = Path(path)
     check(path.stat().st_size > 0, str(path) + ": stat")
     if sealed:
@@ -40,9 +41,10 @@ def access(path, sealed):
     else:
         check(bool(path.read_bytes()), str(path) + ": read")
         check(bool(mapped(path)), str(path) + ": read-only mmap")
-    denied(str(path) + ": write", lambda: path.write_bytes(b"bad"))
-    denied(str(path) + ": append", lambda: open(path, "ab"))
-    denied(str(path) + ": truncate", lambda: os.truncate(path, 0))
+    denied(str(path) + ": write", lambda: path.write_bytes(b"bad"), readonly_mount=readonly_mount)
+    denied(str(path) + ": append", lambda: open(path, "ab"), readonly_mount=readonly_mount)
+    denied(str(path) + ": truncate", lambda: os.truncate(path, 0), readonly_mount=readonly_mount)
+    # ACCESS_COPY is private: Docker readonly alone does not deny this mapping.
     denied(str(path) + ": writable mmap", lambda: mapped(path, True))
 
 
@@ -132,7 +134,7 @@ def semantics(sealed):
             finally:
                 libc.munmap(address, 4096)
     Path("/tmp/workspace-copy").mkdir(exist_ok=True)
-    subprocess.run(["mount", "--bind", "/workspace", "/tmp/workspace-copy"], check=True)
+    subprocess.run(["mount", "--bind", ".", "/tmp/workspace-copy"], check=True)
     try:
         access("/tmp/workspace-copy/protected", sealed)
     finally:
@@ -188,34 +190,35 @@ def snapshot():
         old.close(); ordinary.close()
 
 
-mode = sys.argv[1]
-if mode == "prepare":
-    prepare()
-elif mode in ("sealed", "readonly"):
-    semantics(mode == "sealed")
-elif mode == "snapshot":
-    snapshot()
-elif mode == "precedence":
-    access("config/settings.yaml", False)
-    access("config/secrets.txt", True)
-    access("sealed/readonly/child", True)
-elif mode == "hold":
-    denied("policy active at first workload operation", lambda: Path("protected").read_bytes())
-    gate()
-    denied("held policy remains active", lambda: Path("protected").read_bytes())
-elif mode == "ordinary":
-    check(bool(Path("protected").read_bytes()), "second session can read same inode")
-    Path("protected").write_text("other session write\n")
-    gate()
-elif mode == "late-only":
-    gate()
-    check(Path(".env").read_text() == "late\n", "empty snapshot: late matching inode is normal")
-    Path(".env").write_text("agent write\n")
-    Path("agent").mkdir()
-    Path("agent/.env").write_text("agent-created matching inode\n")
-    check(bool(Path("agent/.env").read_bytes()), "agent-created matching inode remains normal")
-    # The host runner cannot unlink children of this root-owned directory.
-    Path("agent/.env").unlink()
-    Path("agent").rmdir()
-else:
-    raise RuntimeError("unknown workload mode: " + mode)
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    if mode == "prepare":
+        prepare()
+    elif mode in ("sealed", "readonly"):
+        semantics(mode == "sealed")
+    elif mode == "snapshot":
+        snapshot()
+    elif mode == "precedence":
+        access("config/settings.yaml", False)
+        access("config/secrets.txt", True)
+        access("sealed/readonly/child", True)
+    elif mode == "hold":
+        denied("policy active at first workload operation", lambda: Path("protected").read_bytes())
+        gate()
+        denied("held policy remains active", lambda: Path("protected").read_bytes())
+    elif mode == "ordinary":
+        check(bool(Path("protected").read_bytes()), "second session can read same inode")
+        Path("protected").write_text("other session write\n")
+        gate()
+    elif mode == "late-only":
+        gate()
+        check(Path(".env").read_text() == "late\n", "empty snapshot: late matching inode is normal")
+        Path(".env").write_text("agent write\n")
+        Path("agent").mkdir()
+        Path("agent/.env").write_text("agent-created matching inode\n")
+        check(bool(Path("agent/.env").read_bytes()), "agent-created matching inode remains normal")
+        # The host runner cannot unlink children of this root-owned directory.
+        Path("agent/.env").unlink()
+        Path("agent").rmdir()
+    else:
+        raise RuntimeError("unknown workload mode: " + mode)

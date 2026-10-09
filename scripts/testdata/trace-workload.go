@@ -60,7 +60,7 @@ func main() {
 	// No initial delay: this open and this process's exec must be captured.
 	must(os.WriteFile("/tmp/"+token+".write", []byte("first"), 0o644))
 	if len(os.Args) > 3 && (os.Args[3] == "hold" || os.Args[3] == "tty") {
-		must(os.WriteFile("/workspace/"+token+".first", nil, 0o644))
+		must(os.WriteFile(token+".first", nil, 0o644))
 		if os.Args[3] == "tty" {
 			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 			must(err)
@@ -72,7 +72,7 @@ func main() {
 		}
 		deadline := time.Now().Add(90 * time.Second)
 		for {
-			if _, err := os.Stat("/workspace/continue"); err == nil {
+			if _, err := os.Stat("continue"); err == nil {
 				break
 			}
 			if time.Now().After(deadline) {

@@ -18,103 +18,136 @@ const (
 // filesystemPolicyEntry is a startup snapshot, never a runtime path rule.
 // Policy follows enrolled objects; replacement objects remain ordinary.
 type filesystemPolicyEntry struct {
+	Root     int    `json:"root"`
 	Path     string `json:"path"`
 	Mode     uint32 `json:"mode"`
 	NoFollow bool   `json:"no_follow,omitempty"`
 }
 
-func effectiveFilesystemPolicy(cfg *config, relative, name string, inherited uint32) uint32 {
-	if inherited == policySealed || matchesAny(relative, name, cfg.Sealed) {
+func effectiveFilesystemPolicy(cfg *config, workspace, path, relative string, inherited uint32) uint32 {
+	if inherited == policySealed || matchesAny(workspace, path, relative, cfg.Sealed) {
 		return policySealed
 	}
-	if inherited == policyReadonly || matchesAny(relative, name, cfg.Readonly) {
+	if inherited == policyReadonly || matchesAny(workspace, path, relative, cfg.Readonly) {
 		return policyReadonly
 	}
 	return policyNormal
 }
 
-// resolveFilesystemPolicy reuses the existing filename/workspace-relative
-// filepath.Match semantics, including trailing-slash normalization. Overlapping
-// selectors combine by maximum policy, and every protected directory descendant
-// is included rather than only the directory's mount path.
-func resolveFilesystemPolicy(workspace string, cfg *config) ([]filesystemPolicyEntry, error) {
-	if len(cfg.Sealed) == 0 && len(cfg.Readonly) == 0 {
+// resolveFilesystemPolicy walks only selected trees. Explicit restrictions
+// inherit independently of the most specific mount's baseline; both use the
+// same inode snapshot and manifest, with one entry per canonical path.
+func resolveFilesystemPolicy(workspace string, cfg *config, mounts []directoryMount) ([]filesystemPolicyEntry, error) {
+	needed := len(cfg.Sealed) != 0 || len(cfg.Readonly) != 0
+	for _, mount := range mounts {
+		needed = needed || mount.Mode == "ro"
+	}
+	if !needed {
 		return nil, nil
 	}
-	var entries []filesystemPolicyEntry
-	directories := map[string]uint32{".": policyNormal}
-	err := filepath.WalkDir(workspace, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return fmt.Errorf("enumerate filesystem policy: %w", walkErr)
-		}
-		relative, err := filepath.Rel(workspace, path)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
-			return nil
-		}
-		mode := effectiveFilesystemPolicy(cfg, relative, entry.Name(), directories[filepath.Dir(relative)])
-		if mode != policyNormal {
-			entries = append(entries, filesystemPolicyEntry{Path: relative, Mode: mode})
-		}
-		if entry.IsDir() {
-			directories[relative] = mode
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	// Enroll protected links themselves for namespace/metadata operations and
-	// their resolved targets for content access. Keep targets within the trusted
-	// workspace mount. A dangling link is enrolled, but has no existing target.
 	byPath := make(map[string]filesystemPolicyEntry)
-	for len(entries) != 0 {
-		entry := entries[0]
-		entries = entries[1:]
-		if previous, ok := byPath[entry.Path]; ok && previous.Mode >= entry.Mode {
+	directories := make(map[string]uint32)
+	var links []string
+	for root, mount := range mounts {
+		// An ancestor walk already includes this subtree, with its inherited
+		// selectors. Do not walk overlapping roots a second time.
+		covered := false
+		for other, ancestor := range mounts {
+			relative, err := filepath.Rel(ancestor.Path, mount.Path)
+			if other != root && err == nil && filepath.IsLocal(relative) {
+				covered = true
+				break
+			}
+		}
+		if covered {
 			continue
 		}
-		full := filepath.Join(workspace, entry.Path)
-		info, err := os.Lstat(full)
+		err := filepath.WalkDir(mount.Path, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return fmt.Errorf("enumerate filesystem policy: %w", walkErr)
+			}
+			relative, err := filepath.Rel(mount.Path, path)
+			if err != nil {
+				return err
+			}
+			// Include the selected root directory itself, but no unselected
+			// host ancestors, when matching unanchored component sequences.
+			mode := effectiveFilesystemPolicy(cfg, workspace, path,
+				filepath.Join(filepath.Base(mount.Path), relative), directories[filepath.Dir(path)])
+			if d.IsDir() {
+				directories[path] = mode
+			}
+			entry := filesystemPolicyEntry{Root: root, Path: relative, Mode: mode, NoFollow: d.Type()&os.ModeSymlink != 0}
+			for nested, selected := range mounts {
+				rel, err := filepath.Rel(selected.Path, path)
+				if err == nil && filepath.IsLocal(rel) && len(selected.Path) > len(mounts[entry.Root].Path) {
+					entry.Root, entry.Path = nested, rel
+				}
+			}
+			// Keep ordinary objects too: protected symlink targets must be in
+			// this snapshot, and directory targets protect their descendants.
+			byPath[path] = entry
+			if entry.NoFollow && (mode != policyNormal || mounts[entry.Root].Mode == "ro") {
+				links = append(links, path)
+			}
+			return nil
+		})
 		if err != nil {
-			return nil, fmt.Errorf("snapshot %q: %w", entry.Path, err)
+			return nil, err
 		}
-		entry.NoFollow = info.Mode()&os.ModeSymlink != 0
-		byPath[entry.Path] = entry
-		if !entry.NoFollow {
-			continue
-		}
-		target, err := filepath.EvalSymlinks(full)
+	}
+	// WalkDir never follows directory symlinks. Resolve protected links only
+	// after enumerating the selected trees, and propagate explicit restrictions
+	// through that existing snapshot rather than traversing an alias anew.
+	for len(links) != 0 {
+		path := links[0]
+		links = links[1:]
+		entry := byPath[path]
+		target, err := filepath.EvalSymlinks(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("resolve protected symlink %q: %w", entry.Path, err)
+			return nil, fmt.Errorf("resolve protected symlink %q: %w", path, err)
 		}
-		rel, err := filepath.Rel(workspace, target)
-		if err != nil || !filepath.IsLocal(rel) || rel == "." {
-			return nil, fmt.Errorf("protected symlink %q must resolve within the workspace below its root", entry.Path)
+		if _, ok := byPath[target]; !ok {
+			return nil, fmt.Errorf("protected symlink %q must resolve within a selected directory's startup snapshot", path)
 		}
-		err = filepath.WalkDir(target, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
+		// A readonly mount protects the link itself; the target's own mount
+		// determines its baseline. Only explicit selectors propagate here.
+		if entry.Mode == policyNormal {
+			continue
+		}
+		_, directory := directories[target]
+		for candidate, next := range byPath {
+			relative, err := filepath.Rel(target, candidate)
+			if candidate != target && (!directory || err != nil || !filepath.IsLocal(relative)) {
+				continue
 			}
-			rel, err := filepath.Rel(workspace, path)
-			if err != nil {
-				return err
+			if next.Mode >= entry.Mode {
+				continue
 			}
-			entries = append(entries, filesystemPolicyEntry{Path: rel, Mode: entry.Mode})
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("enumerate protected symlink target: %w", err)
+			next.Mode = entry.Mode
+			byPath[candidate] = next
+			if next.NoFollow {
+				links = append(links, candidate)
+			}
 		}
 	}
+	var entries []filesystemPolicyEntry
 	for _, entry := range byPath {
-		entries = append(entries, entry)
+		if mounts[entry.Root].Mode == "ro" && entry.Mode < policyReadonly {
+			entry.Mode = policyReadonly
+		}
+		if entry.Mode != policyNormal {
+			entries = append(entries, entry)
+		}
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Root != entries[j].Root {
+			return entries[i].Root < entries[j].Root
+		}
+		return entries[i].Path < entries[j].Path
+	})
 	return entries, nil
 }

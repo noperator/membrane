@@ -102,8 +102,8 @@ func TestLoadConfigSealed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, data := range map[string]string{
-		filepath.Join(home, ".membrane/config.yaml"): "sealed: [.env]\nreadonly: [config/]\n",
-		filepath.Join(workspace, ".membrane.yaml"):   "sealed: [secrets/, '*.pem']\n",
+		filepath.Join(home, ".membrane/config.yaml"): "sealed: [.env]\nreadonly: [config/]\nmounts: [{path: ../global, mode: ro}, {type: git-root, mode: ro}]\n",
+		filepath.Join(workspace, ".membrane.yaml"):   "sealed: [secrets/, '*.pem']\nmounts: [{path: ../local}]\n",
 	} {
 		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 			t.Fatal(err)
@@ -115,18 +115,61 @@ func TestLoadConfigSealed(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []string{"secrets/", "*.pem"}
+		wantMounts := []directoryMount{{Path: "../local", Mode: "rw"}}
 		if !skipGlobal {
+			wantMounts = append([]directoryMount{{Path: "../global", Mode: "ro"}, {Type: "git-root", Mode: "ro"}}, wantMounts...)
 			want = append([]string{".env"}, want...)
 			if !reflect.DeepEqual(cfg.Readonly, []string{"config/"}) {
 				t.Fatalf("Readonly = %v", cfg.Readonly)
 			}
 		}
+		if !reflect.DeepEqual(cfg.Mounts, wantMounts) {
+			t.Fatalf("skipGlobal=%v: Mounts = %v, want %v", skipGlobal, cfg.Mounts, wantMounts)
+		}
 		if !reflect.DeepEqual(cfg.Sealed, want) {
 			t.Fatalf("skipGlobal=%v: Sealed = %v, want %v", skipGlobal, cfg.Sealed, want)
 		}
-		if got := effectiveFilesystemPolicy(cfg, "secrets", "secrets", policyReadonly); got != policySealed {
+		if got := effectiveFilesystemPolicy(cfg, workspace, filepath.Join(workspace, "secrets"), "secrets", policyReadonly); got != policySealed {
 			t.Fatalf("loaded sealed selector = %d, want SEALED over READONLY", got)
 		}
+	}
+}
+
+func TestMountValidation(t *testing.T) {
+	for _, test := range []struct {
+		mounts string
+		want   []directoryMount
+	}{
+		{"[{path: .}]", []directoryMount{{Path: ".", Mode: "rw"}}},
+		{"[{type: git-root}]", []directoryMount{{Type: "git-root", Mode: "rw"}}},
+		{"[{type: git-root, mode: ro}]", []directoryMount{{Type: "git-root", Mode: "ro"}}},
+		{"[null]", nil}, {"[{}]", nil}, {"[{mode: ro}]", nil},
+		{"[{path: '', type: git-root}]", nil}, {"[{path: ., type: ''}]", nil},
+		{"[{path: ., type: git-root}]", nil}, {"[{path: null, type: git-root}]", nil},
+		{"[{type: unknown}]", nil}, {"[{type: ''}]", nil}, {"[{type: null}]", nil},
+		{"[{type: 1}]", nil}, {"[{type: true}]", nil}, {"[{type: []}]", nil},
+		{"[{type: git-root, typo: ro}]", nil},
+		{"[{type: git-root, mode: ''}]", nil}, {"[{type: git-root, mode: null}]", nil},
+		{"[{type: git-root, mode: read}]", nil},
+		{"[{path: ''}]", nil}, {"[{path: null}]", nil}, {"[{path: 1}]", nil},
+		{"[{path: ., mode: ''}]", nil}, {"[{path: ., mode: null}]", nil}, {"[{path: ., mode: RO}]", nil},
+		{"[{path: ., mode: read}]", nil}, {"[{path: ., mode: true}]", nil}, {"[{path: ., typo: ro}]", nil},
+		{"[.]", nil}, {"{path: .}", nil}, {"[{path: []}]", nil}, {"[{path: ., mode: []}]", nil},
+	} {
+		t.Run(test.mounts, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("mounts: "+test.mounts+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfigFile(path)
+			if test.want != nil {
+				if err != nil || !reflect.DeepEqual(cfg.Mounts, test.want) {
+					t.Fatalf("mount config: %v, %v; want %v", cfg, err, test.want)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), path) {
+				t.Fatalf("invalid mounts must identify config file: %v", err)
+			}
+		})
 	}
 }
 

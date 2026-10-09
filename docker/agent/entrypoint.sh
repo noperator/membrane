@@ -34,8 +34,8 @@ if [ "$MEMBRANE_DIND" = "1" ] && command -v dockerd >/dev/null 2>&1; then
 fi
 
 # Update agent user to match workspace ownership
-WORKSPACE_UID=$(stat -c '%u' /workspace)
-WORKSPACE_GID=$(stat -c '%g' /workspace)
+WORKSPACE_UID=$(stat -c '%u' .)
+WORKSPACE_GID=$(stat -c '%g' .)
 usermod -u "$WORKSPACE_UID" agent >/dev/null 2>&1 || true
 groupmod -g "$WORKSPACE_GID" agent >/dev/null 2>&1 || true
 
@@ -43,7 +43,6 @@ if [ -n "$MEMBRANE_TITLE" ]; then
     { echo -ne "\e]2;${MEMBRANE_TITLE}\007" >/dev/tty; } 2>/dev/null || true
 fi
 
-cd /workspace
 # shellcheck disable=SC2016
 exec capsh --drop=cap_net_admin,cap_net_raw,cap_setpcap,cap_setfcap \
     -- -c 'exec gosu agent "${@:-bash}"' -- "$@"

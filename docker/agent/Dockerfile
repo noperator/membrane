@@ -103,7 +103,6 @@ ENV PATH="${GOPATH}/bin:${PATH}"
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-WORKDIR /workspace
 ENV SHELL=/bin/bash
 ENV CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
 

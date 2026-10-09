@@ -55,7 +55,9 @@ func main() {
 	cmd.Stdin = &buf
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	must(cmd.Run())
-	cmd = exec.Command("docker", "run", "--rm", "--network=none", "-v", "/workspace:/data", "membrane-policy-test", "/probe", "inner")
+	workspace, err := os.Getwd()
+	must(err)
+	cmd = exec.Command("docker", "run", "--rm", "--network=none", "-v", workspace+":/data", "membrane-policy-test", "/probe", "inner")
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	must(cmd.Run())
 }

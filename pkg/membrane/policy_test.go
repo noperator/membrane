@@ -26,16 +26,47 @@ func TestFilesystemPolicySelectorsAndPrecedence(t *testing.T) {
 		{"tree/x/rules.c", policyNormal, policyReadonly},
 		{"tree/x/y/rules.c", policyNormal, policyNormal},
 		{"tree/x/rules.go", policyNormal, policyNormal},
-		{"nested/config/secrets.bin", policyNormal, policyNormal},
+		{"nested/config/secrets.bin", policyNormal, policySealed},
 		{"readonly.txt", policySealed, policySealed},
 		{"unmatched", policyNormal, policyNormal},
 	} {
 		t.Run(test.path, func(t *testing.T) {
-			got := effectiveFilesystemPolicy(cfg, test.path, filepath.Base(test.path), test.inherited)
+			got := effectiveFilesystemPolicy(cfg, "/workspace", filepath.Join("/workspace", test.path), test.path, test.inherited)
 			if got != test.want {
 				t.Fatalf("policy = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestFilesystemSelectorAnchors(t *testing.T) {
+	workspace := "/projects/main [repo]"
+	for _, test := range []struct {
+		pattern, path, relative string
+		want                    bool
+	}{
+		{".env", "/projects/other/nested/.env", "other/nested/.env", true},
+		{".git/", "/projects/other/.git", "other/.git", true},
+		{"...env", "/projects/other/...env", "other/...env", true},
+		{"secrets/credentials.json", "/projects/other/nested/secrets/credentials.json", "other/nested/secrets/credentials.json", true},
+		{"secrets/credentials.json", "/projects/other/mysecrets/credentials.json", "other/mysecrets/credentials.json", false},
+		{"secrets/*.json", "/projects/other/secrets/deep/credentials.json", "other/secrets/deep/credentials.json", false},
+		{"tree/*/rules.[ch]", "/projects/other/tree/x/rules.c", "other/tree/x/rules.c", true},
+		{"./.env", workspace + "/.env", "main [repo]/.env", true},
+		{"./.env", workspace + "/nested/.env", "main [repo]/nested/.env", false},
+		{"./.env", "/projects/other/.env", "other/.env", false},
+		{"./.git/", workspace + "/.git", "main [repo]/.git", true},
+		{"./secrets/credentials.json", workspace + "/secrets/credentials.json", "main [repo]/secrets/credentials.json", true},
+		{"./secrets/credentials.json", "/projects/other/secrets/credentials.json", "other/secrets/credentials.json", false},
+		{"../other/./nested/../*.json", "/projects/other/credentials.json", "other/credentials.json", true},
+		{"../../projects/other/.env", "/projects/other/.env", "other/.env", true},
+		{"/projects/other/./nested/../.env", "/projects/other/.env", "other/.env", true},
+		{"/projects/other/.env", "/projects/other/nested/.env", "other/nested/.env", false},
+		{"projects/other/.env", "/projects/other/.env", "other/.env", false},
+	} {
+		if got := matchesAny(workspace, test.path, test.relative, []string{test.pattern}); got != test.want {
+			t.Errorf("%q against %q: got %v, want %v", test.pattern, test.path, got, test.want)
+		}
 	}
 }
 
@@ -52,7 +83,7 @@ func TestFilesystemPolicyInitialManifest(t *testing.T) {
 		}
 	}
 	cfg := &config{Readonly: []string{"config/", "sealed/nested/"}, Sealed: []string{"config/secrets.txt", "sealed/"}}
-	got, err := resolveFilesystemPolicy(root, cfg)
+	got, err := resolveFilesystemPolicy(root, cfg, []directoryMount{{Path: root, Mode: "rw"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +98,7 @@ func TestFilesystemPolicyInitialManifest(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("manifest = %#v, want %#v", got, want)
 	}
-	if _, err := resolveFilesystemPolicy(filepath.Join(root, "missing"), cfg); err == nil {
+	if _, err := resolveFilesystemPolicy(filepath.Join(root, "missing"), cfg, []directoryMount{{Path: filepath.Join(root, "missing"), Mode: "rw"}}); err == nil {
 		t.Fatal("missing workspace must fail initial enrollment")
 	}
 }
@@ -86,7 +117,7 @@ func TestFilesystemPolicySymlinkTargets(t *testing.T) {
 	if err := os.Symlink("missing", filepath.Join(root, "ordinary-dangling")); err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"sealed-link"}, Readonly: []string{"tree/"}})
+	got, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"sealed-link"}, Readonly: []string{"tree/"}}, []directoryMount{{Path: root, Mode: "rw"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,14 +130,79 @@ func TestFilesystemPolicySymlinkTargets(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("manifest = %#v, want %#v", got, want)
 	}
-	links, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"ordinary-dangling"}})
+	links, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"ordinary-dangling"}}, []directoryMount{{Path: root, Mode: "rw"}})
 	if err != nil || !reflect.DeepEqual(links, []filesystemPolicyEntry{{Path: "ordinary-dangling", Mode: policySealed, NoFollow: true}}) {
 		t.Fatalf("dangling link snapshot = %#v, %v", links, err)
 	}
 	if err := os.Symlink(t.TempDir(), filepath.Join(root, "outside")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"outside"}}); err == nil {
+	if _, err := resolveFilesystemPolicy(root, &config{Sealed: []string{"outside"}}, []directoryMount{{Path: root, Mode: "rw"}}); err == nil {
 		t.Fatal("an escaping protected link must not be silently skipped")
+	}
+}
+
+// Resolve overlap before inode enrollment, even when an ancestor contains a
+// symlink to the writable subtree. Explicit selectors still inherit there.
+func TestReadonlyMountSnapshot(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(parent, "worktree")
+	for _, dir := range []string{workspace, filepath.Join(workspace, "locked/child"), filepath.Join(parent, "empty")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"sibling", "worktree/ordinary", "worktree/locked/child/secret"} {
+		if err := os.WriteFile(filepath.Join(parent, path), []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("worktree", filepath.Join(parent, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{Readonly: []string{"locked/"}, Sealed: []string{"secret"}}
+	for _, reverse := range []bool{false, true} {
+		configured := []directoryMount{{Path: parent, Mode: "ro"}, {Path: "locked/child", Mode: "rw"}, {Path: "../empty", Mode: "ro"}}
+		if reverse {
+			configured[0], configured[2] = configured[2], configured[0]
+		}
+		mounts, err := resolveMounts(workspace, configured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := resolveFilesystemPolicy(workspace, cfg, mounts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make(map[string]uint32)
+		for _, entry := range entries {
+			path := filepath.Join(mounts[entry.Root].Path, entry.Path)
+			if entry.Mode > got[path] {
+				got[path] = entry.Mode
+			}
+		}
+		want := map[string]uint32{
+			parent: policyReadonly, filepath.Join(parent, "sibling"): policyReadonly,
+			filepath.Join(parent, "alias"): policyReadonly, filepath.Join(parent, "empty"): policyReadonly,
+			filepath.Join(workspace, "locked"):              policyReadonly,
+			filepath.Join(workspace, "locked/child"):        policyReadonly,
+			filepath.Join(workspace, "locked/child/secret"): policySealed,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("reverse=%v: snapshot = %v, want %v", reverse, got, want)
+		}
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(parent, "outside")); err != nil {
+		t.Fatal(err)
+	}
+	mounts, err := resolveMounts(workspace, []directoryMount{{Path: parent, Mode: "ro"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveFilesystemPolicy(workspace, cfg, mounts); err == nil {
+		t.Fatal("readonly mount must reject an escaping protected symlink")
 	}
 }

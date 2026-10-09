@@ -5,17 +5,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
 
-func TestAgentCgroupParentDockerArgument(t *testing.T) {
+func TestAgentDockerArguments(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	workspace := t.TempDir()
+	workspace := filepath.Join(t.TempDir(), "workspace with spaces")
 	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent"}}
 	for _, parent := range []string{"/membrane-test", ""} {
 		args, err := buildAgentArgs(workspace, cfg, nil,
-			sessionNames{cgroupParent: parent}, "172.20.0.2", false)
+			sessionNames{cgroupParent: parent, directoryMounts: []directoryMount{{Path: workspace, Mode: "rw"}, {Path: "/extra with spaces", Mode: "ro"}}}, "172.20.0.2", false)
 		if parent == "" {
 			if err == nil {
 				t.Fatal("accepted a workload without a session cgroup")
@@ -26,8 +27,16 @@ func TestAgentCgroupParentDockerArgument(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(args, " ")
-		if strings.Contains(joined, "/workspace/") || strings.Contains(joined, "empty-file") || strings.Contains(joined, "empty-dir") {
+		if strings.Contains(joined, "empty-file") || strings.Contains(joined, "empty-dir") {
 			t.Fatalf("per-path filesystem policy mount returned: %v", args)
+		}
+		mount := slices.Index(args, "--mount")
+		workdir := slices.Index(args, "--workdir")
+		if mount < 0 || args[mount+1] != "type=bind,src="+workspace+",dst="+workspace || workdir < 0 || args[workdir+1] != workspace {
+			t.Fatalf("workspace mount and working directory must preserve the host path: %v", args)
+		}
+		if !slices.Contains(args, "type=bind,src=/extra with spaces,dst=/extra with spaces,readonly") {
+			t.Fatalf("missing readonly additional mount argument: %v", args)
 		}
 		if args[0] != "create" || !strings.Contains(joined, "--cgroup-parent="+parent) {
 			t.Fatalf("missing traced create/parent: %v", args)
@@ -76,12 +85,12 @@ case "$1 $2" in
   'inspect -f') echo 172.20.0.2 ;;
 esac`)
 			s := sessionNames{id: "fixture", agentContainer: "agent", handlerContainer: "handler",
-				internalNetwork: "internal", externalNetwork: "external", caVolume: "ca"}
+				internalNetwork: "internal", externalNetwork: "external", caVolume: "ca", policyRoots: map[int]string{0: dir, 2: "/extra with spaces"}}
 			policy := ""
 			if mode == "policy" {
 				policy = filepath.Join(dir, "policy.json")
 			}
-			cleanup, _, err := startSession(context.Background(), &s, &config{}, mode == "tracing", filepath.Join(dir, "trace.gz"), dir, policy)
+			cleanup, _, err := startSession(context.Background(), &s, &config{}, mode == "tracing", filepath.Join(dir, "trace.gz"), policy)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -101,6 +110,13 @@ esac`)
 			}
 			if strings.Contains(string(args), "--cap-add=BPF") != (mode == "policy" || mode == "tracing") {
 				t.Errorf("BPF capabilities do not match requested features: %s", args)
+			}
+			if mode == "policy" {
+				for _, want := range []string{"type=bind,src=" + dir + ",dst=/policy-roots/0,readonly", "type=bind,src=/extra with spaces,dst=/policy-roots/2,readonly", "MEMBRANE_POLICY_ROOTS=/policy-roots"} {
+					if !strings.Contains(string(args), want) {
+						t.Errorf("missing trusted root %q: %s", want, args)
+					}
+				}
 			}
 			if mode == "drain-failure" {
 				if err := os.WriteFile(filepath.Join(dir, "cgroup/cgroup.events"), []byte("invalid\n"), 0600); err != nil {

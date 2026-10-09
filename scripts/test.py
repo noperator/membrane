@@ -656,7 +656,7 @@ def trace_events(ctx, path):
     return events
 
 
-def check_events(ctx, events, token, port, output, executable="/workspace/trace-workload"):
+def check_events(ctx, events, token, port, output, executable="./trace-workload"):
     check(ctx, any(e.get("type") == "process_exec" and e.get("argv", "").startswith(executable + " " + token + " ")
               for e in events), token + ": first exec")
     check(ctx, any(e.get("type") == "file_open" and e.get("path") == "/tmp/" + token + ".write"
@@ -703,8 +703,10 @@ def check_handler(ctx, session, traced=True, policy=False):
     check(ctx, "/policy-pins" not in mounts and "/sys/fs/bpf" not in mounts,
           "no bpffs or policy pin mount")
     if policy:
+        roots = [m for path, m in mounts.items() if path.startswith("/policy-roots/")]
         check(ctx, "/sys/kernel/security" not in mounts
-              and all(p in mounts and not mounts[p]["RW"] for p in ("/policy-workspace", "/etc/membrane/policy.json")),
+              and roots and all(not m["RW"] for m in roots)
+              and "/etc/membrane/policy.json" in mounts and not mounts["/etc/membrane/policy.json"]["RW"],
               "trusted enrollment mounts")
     return data
 
@@ -772,7 +774,7 @@ def trace_session(ctx, token, port, *, traced=True, dind=False, env=None, termin
     options = ["--trace-log=" + str(directory / "trace.jsonl.gz")]
     if not traced:
         options.append("--no-trace")
-    command = ["/workspace/trace-workload", token, str(port), "tty" if terminal else "hold"]
+    command = ["./trace-workload", token, str(port), "tty" if terminal else "hold"]
     if dind:
         command.append("dind")
     return Session(ctx, directory, command, options=options, env=env, terminal=terminal)
@@ -812,6 +814,8 @@ def group_25(ctx):
         events_a, events_b = trace_events(ctx, a.directory / "trace.jsonl.gz"), trace_events(ctx, b.directory / "trace.jsonl.gz")
         check_events(ctx, events_a, "trace-a", 45101, output_a)
         check_events(ctx, events_b, "trace-b", 45102, output_b)
+        check(ctx, any(e.get("type") == "file_open" and e.get("path") == str(a.directory.resolve() / "trace-a.first")
+                  for e in events_a), "workspace file opens use the canonical host path")
         check(ctx, any(e.get("type") == "file_open" and e.get("path") == "/etc/hostname"
                   and e["flags"] & 3 == 0 for e in events_a), "read-only file opens recorded")
         check(ctx, "trace-b" not in json.dumps(events_a) and "trace-a" not in json.dumps(events_b)
@@ -833,7 +837,7 @@ def group_27(ctx):
         target.write_text("fixture data\n")
     config(ctx, "readonly:\n  - config/\n  - sealed/readonly/\nsealed:\n  - config/secrets.txt\n  - sealed/\n")
     copy_policy_workload(ctx.workdir)
-    result = membrane(ctx, ["sudo", "python3", "/workspace/policy-workload.py", "precedence"])
+    result = membrane(ctx, ["sudo", "python3", "policy-workload.py", "precedence"])
     ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith("PASS "))
     check(ctx, True, "27A overlapping rules start successfully; SEALED dominates READONLY")
 
@@ -856,11 +860,11 @@ def filesystem_case(ctx, sealed):
     copy_policy_workload(base)
     # Linux xattr APIs are absent from macOS Python. Prepare metadata using
     # Linux's view of the same workspace, outside any Membrane policy session.
-    prepared = run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(base) + ":/workspace",
-                         "-w", "/workspace", "--entrypoint=python3", "membrane-agent",
-                         "/workspace/policy-workload.py", "prepare"])
+    prepared = run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(base.resolve()) + ":" + str(base.resolve()),
+                         "-w", str(base.resolve()), "--entrypoint=python3", "membrane-agent",
+                         "policy-workload.py", "prepare"])
     ctx.output.extend(line for line in prepared.stdout.splitlines() if line.startswith(("PASS ", "SKIP ")))
-    with Session(ctx, base, ["sudo", "python3", "/workspace/policy-workload.py",
+    with Session(ctx, base, ["sudo", "python3", "policy-workload.py",
                             "sealed" if sealed else "readonly"], options=["--no-trace"]) as session:
         session.wait_for("ready")
         check(ctx, (base / "protected").read_text() == "protected data\n", "host can read protected object")
@@ -897,6 +901,50 @@ def group_28(ctx):
 
 
 def group_29(ctx):
+    directory = (ctx.workdir / "workspace with spaces").resolve()
+    directory.mkdir()
+    link = ctx.workdir / "launch link"
+    link.symlink_to(directory, target_is_directory=True)
+    (ctx.workdir / "parent-only").write_text("outside workspace\n")
+    sibling = ctx.workdir / "sibling"
+    sibling.mkdir()
+    (sibling / "host-only").write_text("outside workspace\n")
+    command = ["bash", "-c", r'''set -eu
+test "$PWD" = "$1"
+test "$HOME" = /home/agent
+test ! -e /workspace
+test ! -L /workspace
+test ! -e ../parent-only
+test ! -e ../sibling
+test ! -e '../launch link'
+printf '%s\n' "$PWD" > 'written by agent'
+touch ready
+while [ ! -e continue ]; do sleep 0.1; done
+''', "workspace-check", str(directory)]
+    for launch in (directory, link):
+        # Preserve the logical launch path so Run's existing EvalSymlinks is exercised.
+        terminal = launch == link
+        with Session(ctx, launch, [] if terminal else command, options=["--no-trace"], terminal=terminal,
+                     env=dict(ctx.environment, PWD=str(launch))) as session:
+            if terminal:
+                os.write(session.terminal[0], (shlex.join(command) + "\nexit\n").encode())
+            session.wait_for("ready")
+            agent = inspect(ctx, "membrane-agent-" + session.id)
+            mounts = {m["Destination"]: m for m in agent["Mounts"]}
+            check(ctx, agent["Config"]["WorkingDir"] == str(directory)
+                  and str(directory) in mounts and mounts[str(directory)]["Source"] == str(directory)
+                  and mounts[str(directory)]["RW"], launch.name + ": canonical writable mount and working directory")
+            check(ctx, "/workspace" not in mounts
+                  and not any(m["Source"] in {str(p) for p in directory.parents} for m in agent["Mounts"]),
+                  launch.name + ": no workspace alias or host parent mount")
+            check(ctx, (directory / "written by agent").read_text() == str(directory) + "\n",
+                  launch.name + ": command writes to host workspace with spaces; parents and siblings stay isolated")
+            session.release()
+            session.wait()
+            cleaned(ctx, session)
+        for name in ("ready", "continue", "written by agent"):
+            (directory / name).unlink()
+
     build_trace_workload(ctx)
     run(ctx, [ctx.membrane_cmd, "--no-update", "--no-global-config",
               "--trace-log=" + str(ctx.workdir / "exit37.gz"), "--", "bash", "-c", "exit 37"],
@@ -952,17 +1000,21 @@ def group_30(ctx):
         copy_policy_workload(directory)
     a_dir, b_dir = ctx.workdir / "a", ctx.workdir / "b"
     (a_dir / "protected").write_text("sealed\n")
-    (a_dir / "readonly").write_text("readonly\n")
-    (a_dir / ".membrane.yaml").write_text("sealed: [protected]\nreadonly: [readonly]\n")
+    readonly_dir = ctx.workdir / "additional readonly"
+    readonly_dir.mkdir()
+    (readonly_dir / "readonly").write_text("readonly\n")
+    os.link(readonly_dir / "readonly", a_dir / "readonly")
+    os.link(a_dir / "protected", readonly_dir / "sealed-alias")
+    (a_dir / ".membrane.yaml").write_text("sealed: [protected]\nmounts: [{path: '../additional readonly', mode: ro}]\n")
     (b_dir / "other").write_text("B sealed\n")
     os.link(a_dir / "protected", b_dir / "protected")
     os.link(b_dir / "other", a_dir / "other")
     (b_dir / ".membrane.yaml").write_text("sealed: [other]\n")
     shutil.copy2(ctx.workdir / "policy-dind", a_dir / "policy-dind")
     with ExitStack() as stack:
-        a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "/workspace/policy-workload.py", "hold"], options=["--no-trace"]))
+        a = stack.enter_context(Session(ctx, a_dir, ["sudo", "python3", "policy-workload.py", "hold"], options=["--no-trace"]))
         a.wait_for("ready")
-        b = stack.enter_context(Session(ctx, b_dir, ["sudo", "python3", "/workspace/policy-workload.py", "ordinary"], options=["--trace-log=" + str(b_dir / "trace.jsonl.gz")]))
+        b = stack.enter_context(Session(ctx, b_dir, ["sudo", "python3", "policy-workload.py", "ordinary"], options=["--trace-log=" + str(b_dir / "trace.jsonl.gz")]))
         b.wait_for("ready")
         check_handler(ctx, a, traced=False, policy=True)
         check_handler(ctx, b, traced=True, policy=True)
@@ -970,14 +1022,19 @@ def group_30(ctx):
         check(ctx, a.id != b.id and agent_a["HostConfig"]["CgroupParent"] != agent_b["HostConfig"]["CgroupParent"], "concurrent policy sessions have distinct cgroups")
         run(ctx, ["docker", "exec", "membrane-handler-" + a.id, "test", "!", "-d", "/trace"])
         check(ctx, (a_dir / "protected").read_text() == "other session write\n", "other session can mutate the same inode")
-        run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", "/workspace/other"])
+        run(ctx, ["docker", "exec", "-u", "root", "membrane-agent-" + a.id, "cat", str(a_dir.resolve() / "other")])
         run(ctx, ["docker", "run", "--rm", "--network=none", "-v", str(a_dir) + ":/data", "--entrypoint=python3", "membrane-agent", "-c",
                   "from pathlib import Path; p=Path('/data/protected'); p.read_bytes(); p.write_text('unrelated write\\n')"])
         check(ctx, True, "unrelated Docker container remains unrestricted")
         # Explicit original exploit, executing as sandbox root through sudo.
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mkdir", "-p", "/tmp/workspace-copy"])
-        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", "/workspace", "/tmp/workspace-copy"])
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "--bind", str(a_dir.resolve()), "/tmp/workspace-copy"])
+        # Use the alias without spaces for remount (mount's target lookup can
+        # fail on escaped paths), with explicit source and target arguments.
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "-o", "remount,rw,bind",
+                  str(a_dir.resolve()), "/tmp/workspace-copy"])
         probe = """import errno, os
+assert not os.statvfs('/tmp/workspace-copy').f_flag & os.ST_RDONLY
 for name, readable in [('protected', False), ('readonly', True)]:
  for flags, allowed in [(os.O_RDONLY, readable), (os.O_WRONLY, False)]:
   try: fd = os.open('/tmp/workspace-copy/' + name, flags)
@@ -988,8 +1045,8 @@ for name, readable in [('protected', False), ('readonly', True)]:
    if not allowed: raise RuntimeError('mount alias bypass: ' + name)
 """
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "python3", "-c", probe])
-        check(ctx, True, "F-005 sudo bind-mount alias preserves sealed/readonly policy")
-        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "/workspace/policy-dind"], timeout=90)
+        check(ctx, True, "F-005 sudo bind-mount alias and rw remount preserve selectors and additional readonly mount policy")
+        run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", str(a_dir.resolve() / "policy-dind")], timeout=90)
         check(ctx, True, "inner Docker descendant remains subject to policy")
         b.release(); b.wait(); trace_events(ctx, b_dir / "trace.jsonl.gz"); cleaned(ctx, b)
         a.release(); a.wait(); cleaned(ctx, a)
@@ -998,7 +1055,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     failed_dir = ctx.workdir / "failed"
     (failed_dir / "protected").write_text("secret\n")
     (failed_dir / ".membrane.yaml").write_text("sealed: [protected]\n")
-    with Session(ctx, failed_dir, ["touch", "/workspace/first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(failed_dir))) as failed:
+    with Session(ctx, failed_dir, ["touch", "first-instruction"], options=["--no-trace"], env=dict(env, FAIL_BPF="1", BPF_FAILURE_ARTIFACTS=str(failed_dir))) as failed:
         output = failed.wait(expected=None)
         check(ctx, failed.process.returncode != 0 and "load filesystem policy BPF" in output, "LSM setup failure aborts clearly")
         check(ctx, not (failed_dir / "first-instruction").exists(), "failed policy never starts workload")
@@ -1015,7 +1072,7 @@ for name, readable in [('protected', False), ('readonly', True)]:
     (directory / "ordinary").write_text("ordinary\n")
     (directory / "readonly-old").write_text("readonly original\n")
     (directory / ".membrane.yaml").write_text("sealed: [.env, tree/]\nreadonly: [readonly-old]\n")
-    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
+    with Session(ctx, directory, ["sudo", "python3", "policy-workload.py", "snapshot"], options=["--no-trace"]) as snapshot:
         snapshot.wait_for("ready")
         update_snapshot_workspace(ctx, snapshot, r'''
 (directory / ".env").rename(directory / "renamed-env")
@@ -1032,7 +1089,7 @@ os.replace(directory / "temp", directory / "readonly-old")
 
     directory = ctx.workdir / "late"
     (directory / ".membrane.yaml").write_text("sealed: [.env]\n")
-    with Session(ctx, directory, ["sudo", "python3", "/workspace/policy-workload.py", "late-only"], options=["--no-trace"]) as late:
+    with Session(ctx, directory, ["sudo", "python3", "policy-workload.py", "late-only"], options=["--no-trace"]) as late:
         late.wait_for("ready")
         check_handler(ctx, late, traced=False)
         check(ctx, bool(inspect(ctx, "membrane-agent-" + late.id)["HostConfig"]["CgroupParent"]), "empty snapshot still has a supervised workload cgroup")
@@ -1064,11 +1121,11 @@ def lifecycle_session(ctx, token, *, policy=False, env=None):
     # Record workload liveness without relying on Docker's daemon state.
     command = ["python3", "-c", """import os, time
 from pathlib import Path
-Path('/workspace/ready').write_text('ready')
-while not Path('/workspace/continue').exists():
-    Path('/workspace/alive').write_text(str(time.monotonic_ns()))
+Path('ready').write_text('ready')
+while not Path('continue').exists():
+    Path('alive').write_text(str(time.monotonic_ns()))
     time.sleep(0.02)
-Path('/workspace/completed').touch()
+Path('completed').touch()
 """]
     return Session(ctx, directory, command, options=["--no-trace"], env=env)
 
@@ -1126,7 +1183,7 @@ os.kill(pids[0], signal.SIGKILL)
                     before_b = (survivor.directory / "alive").read_text()
                     time.sleep(0.1)
                     check(ctx, (survivor.directory / "alive").read_text() != before_b, component + ": session B remains running")
-                    denied = run(ctx, ["docker", "exec", "membrane-agent-" + survivor.id, "cat", "/workspace/protected"], expected=None)
+                    denied = run(ctx, ["docker", "exec", "membrane-agent-" + survivor.id, "cat", str(survivor.directory.resolve() / "protected")], expected=None)
                     check(ctx, denied.returncode != 0 and "Permission denied" in denied.stderr,
                           component + ": session B filesystem enforcement remains attached")
                 finally:
@@ -1453,6 +1510,345 @@ print('editable-instructions-ok')
         check(ctx, not list((state / "tmp").glob("membrane-instructions-*")), "session copy cleaned up")
 
 
+def group_37(ctx):
+    base = ctx.workdir.resolve()
+    workspace = base / 'primary workspace'
+    shared = base / 'shared library'
+    readonly = base / 'readonly directory'
+    empty = base / 'empty readonly'
+    global_dir = base / 'global library'
+    unselected = base / 'unselected'
+    for directory in (workspace, shared, readonly, empty, global_dir, unselected):
+        directory.mkdir()
+    (base / 'parent-only').write_text('outside\n')
+    (unselected / 'file').write_text('outside\n')
+    (base / 'shared link').symlink_to(shared, target_is_directory=True)
+    (shared / 'outside').symlink_to(unselected, target_is_directory=True)
+    for root in (workspace, shared, global_dir):
+        for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json',
+                     'nested/mysecrets/credentials.json', 'unrelated', 'workspace-readonly',
+                     'global-only', 'global-readonly', 'global-anchor'):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('fixture data\n')
+    (shared / '.membrane.yaml').write_text(json.dumps({
+        'sealed': ['*'], 'mounts': [{'path': str(unselected)}]}))
+    (shared / 'linked tree').mkdir()
+    (shared / 'linked tree/child').write_text('symlink target\n')
+    (shared / 'linked tree/back').symlink_to('.', target_is_directory=True)
+    (workspace / 'selected-link').symlink_to(shared / 'linked tree', target_is_directory=True)
+    (workspace / 'shared-alias').symlink_to(shared, target_is_directory=True)
+    (shared / 'sealed-dangling').symlink_to('missing-target')
+    (shared / 'parent-target').write_text('parent anchored\n')
+    (shared / 'absolute-target.txt').write_text('absolute anchored\n')
+    (shared / 'only-alias').write_text('not traversed via alias\n')
+    (readonly / '.env').write_text('sealed over readonly baseline\n')
+    (readonly / 'file').write_text('readonly\n')
+    copy_policy_workload(workspace)
+    policy_home = base / 'policy-home'
+    (policy_home / '.membrane').mkdir(parents=True)
+    (policy_home / '.membrane/src').symlink_to(REPO_ROOT, target_is_directory=True)
+    (policy_home / '.membrane/config.yaml').write_text(
+        "mounts: [{path: '../global library'}, {path: '../shared library'}]\n"
+        "sealed: [global-only, './global-anchor']\nreadonly: [global-readonly, .env]\n")
+    env = dict(ctx.environment, HOME=str(policy_home))
+    env.setdefault('DOCKER_CONFIG', str(Path.home() / '.docker'))
+    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
+        colima_home = Path.home() / '.colima'
+        if not colima_home.is_dir():
+            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
+        env['COLIMA_HOME'] = str(colima_home)
+    # JSON is YAML; quoting preserves absolute paths and spaces on both hosts.
+    mounts = [{'path': '../shared link'}, {'path': str(shared), 'mode': 'rw'},
+              {'path': str(readonly), 'mode': 'ro'}, {'path': '../empty readonly', 'mode': 'ro'},
+              {'path': '.', 'mode': 'rw'}]
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts, 'sealed': ['.env', 'secrets/credentials.json', 'selected-link', 'sealed-dangling'],
+        'readonly': ['workspace-readonly']}))
+    command = ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+workspace, shared, readonly, empty, global_dir = map(Path, sys.argv[1:6])
+assert Path.cwd() == workspace
+assert not (workspace.parent / 'parent-only').exists()
+assert not (workspace.parent / 'unselected').exists()
+assert not (workspace.parent / 'shared link').exists()
+assert not (shared / 'outside/file').exists()
+assert global_dir.exists() == (sys.argv[6] == 'false')
+for root in [workspace, shared, readonly, empty] + ([global_dir] if global_dir.exists() else []):
+    p['check'](bool(os.statvfs(root).f_flag & os.ST_RDONLY) == (root in (readonly, empty)),
+               'kernel mount mode: ' + str(root))
+if global_dir.exists(): (global_dir / 'written').write_text('global writeback')
+for root in [workspace, shared] + ([global_dir] if global_dir.exists() else []):
+    for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json'):
+        path = root / name
+        p['denied']('unanchored selector: ' + str(path), path.read_bytes)
+    for name in ('unrelated', 'nested/mysecrets/credentials.json'):
+        (root / name).write_text('ordinary writeback')
+    assert (root / 'workspace-readonly').read_bytes()
+    p['denied']('workspace readonly across roots', lambda: (root / 'workspace-readonly').write_text('bad'))
+    if sys.argv[6] == 'false':
+        p['denied']('global sealed across roots', (root / 'global-only').read_bytes)
+        assert (root / 'global-readonly').read_bytes()
+        p['denied']('global readonly across roots', lambda: (root / 'global-readonly').write_text('bad'))
+    else:
+        (root / 'global-only').write_text('global skipped')
+        (root / 'global-readonly').write_text('global skipped')
+if sys.argv[6] == 'false':
+    p['denied']('global relative anchor uses primary workspace', (workspace / 'global-anchor').read_bytes)
+else:
+    (workspace / 'global-anchor').write_text('global skipped')
+(shared / 'global-anchor').write_text('anchor excludes additional root')
+p['denied']('sealed beats readonly mount baseline', (readonly / '.env').read_bytes)
+p['denied']('protected link into selected root', (workspace / 'selected-link/child').read_bytes)
+p['denied']('resolved selected target', (shared / 'linked tree/child').read_bytes)
+p['denied']('protected symlink itself', (workspace / 'selected-link').unlink)
+p['denied']('dangling protected symlink', (shared / 'sealed-dangling').unlink)
+p['denied']('alias cannot clear selected target policy', (workspace / 'shared-alias/.env').read_bytes)
+(shared / 'written').write_text('additional writeback')
+(workspace / 'written').write_text('primary writeback')
+p['access'](readonly / 'file', False, readonly_mount=True)
+p['denied']('readonly child creation', lambda: (readonly / 'new').touch(), readonly_mount=True)
+p['denied']('empty readonly root creation', lambda: (empty / 'new').touch(), readonly_mount=True)
+p['gate']()
+''', str(workspace), str(shared), str(readonly), str(empty), str(global_dir)]
+    for skip in (False, True):
+        # Check HOME before sudo, which may choose root's HOME.
+        probe = ['bash', '-c', 'test "$HOME" = /home/agent && exec "$@"', 'mount-check',
+                 *command, str(skip).lower()]
+        with Session(ctx, workspace, probe, env=env,
+                     options=['--no-trace', '--no-global-config=' + str(skip).lower()]) as session:
+            session.wait_for('ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            expected = {str(p) for p in (workspace, shared, readonly, empty)}
+            if not skip:
+                expected.add(str(global_dir))
+            selected = [m for m in agent['Mounts'] if m['Source'] in expected]
+            check(ctx, len(selected) == len(expected)
+                  and all(m['Source'] == m['Destination'] for m in selected)
+                  and agent['Config']['WorkingDir'] == str(workspace),
+                  f'37 skip global={skip}: canonical mounts, deduplication and primary working directory')
+            check(ctx, all(m['RW'] == (m['Source'] not in (str(readonly), str(empty))) for m in selected),
+                  '37 Docker mount flags honor ro/rw modes')
+            handler = inspect(ctx, 'membrane-handler-' + session.id)
+            roots = [m for m in handler['Mounts'] if m['Destination'].startswith('/policy-roots/')]
+            check(ctx, {m['Source'] for m in roots} == expected
+                  and all(not m['RW'] for m in roots), 'handler gets only selected roots needed for enrollment')
+            session.release()
+            output = session.wait()
+            ctx.output.extend(line for line in output.splitlines() if line.startswith('PASS '))
+            cleaned(ctx, session)
+        for name in ('ready', 'continue'):
+            (workspace / name).unlink()
+        check(ctx, (shared / 'written').read_text() == 'additional writeback'
+              and (workspace / 'written').read_text() == 'primary writeback', '37 rw host writeback')
+    check(ctx, (global_dir / 'written').read_text() == 'global writeback', '37 relative global mount writeback')
+    # Anchors select locations without adding mounts or following directory aliases.
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts,
+        'sealed': ['./.env', './secrets/credentials.json', '../shared library/nested/../parent-target',
+                   str(shared / 'nested/../absolute-*.txt'), '../unselected/file', str(unselected / 'file'),
+                   './shared-alias/only-alias', './missing']}))
+    result = membrane(ctx, ['sudo', 'python3', '-c', """import runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+workspace, shared = map(Path, sys.argv[1:])
+for root in (workspace, shared):
+    for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json'):
+        path = root / name
+        if root == workspace and name in ('.env', 'secrets/credentials.json'):
+            p['denied']('primary anchored selector: ' + name, path.read_bytes)
+        else:
+            assert path.read_bytes()
+            path.write_text('outside primary anchor')
+for name in ('parent-target', 'absolute-target.txt'):
+    p['denied']('additional anchored selector: ' + name, (shared / name).read_bytes)
+assert (workspace / 'shared-alias/only-alias').read_bytes()
+(shared / 'only-alias').write_text('directory alias is not a traversal root')
+assert not (workspace.parent / 'unselected').exists()
+assert not (shared / 'outside/file').exists()
+assert not (workspace / 'missing').exists()
+print('PASS anchors, component boundaries and selected-tree containment', flush=True)
+""", str(workspace), str(shared)], cwd=workspace, env=env)
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'mounts': mounts, 'sealed': ['../shared library/outside']}))
+    result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
+    check(ctx, result.returncode != 0 and 'must resolve within a selected directory' in result.stderr
+          and 'workload-started' not in result.stdout, '37 protected symlink escape rejected before startup')
+    for entries, message in (
+        ([{'path': '../shared library', 'mode': 'invalid'}], 'must be ro or rw'),
+        ([{'path': '../missing'}], 'no such file'),
+        ([{'path': '../parent-only'}], 'not a directory'),
+        ([{'path': '.', 'mode': 'ro'}], 'conflicting modes'),
+        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], 'conflicting modes'),
+    ):
+        (workspace / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
+        check(ctx, result.returncode != 0 and message in result.stderr and 'workload-started' not in result.stdout,
+              '37 invalid mount fails before workload: ' + message)
+    check(ctx, not (base / 'missing').exists(), '37 missing source was not created')
+
+
+def group_38(ctx):
+    repo = (ctx.workdir / 'main repo').resolve()
+    repo.mkdir()
+    # Host-only fixture setup must not run personal hooks or require signing.
+    # Command-local options leave the agent's Git operations below unchanged.
+    git = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false']
+    run(ctx, [*git, 'init', str(repo)])
+    (repo / 'tracked').write_text('original\n')
+    run(ctx, [*git, '-C', str(repo), 'add', 'tracked'])
+    run(ctx, [*git, '-C', str(repo), '-c', 'user.name=Membrane Test', '-c',
+              'user.email=membrane@example.invalid', 'commit', '-m', 'fixture'])
+    workspace = repo / '.worktrees/fix'
+    sibling = repo / '.worktrees/sibling'
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'fix', str(workspace)])
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'sibling', str(sibling)])
+    external = ctx.workdir.resolve() / 'external worktree'
+    unselected = ctx.workdir.resolve() / 'unselected worktree'
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '-b', 'external', str(external)])
+    run(ctx, [*git, '-C', str(repo), 'worktree', 'add', '--detach', str(unselected)])
+    (repo / '.membrane.yaml').write_text(json.dumps({
+        'sealed': ['*'], 'mounts': [{'path': str(unselected)}]}))
+    for directory in ('readonly/rw', 'sealed/rw', 'rw/ro', 'rw/ro-sibling'):
+        (workspace / directory).mkdir(parents=True)
+        (workspace / directory / 'file').write_text('fixture\n')
+    # Unanchored selectors also match outside the primary worktree.
+    (repo / 'sealed').write_text('additional sealed file\n')
+    (repo / 'readonly/rw').mkdir(parents=True)
+    (repo / 'readonly/rw/file').write_text('inherited additional readonly\n')
+    (repo / 'worktree-alias').symlink_to('.worktrees/fix', target_is_directory=True)
+    copy_policy_workload(workspace)
+    mounts = [{'type': 'git-root', 'mode': 'ro'}, {'path': '.', 'mode': 'rw'},
+              {'path': 'readonly/rw', 'mode': 'rw'}, {'path': 'sealed/rw', 'mode': 'rw'},
+              {'path': 'rw', 'mode': 'rw'}, {'path': 'rw/ro', 'mode': 'ro'},
+              {'path': str(repo / 'readonly/rw'), 'mode': 'rw'}]
+    for reverse in (False, True):
+        (workspace / '.membrane.yaml').write_text(json.dumps({
+            'mounts': list(reversed(mounts)) if reverse else mounts,
+            'readonly': ['readonly/', 'sealed/'], 'sealed': ['sealed/']}))
+        command = ['sudo', 'python3', '-c', '''import ctypes, errno, os, runpy, subprocess, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo = Path(sys.argv[1])
+assert str(Path.cwd()) == sys.argv[2]
+for path, readonly in ((repo, True), (Path.cwd(), False), (Path('rw'), False),
+                       (Path('rw/ro'), True), (Path('readonly/rw'), False),
+                       (Path('sealed/rw'), False), (repo / 'readonly/rw', False)):
+    p['check'](bool(os.statvfs(path).f_flag & os.ST_RDONLY) == readonly, 'kernel mount mode: ' + str(path))
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+Path('tracked').write_text('edited\\n')
+Path('created').write_text('new file\\n')
+assert '+edited' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
+Path('rw/ordinary').write_text('ordinary\\n')
+Path('rw/ro-sibling/file').write_text('prefix sibling writable\\n')
+p['access'](repo / 'sealed', True, readonly_mount=True)
+p['access'](repo / 'readonly/rw/file', False)
+p['access'](repo / 'tracked', False, readonly_mount=True)
+p['access'](repo / '.worktrees/sibling/tracked', False, readonly_mount=True)
+p['denied']('readonly repo root', lambda: (repo / 'new').touch(), readonly_mount=True)
+p['denied']('readonly child', lambda: Path('rw/ro/new').touch(), readonly_mount=True)
+p['access']('rw/ro/file', False, readonly_mount=True)
+p['access']('readonly/rw/file', False)
+p['access']('sealed/rw/file', True)
+p['access'](repo / 'worktree-alias/readonly/rw/file', False)
+p['access'](repo / 'worktree-alias/sealed/rw/file', True)
+(repo / 'worktree-alias/tracked').write_text('edited through ancestor alias\\n')
+for args in (['add', 'tracked'], ['update-ref', 'refs/heads/must-not-exist', 'HEAD']):
+    result = subprocess.run(['git', *args], text=True, capture_output=True)
+    assert result.returncode != 0 and any(message in result.stderr for message in
+                                        ('Permission denied', 'Read-only file system')), result
+print('PASS linked-worktree history, diff and edits; metadata writes denied', flush=True)
+p['gate']()
+# Removing this bind exposes the same inodes through the writable parent.
+child = Path('rw/ro').resolve()
+mount_path = str(child)
+for char in (chr(92), chr(9), chr(10), ' '):
+    mount_path = mount_path.replace(char, chr(92) + format(ord(char), '03o'))
+mountinfo = Path('/proc/self/mountinfo')
+mounts = {line for line in mountinfo.read_text().splitlines() if line.split()[4] == mount_path}
+assert mounts, 'unmount target is not a mount point: ' + str(child)
+before = (child / 'file').stat()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.umount2(os.fsencode(child), 0) != 0:
+    error = ctypes.get_errno()
+    # Linux also returns EINVAL for a locked mount, not just an invalid target.
+    assert error in (errno.EPERM, errno.EACCES, errno.EINVAL), os.strerror(error)
+    assert mounts.issubset(mountinfo.read_text().splitlines()), 'mount changed after failed unmount'
+    assert os.statvfs(child).f_flag & os.ST_RDONLY
+    print('SKIP runtime denied readonly child unmount: ' + errno.errorcode[error]
+          + '; eBPF after removal not exercised', flush=True)
+else:
+    assert not os.statvfs(child).f_flag & os.ST_RDONLY
+    assert os.path.samestat(before, (child / 'file').stat())
+    Path('rw/after-unmount').write_text('writable parent\\n')
+    p['access'](child / 'file', False)
+    p['denied']('exposed readonly directory child creation', lambda: (child / 'new').touch())
+    print('PASS readonly child removed; eBPF denies writes through writable parent', flush=True)
+''', str(repo), str(workspace)]
+        with Session(ctx, workspace, command, options=['--no-trace']) as session:
+            session.wait_for('ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            expected = {str(workspace): True, str(repo): False}
+            expected.update({str((workspace / entry['path']).resolve()): entry['mode'] == 'rw'
+                             for entry in mounts if 'path' in entry})
+            selected = [m for m in agent['Mounts'] if m['Source'] in expected]
+            check(ctx, len(selected) == len(expected)
+                  and all(m['Source'] == m['Destination'] and m['RW'] == expected[m['Source']] for m in selected),
+                  f'38 reverse={reverse}: Docker mount flags honor both overlap directions')
+            session.release()
+            output = session.wait()
+            ctx.output.extend(line for line in output.splitlines() if line.startswith(('PASS ', 'SKIP ')))
+        for name in ('ready', 'continue'):
+            (workspace / name).unlink()
+        check(ctx, (workspace / 'tracked').read_text() == 'edited through ancestor alias\n'
+              and (workspace / 'created').read_text() == 'new file\n'
+              and (sibling / 'tracked').read_text() == 'original\n',
+              f'38 reverse={reverse}: both overlap directions, inherited selectors and linked worktree')
+
+    # The main repository need not be an ancestor of the starting worktree.
+    copy_policy_workload(external)
+    (external / '.membrane.yaml').write_text(json.dumps({
+        'mounts': [{'type': 'git-root', 'mode': 'rw'}, {'path': str(repo), 'mode': 'rw'}],
+        'sealed': ['sealed/'], 'readonly': ['readonly/']}))
+    result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, subprocess, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo, workspace, unselected = map(Path, sys.argv[1:])
+assert Path.cwd() == workspace
+assert not os.statvfs(repo).f_flag & os.ST_RDONLY
+assert not os.statvfs(workspace).f_flag & os.ST_RDONLY
+assert not unselected.exists()
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+Path('tracked').write_text('external edit\\n')
+assert '+external edit' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
+(repo / 'tracked').write_text('main repository writeback\\n')
+p['access'](repo / 'sealed', True)
+p['access'](repo / 'readonly/rw/file', False)
+print('PASS external worktree discovers writable main repo; selectors and mount scope preserved', flush=True)
+''', str(repo), str(external), str(unselected)], cwd=external)
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+    check(ctx, (repo / 'tracked').read_text() == 'main repository writeback\n'
+          and (external / 'tracked').read_text() == 'external edit\n', '38 typed rw mount host writeback')
+
+    (repo / '.membrane.yaml').write_text(json.dumps({
+        'mounts': [{'type': 'git-root'}, {'path': str(repo)}]}))
+    membrane(ctx, ['python3', '-c', 'import os, sys; assert os.getcwd() == sys.argv[1]', str(repo)], cwd=repo)
+    check(ctx, True, '38 default rw typed mount deduplicates with primary workspace and explicit path')
+    nonrepo = ctx.workdir.resolve() / 'not a repository'
+    nonrepo.mkdir()
+    for directory, entries, message in (
+        (repo, [{'type': 'git-root', 'mode': 'ro'}], 'conflicting modes'),
+        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}], 'conflicting modes'),
+        (nonrepo, [{'type': 'git-root'}], 'type "git-root": git worktree list'),
+    ):
+        (directory / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=directory, expected=None)
+        check(ctx, result.returncode != 0 and 'mounts[' in result.stderr and message in result.stderr
+              and 'workload-started' not in result.stdout, '38 typed mount fails before workload: ' + message)
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -1488,7 +1884,7 @@ GROUPS = {
     26: TestGroup("readonly filesystem paths", group_26),
     27: TestGroup("filesystem policy precedence", group_27),
     28: TestGroup("tracing modes and failure handling", group_28),
-    29: TestGroup("traced workload lifecycle and terminal I/O", group_29),
+    29: TestGroup("workspace paths, traced workload lifecycle and terminal I/O", group_29),
     30: TestGroup("filesystem LSM isolation, lifecycle and startup snapshot", group_30),
     31: TestGroup("security supervisor fail-stop, cgroup isolation and signals", group_31),
     32: TestGroup("HTTP deny precedence, methods, paths and ports", group_32),
@@ -1496,6 +1892,8 @@ GROUPS = {
     34: TestGroup("deny config merging, CLI precedence and unsupported UDP constraints", group_34),
     35: TestGroup("fragmented HTTP/TLS deny inspection", group_35),
     36: TestGroup("editable agent instructions and global configuration mounts", group_36),
+    37: TestGroup("additional directory mounts, configuration and readonly roots", group_37),
+    38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
 }
 
 
