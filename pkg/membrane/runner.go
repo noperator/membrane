@@ -419,9 +419,9 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"--workdir", workspaceDir,
 	)
 	for _, mount := range s.directoryMounts {
-		// Both modes use writable binds. Readonly is enforced by the inode
-		// snapshot, including aliases and after workload mount manipulation.
-		args = append(args, "--mount", directoryBind(mount.Path, mount.Path, false))
+		// Docker honors mount modes; eBPF independently enforces the
+		// filesystem policy, including through writable aliases.
+		args = append(args, "--mount", directoryBind(mount.Path, mount.Path, mount.Mode == "ro"))
 	}
 
 	home, err := os.UserHomeDir()

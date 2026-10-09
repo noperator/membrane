@@ -1034,6 +1034,7 @@ def group_30(ctx):
         run(ctx, ["docker", "exec", "membrane-agent-" + a.id, "sudo", "mount", "-o", "remount,rw,bind",
                   str(a_dir.resolve()), "/tmp/workspace-copy"])
         probe = """import errno, os
+assert not os.statvfs('/tmp/workspace-copy').f_flag & os.ST_RDONLY
 for name, readable in [('protected', False), ('readonly', True)]:
  for flags, allowed in [(os.O_RDONLY, readable), (os.O_WRONLY, False)]:
   try: fd = os.open('/tmp/workspace-copy/' + name, flags)
@@ -1564,7 +1565,7 @@ def group_37(ctx):
     (workspace / '.membrane.yaml').write_text(json.dumps({
         'mounts': mounts, 'sealed': ['.env', 'secrets/credentials.json', 'selected-link', 'sealed-dangling'],
         'readonly': ['workspace-readonly']}))
-    command = ['sudo', 'python3', '-c', '''import runpy, sys
+    command = ['sudo', 'python3', '-c', '''import os, runpy, sys
 from pathlib import Path
 p = runpy.run_path('policy-workload.py')
 workspace, shared, readonly, empty, global_dir = map(Path, sys.argv[1:6])
@@ -1574,6 +1575,9 @@ assert not (workspace.parent / 'unselected').exists()
 assert not (workspace.parent / 'shared link').exists()
 assert not (shared / 'outside/file').exists()
 assert global_dir.exists() == (sys.argv[6] == 'false')
+for root in [workspace, shared, readonly, empty] + ([global_dir] if global_dir.exists() else []):
+    p['check'](bool(os.statvfs(root).f_flag & os.ST_RDONLY) == (root in (readonly, empty)),
+               'kernel mount mode: ' + str(root))
 if global_dir.exists(): (global_dir / 'written').write_text('global writeback')
 for root in [workspace, shared] + ([global_dir] if global_dir.exists() else []):
     for name in ('.env', 'nested/.env', 'secrets/credentials.json', 'nested/secrets/credentials.json'):
@@ -1603,9 +1607,9 @@ p['denied']('dangling protected symlink', (shared / 'sealed-dangling').unlink)
 p['denied']('alias cannot clear selected target policy', (workspace / 'shared-alias/.env').read_bytes)
 (shared / 'written').write_text('additional writeback')
 (workspace / 'written').write_text('primary writeback')
-p['access'](readonly / 'file', False)
-p['denied']('readonly child creation', lambda: (readonly / 'new').touch())
-p['denied']('empty readonly root creation', lambda: (empty / 'new').touch())
+p['access'](readonly / 'file', False, readonly_mount=True)
+p['denied']('readonly child creation', lambda: (readonly / 'new').touch(), readonly_mount=True)
+p['denied']('empty readonly root creation', lambda: (empty / 'new').touch(), readonly_mount=True)
 p['gate']()
 ''', str(workspace), str(shared), str(readonly), str(empty), str(global_dir)]
     for skip in (False, True):
@@ -1624,6 +1628,8 @@ p['gate']()
                   and all(m['Source'] == m['Destination'] for m in selected)
                   and agent['Config']['WorkingDir'] == str(workspace),
                   f'37 skip global={skip}: canonical mounts, deduplication and primary working directory')
+            check(ctx, all(m['RW'] == (m['Source'] not in (str(readonly), str(empty))) for m in selected),
+                  '37 Docker mount flags honor ro/rw modes')
             handler = inspect(ctx, 'membrane-handler-' + session.id)
             roots = [m for m in handler['Mounts'] if m['Destination'].startswith('/policy-roots/')]
             check(ctx, {m['Source'] for m in roots} == expected
@@ -1722,24 +1728,28 @@ def group_38(ctx):
         (workspace / '.membrane.yaml').write_text(json.dumps({
             'mounts': list(reversed(mounts)) if reverse else mounts,
             'readonly': ['readonly/', 'sealed/'], 'sealed': ['sealed/']}))
-        result = membrane(ctx, ['sudo', 'python3', '-c', '''import runpy, subprocess, sys
+        command = ['sudo', 'python3', '-c', '''import ctypes, errno, os, runpy, subprocess, sys
 from pathlib import Path
 p = runpy.run_path('policy-workload.py')
 repo = Path(sys.argv[1])
 assert str(Path.cwd()) == sys.argv[2]
+for path, readonly in ((repo, True), (Path.cwd(), False), (Path('rw'), False),
+                       (Path('rw/ro'), True), (Path('readonly/rw'), False),
+                       (Path('sealed/rw'), False), (repo / 'readonly/rw', False)):
+    p['check'](bool(os.statvfs(path).f_flag & os.ST_RDONLY) == readonly, 'kernel mount mode: ' + str(path))
 assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
 Path('tracked').write_text('edited\\n')
 Path('created').write_text('new file\\n')
 assert '+edited' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
 Path('rw/ordinary').write_text('ordinary\\n')
 Path('rw/ro-sibling/file').write_text('prefix sibling writable\\n')
-p['access'](repo / 'sealed', True)
+p['access'](repo / 'sealed', True, readonly_mount=True)
 p['access'](repo / 'readonly/rw/file', False)
-p['access'](repo / 'tracked', False)
-p['access'](repo / '.worktrees/sibling/tracked', False)
-p['denied']('readonly repo root', lambda: (repo / 'new').touch())
-p['denied']('readonly child', lambda: Path('rw/ro/new').touch())
-p['access']('rw/ro/file', False)
+p['access'](repo / 'tracked', False, readonly_mount=True)
+p['access'](repo / '.worktrees/sibling/tracked', False, readonly_mount=True)
+p['denied']('readonly repo root', lambda: (repo / 'new').touch(), readonly_mount=True)
+p['denied']('readonly child', lambda: Path('rw/ro/new').touch(), readonly_mount=True)
+p['access']('rw/ro/file', False, readonly_mount=True)
 p['access']('readonly/rw/file', False)
 p['access']('sealed/rw/file', True)
 p['access'](repo / 'worktree-alias/readonly/rw/file', False)
@@ -1747,10 +1757,51 @@ p['access'](repo / 'worktree-alias/sealed/rw/file', True)
 (repo / 'worktree-alias/tracked').write_text('edited through ancestor alias\\n')
 for args in (['add', 'tracked'], ['update-ref', 'refs/heads/must-not-exist', 'HEAD']):
     result = subprocess.run(['git', *args], text=True, capture_output=True)
-    assert result.returncode != 0 and 'Permission denied' in result.stderr, result
+    assert result.returncode != 0 and any(message in result.stderr for message in
+                                        ('Permission denied', 'Read-only file system')), result
 print('PASS linked-worktree history, diff and edits; metadata writes denied', flush=True)
-''', str(repo), str(workspace)], cwd=workspace)
-        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+p['gate']()
+# Removing this bind exposes the same inodes through the writable parent.
+child = Path('rw/ro').resolve()
+mount_path = str(child)
+for char in (chr(92), chr(9), chr(10), ' '):
+    mount_path = mount_path.replace(char, chr(92) + format(ord(char), '03o'))
+mountinfo = Path('/proc/self/mountinfo')
+mounts = {line for line in mountinfo.read_text().splitlines() if line.split()[4] == mount_path}
+assert mounts, 'unmount target is not a mount point: ' + str(child)
+before = (child / 'file').stat()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.umount2(os.fsencode(child), 0) != 0:
+    error = ctypes.get_errno()
+    # Linux also returns EINVAL for a locked mount, not just an invalid target.
+    assert error in (errno.EPERM, errno.EACCES, errno.EINVAL), os.strerror(error)
+    assert mounts.issubset(mountinfo.read_text().splitlines()), 'mount changed after failed unmount'
+    assert os.statvfs(child).f_flag & os.ST_RDONLY
+    print('SKIP runtime denied readonly child unmount: ' + errno.errorcode[error]
+          + '; eBPF after removal not exercised', flush=True)
+else:
+    assert not os.statvfs(child).f_flag & os.ST_RDONLY
+    assert os.path.samestat(before, (child / 'file').stat())
+    Path('rw/after-unmount').write_text('writable parent\\n')
+    p['access'](child / 'file', False)
+    p['denied']('exposed readonly directory child creation', lambda: (child / 'new').touch())
+    print('PASS readonly child removed; eBPF denies writes through writable parent', flush=True)
+''', str(repo), str(workspace)]
+        with Session(ctx, workspace, command, options=['--no-trace']) as session:
+            session.wait_for('ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            expected = {str(workspace): True, str(repo): False}
+            expected.update({str((workspace / entry['path']).resolve()): entry['mode'] == 'rw'
+                             for entry in mounts if 'path' in entry})
+            selected = [m for m in agent['Mounts'] if m['Source'] in expected]
+            check(ctx, len(selected) == len(expected)
+                  and all(m['Source'] == m['Destination'] and m['RW'] == expected[m['Source']] for m in selected),
+                  f'38 reverse={reverse}: Docker mount flags honor both overlap directions')
+            session.release()
+            output = session.wait()
+            ctx.output.extend(line for line in output.splitlines() if line.startswith(('PASS ', 'SKIP ')))
+        for name in ('ready', 'continue'):
+            (workspace / name).unlink()
         check(ctx, (workspace / 'tracked').read_text() == 'edited through ancestor alias\n'
               and (workspace / 'created').read_text() == 'new file\n'
               and (sibling / 'tracked').read_text() == 'original\n',
@@ -1761,11 +1812,13 @@ print('PASS linked-worktree history, diff and edits; metadata writes denied', fl
     (external / '.membrane.yaml').write_text(json.dumps({
         'mounts': [{'type': 'git-root', 'mode': 'rw'}, {'path': str(repo), 'mode': 'rw'}],
         'sealed': ['sealed/'], 'readonly': ['readonly/']}))
-    result = membrane(ctx, ['sudo', 'python3', '-c', '''import runpy, subprocess, sys
+    result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, subprocess, sys
 from pathlib import Path
 p = runpy.run_path('policy-workload.py')
 repo, workspace, unselected = map(Path, sys.argv[1:])
 assert Path.cwd() == workspace
+assert not os.statvfs(repo).f_flag & os.ST_RDONLY
+assert not os.statvfs(workspace).f_flag & os.ST_RDONLY
 assert not unselected.exists()
 assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
 Path('tracked').write_text('external edit\\n')

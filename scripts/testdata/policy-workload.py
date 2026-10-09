@@ -16,11 +16,12 @@ def check(ok, label):
     print("PASS " + label, flush=True)
 
 
-def denied(label, operation):
+def denied(label, operation, *, readonly_mount=False):
     try:
         operation()
     except OSError as error:
-        check(error.errno == errno.EACCES, f"{label}: EACCES (got {error})")
+        expected = (errno.EACCES, errno.EROFS) if readonly_mount else (errno.EACCES,)
+        check(error.errno in expected, f"{label}: {'/'.join(errno.errorcode[e] for e in expected)} (got {error})")
     else:
         raise RuntimeError(label + ": unexpectedly allowed")
 
@@ -31,7 +32,7 @@ def mapped(path, writable=False):
             return view[:1]
 
 
-def access(path, sealed):
+def access(path, sealed, *, readonly_mount=False):
     path = Path(path)
     check(path.stat().st_size > 0, str(path) + ": stat")
     if sealed:
@@ -40,9 +41,10 @@ def access(path, sealed):
     else:
         check(bool(path.read_bytes()), str(path) + ": read")
         check(bool(mapped(path)), str(path) + ": read-only mmap")
-    denied(str(path) + ": write", lambda: path.write_bytes(b"bad"))
-    denied(str(path) + ": append", lambda: open(path, "ab"))
-    denied(str(path) + ": truncate", lambda: os.truncate(path, 0))
+    denied(str(path) + ": write", lambda: path.write_bytes(b"bad"), readonly_mount=readonly_mount)
+    denied(str(path) + ": append", lambda: open(path, "ab"), readonly_mount=readonly_mount)
+    denied(str(path) + ": truncate", lambda: os.truncate(path, 0), readonly_mount=readonly_mount)
+    # ACCESS_COPY is private: Docker readonly alone does not deny this mapping.
     denied(str(path) + ": writable mmap", lambda: mapped(path, True))
 
 

@@ -35,8 +35,8 @@ func TestAgentDockerArguments(t *testing.T) {
 		if mount < 0 || args[mount+1] != "type=bind,src="+workspace+",dst="+workspace || workdir < 0 || args[workdir+1] != workspace {
 			t.Fatalf("workspace mount and working directory must preserve the host path: %v", args)
 		}
-		if !slices.Contains(args, "type=bind,src=/extra with spaces,dst=/extra with spaces") {
-			t.Fatalf("missing additional mount argument: %v", args)
+		if !slices.Contains(args, "type=bind,src=/extra with spaces,dst=/extra with spaces,readonly") {
+			t.Fatalf("missing readonly additional mount argument: %v", args)
 		}
 		if args[0] != "create" || !strings.Contains(joined, "--cgroup-parent="+parent) {
 			t.Fatalf("missing traced create/parent: %v", args)
