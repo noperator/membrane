@@ -265,6 +265,5 @@ deny: []
 
 # `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
-# its argument must be separate items. Treat this as trusted host-level
-# configuration, especially in a workspace .membrane.yaml.
+# its argument must be separate items.
 args:

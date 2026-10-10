@@ -1,11 +1,16 @@
 package membrane
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/creack/pty/v2"
 )
 
 func TestWriteDefaultFiles(t *testing.T) {
@@ -109,6 +114,7 @@ func TestLoadConfigSealed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	trustConfigFixture(t, home, workspace)
 	for _, skipGlobal := range []bool{false, true} {
 		cfg, err := loadConfig(workspace, skipGlobal)
 		if err != nil {
@@ -174,6 +180,13 @@ func TestMountValidation(t *testing.T) {
 }
 
 func TestLoadConfigRejectsLegacyPolicy(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = previous; stdin.Close() })
 	for _, location := range []string{"global", "workspace"} {
 		for _, data := range []string{
 			"ignore: [.env]\n",
@@ -194,6 +207,13 @@ func TestLoadConfigRejectsLegacyPolicy(t *testing.T) {
 				}
 				if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 					t.Fatal(err)
+				}
+				if location == "workspace" {
+					cfg, err := loadConfig(workspace, false)
+					if err != nil || cfg == nil || !reflect.DeepEqual(*cfg, config{}) {
+						t.Fatalf("untrusted config must be ignored before parsing: cfg=%+v err=%v", cfg, err)
+					}
+					trustConfigFixture(t, home, workspace)
 				}
 				cfg, err := loadConfig(workspace, false)
 				if cfg != nil || err == nil || !strings.Contains(err.Error(), path) ||
@@ -234,6 +254,7 @@ func TestDenyConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	trustConfigFixture(t, home, workspace)
 	for _, skip := range []bool{false, true} {
 		cfg, err := loadConfig(workspace, skip)
 		if err != nil {
@@ -287,5 +308,79 @@ func TestDenyValidation(t *testing.T) {
 				t.Fatalf("unclear UDP error: %v", err)
 			}
 		}
+	}
+}
+
+// These parser/merge fixtures explicitly trust only the bytes under test.
+func trustConfigFixture(t *testing.T, home, workspace string) {
+	t.Helper()
+	path := filepath.Join(workspace, ".membrane.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := workspaceTrustStore{Trusted: []workspaceTrustEntry{{Path: path, Hash: workspaceConfigHash(path, data)}}}
+	if err := writeWorkspaceTrust(filepath.Join(home, ".membrane/trusted-workspaces.yaml"), store); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadConfigUsesApprovedBytes(t *testing.T) {
+	home, workspace := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(workspace, ".membrane.yaml")
+	data := []byte("args: [-e, APPROVED=original]\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	stdin, stderr := os.Stdin, os.Stderr
+	os.Stdin, os.Stderr = slave, writer
+	defer func() { os.Stdin, os.Stderr = stdin, stderr }()
+
+	// Wait until the bytes have been read and the trust decision is pending.
+	// Closing the PTY and pipe on timeout also unblocks either side on failure.
+	timer := time.AfterFunc(5*time.Second, func() { master.Close(); reader.Close() })
+	defer timer.Stop()
+	done := make(chan error, 1)
+	go func() {
+		var prompt strings.Builder
+		var b [1]byte
+		for !strings.HasSuffix(prompt.String(), "Trust this workspace config? [y/n/p] ") {
+			if _, err := io.ReadFull(reader, b[:]); err != nil {
+				done <- fmt.Errorf("wait for trust prompt: %w", err)
+				return
+			}
+			prompt.WriteByte(b[0])
+		}
+		if err := os.WriteFile(path, []byte("args: [-e, APPROVED=replaced]\n"), 0600); err != nil {
+			done <- err
+			master.Close()
+			return
+		}
+		_, err := master.Write([]byte("y\n"))
+		done <- err
+	}()
+	cfg, err := loadConfig(workspace, true)
+	if promptErr := <-done; promptErr != nil {
+		t.Fatal(promptErr)
+	}
+	if err != nil || cfg == nil || !reflect.DeepEqual(cfg.Args, []string{"-e", "APPROVED=original"}) {
+		t.Fatalf("must parse approved snapshot: cfg=%+v err=%v", cfg, err)
+	}
+	store, err := readWorkspaceTrust(filepath.Join(home, ".membrane/trusted-workspaces.yaml"))
+	if err != nil || len(store.Trusted) != 1 || store.Trusted[0].Hash != workspaceConfigHash(path, data) {
+		t.Fatalf("must trust the parsed snapshot: store=%+v err=%v", store, err)
 	}
 }
