@@ -1,6 +1,7 @@
 package membrane
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -253,8 +254,8 @@ func ParseAllowEntry(raw string) (NetworkRule, error) {
 }
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
-// (.membrane.yaml) configs. Workspace config lists are appended to local lists.
-// When skipGlobal is true, the global config is skipped entirely.
+// (.membrane.yaml) configs. Trusted workspace lists are appended to local lists.
+// When skipGlobal is true, only the global config is skipped; trust still applies.
 func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -262,7 +263,10 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	}
 
 	localPath := filepath.Join(home, ".membrane", "config.yaml")
-	workspacePath := filepath.Join(workspaceDir, ".membrane.yaml")
+	workspacePath, err := filepath.Abs(filepath.Join(workspaceDir, ".membrane.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace config path: %w", err)
+	}
 
 	base := config{}
 
@@ -277,7 +281,7 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 		}
 	}
 
-	workspace, workspaceErr := loadConfigFile(workspacePath)
+	data, workspaceErr := os.ReadFile(workspacePath)
 	workspaceMissing := os.IsNotExist(workspaceErr)
 
 	if workspaceErr != nil && !workspaceMissing {
@@ -285,12 +289,22 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	}
 
 	if !workspaceMissing {
-		base.Sealed = append(base.Sealed, workspace.Sealed...)
-		base.Readonly = append(base.Readonly, workspace.Readonly...)
-		base.Mounts = append(base.Mounts, workspace.Mounts...)
-		base.Args = append(base.Args, workspace.Args...)
-		base.Allow = append(base.Allow, workspace.Allow...)
-		base.Deny = append(base.Deny, workspace.Deny...)
+		trusted, err := trustWorkspaceConfig(home, workspacePath, data)
+		if err != nil {
+			return nil, err
+		}
+		if trusted {
+			workspace, err := parseConfig(workspacePath, data)
+			if err != nil {
+				return nil, fmt.Errorf("load workspace config: %w", err)
+			}
+			base.Sealed = append(base.Sealed, workspace.Sealed...)
+			base.Readonly = append(base.Readonly, workspace.Readonly...)
+			base.Mounts = append(base.Mounts, workspace.Mounts...)
+			base.Args = append(base.Args, workspace.Args...)
+			base.Allow = append(base.Allow, workspace.Allow...)
+			base.Deny = append(base.Deny, workspace.Deny...)
+		}
 	}
 
 	expandArgs(base.Args)
@@ -302,8 +316,12 @@ func loadConfigFile(path string) (*config, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseConfig(path, data)
+}
+
+func parseConfig(path string, data []byte) (*config, error) {
 	cfg := &config{}
-	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(cfg); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("parse %s: %w", path, err)

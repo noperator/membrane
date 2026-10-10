@@ -226,7 +226,7 @@ exec  ls: ls -lh blog.html
 Configuration is YAML and works at two levels:
 
 - **Global** (`~/.membrane/config.yaml`): Applies to every workspace. Written from the default template on first run. Edit this to set your additional mounts, baseline allow and deny lists, sealed patterns, and readonly patterns. `--no-global-config` skips this entire global configuration and otherwise relies on a local workspace configuration.
-- **Workspace** (`.membrane.yaml` in your project root): Applies to the current workspace only. Lists in the workspace config are appended to the global config, not replaced.
+- **Workspace** (`.membrane.yaml` in the primary workspace): Loaded only after approval. Workspace lists are appended to global lists; workspace scalars retain their existing behavior and do not override global scalars. An untrusted or changed workspace config prompts for approval. Trust permits host-side Docker arguments, environment expansion, and additional mounts. Approvals live on the host in `~/.membrane/trusted-workspaces.yaml`.
 
 ```yaml
 # `mounts` selects additional existing directories at canonical host paths.
@@ -338,8 +338,7 @@ deny:
 
 # `args` lists raw arguments appended when creating the agent container.
 # Environment variables are expanded ($VAR, ${VAR}). Each flag and
-# its argument must be separate items. Treat this as trusted host-level
-# configuration, especially in a workspace .membrane.yaml.
+# its argument must be separate items.
 args:
   - -e
   - MY_API_KEY=abc123
@@ -373,10 +372,10 @@ See [`config.yaml`](config.yaml) for the full default allow list.
 - [ ] return error messages from proxy
 - [ ] add debug flag
 - [ ] BYO container
-- [ ] require explicit trust/approval for workspace `.membrane.yaml`
 
 <details><summary>Completed</summary>
 
+- [x] require explicit trust/approval for workspace `.membrane.yaml`
 - [x] replace Tracee sidecar with built-in eBPF probes
 - [x] support wildcard hostnames
 - [x] support HTTP filters on IP dest

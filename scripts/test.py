@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ class Context:
     output: list = field(default_factory=list)
     invocation: int = 0
     last_command: str = ""
+    trust_fixtures: bool = True
 
 
 def check(ctx, condition, description):
@@ -107,10 +109,46 @@ def run(ctx, args, *, cwd=None, env=None, input=None, timeout=120, expected=0):
 
 def membrane(ctx, command, *, options=(), **kwargs):
     """Run an ordinary non-tracing workload and retain its session ID for logs."""
+    trust_fixture(ctx, kwargs.get("cwd", ctx.workdir), kwargs.get("env", ctx.environment))
     ctx.invocation += 1
     return run(ctx, [ctx.membrane_cmd, "--no-update", "--no-trace", "--no-global-config",
                      f"--session-id-file={ctx.workdir / f'session-id-{ctx.invocation}'}",
                      *options, "--", *command], **kwargs)
+
+
+def isolated_home(ctx, home):
+    """Keep configuration and trust test-owned, retaining the host Docker/VM."""
+    state = home / ".membrane"
+    state.mkdir(parents=True)
+    (state / "src").symlink_to(REPO_ROOT, target_is_directory=True)
+    env = dict(ctx.environment, HOME=str(home))
+    env.setdefault("DOCKER_CONFIG", str(Path.home() / ".docker"))
+    if sys.platform == "darwin" and not env.get("COLIMA_HOME"):
+        colima_home = Path.home() / ".colima"
+        if not colima_home.is_dir():
+            colima_home = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "colima"
+        env["COLIMA_HOME"] = str(colima_home)
+    return env
+
+
+def trust_fixture(ctx, directory, env):
+    """Version-trust existing fixtures; the trust group exercises real approval."""
+    if not ctx.trust_fixtures:
+        return
+    path = Path(directory).resolve() / ".membrane.yaml"
+    if not path.exists():
+        return
+    store = Path(env["HOME"]) / ".membrane/trusted-workspaces.yaml"
+    # Never approve arbitrary workspaces or edit real-user decisions.
+    path.resolve().relative_to(ctx.workdir.resolve())
+    store.resolve().relative_to(ctx.workdir.resolve())
+    entries = json.loads(store.read_text())["trusted"] if store.exists() else []
+    digest = hashlib.sha256(os.fsencode(path) + b"\0" + path.read_bytes()).hexdigest()
+    entries = [entry for entry in entries if entry["path"] != str(path)]
+    entries.append({"path": str(path), "hash": "sha256:" + digest})
+    # JSON is YAML, as with the mount fixtures below.
+    store.write_text(json.dumps({"trusted": entries}))
+    store.chmod(0o600)
 
 
 def config(ctx, contents):
@@ -561,6 +599,7 @@ class Session:
         self.log = None
 
     def __enter__(self):
+        trust_fixture(self.ctx, self.directory, self.env)
         try:
             self.log = (self.directory / "output.log").open("w")
             if self.use_terminal:
@@ -1210,7 +1249,7 @@ os.kill(pids[0], signal.SIGKILL)
             session.wait(expected=None, timeout=45)
             check(ctx, not (session.directory / "completed").exists(), sig.name + ": workload terminated")
             cleaned(ctx, session)
-            path = Path.home() / ".membrane/logs" / ("membrane-handler-" + session.id + ".log.gz")
+            path = Path(session.env["HOME"]) / ".membrane/logs" / ("membrane-handler-" + session.id + ".log.gz")
             with gzip.open(path, "rt") as log:
                 text = log.read()
             check(ctx, "tracer exited cleanly" in text and "exited unexpectedly" not in text,
@@ -1321,18 +1360,8 @@ deny: ['*']
 
 def group_34(ctx):
     policy_home = ctx.workdir / 'policy-home'
-    (policy_home / '.membrane').mkdir(parents=True)
-    (policy_home / '.membrane/src').symlink_to(REPO_ROOT, target_is_directory=True)
+    env = isolated_home(ctx, policy_home)
     global_file = policy_home / '.membrane/config.yaml'
-    env = dict(ctx.environment, HOME=str(policy_home))
-    # Isolate Membrane's global policy while retaining access to the existing
-    # Docker context and Colima VM, whose defaults also depend on HOME.
-    env.setdefault('DOCKER_CONFIG', str(Path.home() / '.docker'))
-    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
-        colima_home = Path.home() / '.colima'
-        if not colima_home.is_dir():
-            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
-        env['COLIMA_HOME'] = str(colima_home)
     global_file.write_text("""allow: [httpbin.org]
 deny:
   - dest: httpbin.org
@@ -1430,15 +1459,7 @@ def group_36(ctx):
     # Isolate user-managed files and shared client home from the real user.
     home = ctx.workdir / "host-home"
     state = home / ".membrane"
-    state.mkdir(parents=True)
-    (state / "src").symlink_to(REPO_ROOT, target_is_directory=True)
-    env = dict(ctx.environment, HOME=str(home))
-    env.setdefault("DOCKER_CONFIG", str(Path.home() / ".docker"))
-    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
-        colima_home = Path.home() / '.colima'
-        if not colima_home.is_dir():
-            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
-        env['COLIMA_HOME'] = str(colima_home)
+    env = isolated_home(ctx, home)
     membrane(ctx, ["true"], env=env)
     check(ctx, all((state / name).read_bytes() == (REPO_ROOT / name).read_bytes()
                    and not (state / name).is_symlink() for name in ("config.yaml", "AGENTS.md")),
@@ -1546,18 +1567,10 @@ def group_37(ctx):
     (readonly / 'file').write_text('readonly\n')
     copy_policy_workload(workspace)
     policy_home = base / 'policy-home'
-    (policy_home / '.membrane').mkdir(parents=True)
-    (policy_home / '.membrane/src').symlink_to(REPO_ROOT, target_is_directory=True)
+    env = isolated_home(ctx, policy_home)
     (policy_home / '.membrane/config.yaml').write_text(
         "mounts: [{path: '../global library'}, {path: '../shared library'}]\n"
         "sealed: [global-only, './global-anchor']\nreadonly: [global-readonly, .env]\n")
-    env = dict(ctx.environment, HOME=str(policy_home))
-    env.setdefault('DOCKER_CONFIG', str(Path.home() / '.docker'))
-    if sys.platform == 'darwin' and not env.get('COLIMA_HOME'):
-        colima_home = Path.home() / '.colima'
-        if not colima_home.is_dir():
-            colima_home = Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'colima'
-        env['COLIMA_HOME'] = str(colima_home)
     # JSON is YAML; quoting preserves absolute paths and spaces on both hosts.
     mounts = [{'path': '../shared link'}, {'path': str(shared), 'mode': 'rw'},
               {'path': str(readonly), 'mode': 'ro'}, {'path': '../empty readonly', 'mode': 'ro'},
@@ -1849,6 +1862,189 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
               and 'workload-started' not in result.stdout, '38 typed mount fails before workload: ' + message)
 
 
+def group_39(ctx):
+    ctx.trust_fixtures = False
+    workspace = (ctx.workdir / 'primary workspace').resolve()
+    workspace.mkdir()
+    shared = ctx.workdir.resolve() / 'additional mount'
+    shared.mkdir()
+    path = workspace / '.membrane.yaml'
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    store = state / 'trusted-workspaces.yaml'
+    (state / 'config.yaml').write_text('''args: [-e, TRUST_GLOBAL=loaded]
+allow: [192.0.2.0/24]
+deny: [192.0.2.128/25]
+dns_resolver: 9.9.9.9
+ssl_insecure: true
+''')
+    ctx.environment['TRUST_HOST_VALUE'] = 'expanded'
+    options = ['--arg=-e', '--arg=TRUST_CLI=loaded', '--sealed=cli-secret',
+               '--allow=203.0.113.0/24']
+    for name in ('cli-secret', 'workspace-secret', 'workspace-readonly'):
+        (workspace / name).write_text('fixture\n')
+
+    def probe(version='', global_enabled=False):
+        return ['python3', '-c', '''import errno, os, sys
+from pathlib import Path
+version, global_enabled, shared = sys.argv[1:]
+assert os.getenv('TRUST_CLI') == 'loaded'
+assert os.getenv('TRUST_GLOBAL', '') == global_enabled
+assert os.getenv('TRUST_WORKSPACE', '') == version
+assert Path(shared).is_dir() == bool(version)
+for name, denied, mode in (('cli-secret', True, 'r'),
+                           ('workspace-secret', bool(version), 'r'),
+                           ('workspace-readonly', bool(version), 'a')):
+    try:
+        with open(name, mode): pass
+    except OSError as error:
+        assert denied and error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), (name, error)
+    else:
+        assert not denied, name
+print('trust-probe-ok', flush=True)
+''', version, 'loaded' if global_enabled else '', str(shared)]
+
+    def choose(answer, command, *, directory=workspace, extra=(), expected=0):
+        with Session(ctx, directory, command, terminal=True,
+                     options=['--no-trace', *options, *extra]) as session:
+            deadline = time.monotonic() + 90
+            while 'Trust this workspace config? [y/n/p] ' not in session.output():
+                if session.process.poll() is not None or time.monotonic() > deadline:
+                    raise TestFailure('39 did not reach trust prompt\n' + session.details('trust prompt'))
+                time.sleep(0.1)
+            text = session.output()
+            check(ctx, str(directory / '.membrane.yaml') in text
+                  and 'host-side arguments, environment expansion, and additional mounts' in text
+                  and 'including future changes' in text, '39 prompt explains path and trust consequences')
+            os.write(session.terminal[0], answer)
+            return session.wait(expected=expected)
+
+    # A missing config must not even consult an unusable trust store.
+    with Session(ctx, workspace, probe(), terminal=True, options=['--no-trace', *options]) as session:
+        output = session.wait()
+    check(ctx, 'workspace config' not in output and not store.exists(),
+          '39 missing config: no prompt or trust-store creation')
+    store.mkdir()
+    membrane(ctx, probe(), cwd=workspace, options=options)
+    store.rmdir()
+
+    contents = json.dumps({'args': ['-e', 'TRUST_WORKSPACE=$TRUST_HOST_VALUE'],
+                           'mounts': [{'path': str(shared)}],
+                           'sealed': ['workspace-secret'], 'readonly': ['workspace-readonly'],
+                           'allow': ['198.51.100.0/24'], 'deny': ['198.51.100.128/25'],
+                           'dns_resolver': '8.8.8.8', 'ssl_insecure': False})
+    path.write_text(contents)
+    result = membrane(ctx, probe(global_enabled=True), cwd=workspace, input='y\n',
+                      options=[*options, '--no-global-config=false'])
+    check(ctx, 'ignoring untrusted workspace config' in result.stderr
+          and 'restrictions and permissions' in result.stderr
+          and 'Trust this workspace config?' not in result.stderr and not store.exists(),
+          '39 piped approval ignored; global and CLI survive; workspace args, mounts and restrictions omitted')
+    for answer in (b'n\n', b'\n', b'unknown\n', b'\x04'):
+        choose(answer, probe())
+        check(ctx, not store.exists(), '39 decline, empty, unknown or EOF creates no trust')
+
+    # Preserve an unrelated, test-owned decision through declines and approvals.
+    other = ctx.workdir.resolve() / 'other/.membrane.yaml'
+    original_store = 'trusted:\n  - path: ' + json.dumps(str(other)) + '\n    permanent: true\n'
+    store.write_text(original_store)
+    choose(b'n\n', probe())
+    check(ctx, store.read_text() == original_store, '39 n leaves existing trust unchanged')
+    choose(b'y\n', probe('expanded', True), extra=['--no-global-config=false'])
+    first_hash = 'sha256:' + hashlib.sha256(os.fsencode(path) + b'\0' + path.read_bytes()).hexdigest()
+    saved = store.read_bytes()
+    check(ctx, first_hash in saved.decode() and str(other) in saved.decode()
+          and saved.decode().count('path:') == 2 and store.stat().st_mode & 0o777 == 0o600,
+          '39 y records path-and-byte hash, preserves other entries and writes mode 0600')
+    result = membrane(ctx, probe('expanded'), cwd=workspace, options=options)
+    check(ctx, 'workspace config' not in result.stderr, '39 unchanged version loads without TTY, including with no-global-config')
+
+    # Observe merged rules and unchanged scalar behavior in a live session.
+    with Session(ctx, workspace, ['bash', '-c', 'touch ready; while [ ! -f continue ]; do sleep .1; done'],
+                 options=['--no-trace', '--no-global-config=false', *options]) as session:
+        session.wait_for('ready')
+        handler = inspect(ctx, 'membrane-handler-' + session.id)
+        rules = json.loads(run(ctx, ['docker', 'exec', 'membrane-handler-' + session.id,
+                                     'cat', '/etc/membrane/network-rules.json']).stdout)
+        check(ctx, [r['cidr'] for r in rules['allow']] == ['192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24']
+              and [r['cidr'] for r in rules['deny']] == ['192.0.2.128/25', '198.51.100.128/25']
+              and 'MEMBRANE_DNS_RESOLVER=9.9.9.9' in handler['Config']['Env']
+              and 'MEMBRANE_SSL_INSECURE=true' in handler['Config']['Env'],
+              '39 trusted list merging and global scalar behavior preserved')
+        session.release()
+        session.wait()
+
+    path.write_text(contents + '\n# byte change\n')
+    result = membrane(ctx, probe(), cwd=workspace, options=options)
+    check(ctx, 'ignoring untrusted' in result.stderr and store.read_bytes() == saved,
+          '39 byte change rejected without TTY and leaves trust unchanged')
+    choose(b'n\n', probe())
+    check(ctx, store.read_bytes() == saved, '39 n preserves previous version trust')
+    choose(b'y\n', probe('expanded'))
+    second_hash = 'sha256:' + hashlib.sha256(os.fsencode(path) + b'\0' + path.read_bytes()).hexdigest()
+    check(ctx, second_hash in store.read_text() and first_hash not in store.read_text()
+          and store.read_text().count('path:') == 2 and str(other) in store.read_text(),
+          '39 renewed approval replaces the version and preserves other entries')
+    relocated = ctx.workdir.resolve() / 'relocated'
+    shutil.copytree(workspace, relocated)
+    result = membrane(ctx, probe(), cwd=relocated, options=options)
+    check(ctx, 'ignoring untrusted' in result.stderr, '39 same contents at another path require trust')
+
+    path.write_text(contents + '\n# permanent approval\n')
+    choose(b'p\n', probe('expanded'))
+    check(ctx, 'sha256:' not in store.read_text() and store.read_text().count('permanent: true') == 2,
+          '39 p replaces version trust with permanent path trust')
+    path.write_text(contents.replace('$TRUST_HOST_VALUE', 'future'))
+    result = membrane(ctx, probe('future'), cwd=workspace, options=options)
+    check(ctx, 'workspace config' not in result.stderr, '39 permanent trust loads future edits without TTY')
+
+    for invalid, message in (('unknown_key: true\n', 'field unknown_key not found'),
+                             ('deny: [null]\n', 'missing destination'),
+                             ('mounts: [{path: ., type: git-root}]\n', 'specify exactly one'),
+                             ('mounts: [{path: ., mode: read}]\n', 'invalid mode')):
+        path.write_text(invalid)
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, expected=None)
+        check(ctx, result.returncode != 0 and message in result.stderr and str(path) in result.stderr
+              and 'workload-started' not in result.stdout, '39 approved config retains strict validation: ' + message)
+    # Invalid values, host Git discovery and missing mount paths stay behind the gate.
+    store.write_text(original_store)
+    path.write_text('mounts: [{type: git-root}, {path: /nonexistent-membrane-trust-mount}]\nargs: [--invalid-trust-option]\n')
+    membrane(ctx, probe(), cwd=workspace, options=options)
+    path.write_text('unknown_key: true\n')
+    membrane(ctx, probe(), cwd=workspace, options=options)
+
+    for bad, message in (('trusted: [', 'invalid YAML'),
+                         ('unrecognized: []\n', 'field unrecognized not found'),
+                         ('trusted: [{path: relative, permanent: true}]\n', 'path must be'),
+                         ('trusted: [{path: "' + str(path) + '", hash: nope}]\n', 'invalid SHA-256'),
+                         (original_store + original_store.split('trusted:\n')[1], 'duplicate workspace'),
+                         (original_store + '---\ntrusted: []\n', 'single YAML document')):
+        store.write_text(bad)
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, expected=None)
+        check(ctx, result.returncode != 0 and str(store) in result.stderr and message in result.stderr
+              and store.read_text() == bad and 'workload-started' not in result.stdout,
+              '39 malformed trust store fails without overwriting: ' + message)
+    store.unlink()
+    store.mkdir()
+    result = membrane(ctx, ['true'], cwd=workspace, expected=None)
+    check(ctx, result.returncode != 0 and 'read workspace trust file' in result.stderr,
+          '39 unreadable trust store fails clearly')
+    store.rmdir()
+    # A parent directory without write permission blocks persistence even though
+    # the missing store was readable. Restore it so artifact cleanup still works.
+    path.write_text(contents)
+    state.chmod(0o500)
+    try:
+        if os.geteuid() != 0:
+            output = choose(b'y\n', ['echo', 'workload-started'], expected=1)
+            check(ctx, 'write workspace trust file' in output and 'workload-started' not in output
+                  and not store.exists(), '39 persistence failure stops loading')
+        else:
+            ctx.output.append('SKIP 39 persistence permission failure: running as root')
+    finally:
+        state.chmod(0o700)
+    check(ctx, not list(state.glob('.trusted-workspaces-*')), '39 no temporary trust files left behind')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -1894,6 +2090,7 @@ GROUPS = {
     36: TestGroup("editable agent instructions and global configuration mounts", group_36),
     37: TestGroup("additional directory mounts, configuration and readonly roots", group_37),
     38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
+    39: TestGroup("workspace configuration trust, persistence and strict parsing", group_39),
 }
 
 
@@ -1904,6 +2101,7 @@ def run_group(number, membrane_cmd, environment, artifacts, keep_artifacts):
     try:
         directory = Path(tempfile.mkdtemp(prefix=f"membrane-test-{number:02}-", dir=artifacts))
         ctx = Context(number, membrane_cmd, directory, environment.copy(), output)
+        ctx.environment = isolated_home(ctx, directory / "test-home")
         GROUPS[number].run(ctx)
         passed = True
     except TestFailure as error:
@@ -1918,7 +2116,8 @@ def run_group(number, membrane_cmd, environment, artifacts, keep_artifacts):
                     session_id = idfile.read_text().strip()
                     if not session_id:
                         continue
-                    log = Path.home() / ".membrane/logs" / f"membrane-handler-{session_id}.log"
+                    log = next(directory.rglob(f"membrane-handler-{session_id}.log*"),
+                               Path.home() / ".membrane/logs" / f"membrane-handler-{session_id}.log")
                     if not log.exists():
                         log = log.with_suffix(".log.gz")
                     if log.exists():
