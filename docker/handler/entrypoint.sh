@@ -262,10 +262,13 @@ done
     exit 1
 }
 
-# Generate ephemeral CA keypair
+# Generate a fresh CA per session; teardown removes its key and the agent's trust.
+# Use year 9999 for an effectively unbounded lifetime (RFC 5280 section 4.1.2.5);
+# openssl req accepts whole days, so round down from the last representable date.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
     -keyout /tmp/ca.key -out /membrane-ca/ca.crt \
-    -days 1 -nodes -subj "/CN=membrane-ca" 2>/dev/null
+    -days "$((($(date -u -d '9999-12-31' +%s) - $(date +%s)) / 86400))" \
+    -nodes -subj "/CN=membrane-ca" 2>/dev/null
 
 # Place CA into mitmproxy confdir
 mkdir -p /tmp/mitmproxy
