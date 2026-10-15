@@ -187,6 +187,9 @@ def group_1(ctx):
          'https://httpbin.org/anything/root')
     http(ctx, '1B plain hostname POST / passthrough (origin decides)', 'HTTP',
          'https://httpbin.org/anything/root', method='POST')
+    exit_status(ctx, '1C session CA remains trusted in year 9999', 0,
+                ['sh', '-c', 'openssl verify -attime "$(date -u -d 9999-01-01 +%s)" '
+                 '-CAfile /etc/ssl/certs/ca-certificates.crt /membrane-ca/ca.crt'])
 
 
 def group_2(ctx):
