@@ -1848,14 +1848,35 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
     check(ctx, (repo / 'tracked').read_text() == 'main repository writeback\n'
           and (external / 'tracked').read_text() == 'external edit\n', '38 typed rw mount host writeback')
 
+    # Merged Git-root entries must not make the primary workspace readonly,
+    # including through a launch symlink; explicit selectors must still apply.
+    link = ctx.workdir / 'repo alias'
+    link.symlink_to(repo, target_is_directory=True)
+    copy_policy_workload(repo)
+    (Path(ctx.environment['HOME']) / '.membrane/config.yaml').write_text(
+        'mounts: [{type: git-root, mode: ro}]\n')
     (repo / '.membrane.yaml').write_text(json.dumps({
-        'mounts': [{'type': 'git-root'}, {'path': str(repo)}]}))
-    membrane(ctx, ['python3', '-c', 'import os, sys; assert os.getcwd() == sys.argv[1]', str(repo)], cwd=repo)
-    check(ctx, True, '38 default rw typed mount deduplicates with primary workspace and explicit path')
+        'mounts': [{'type': 'git-root'}, {'type': 'git-root', 'mode': 'ro'}, {'path': str(repo)}],
+        'sealed': ['sealed/'], 'readonly': ['readonly/']}))
+    for launch in (repo, link):
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+assert str(Path.cwd()) == sys.argv[1]
+assert not os.statvfs('.').f_flag & os.ST_RDONLY
+Path('ordinary').write_text('primary workspace writeback')
+p['access']('sealed', True)
+p['access']('readonly/rw/file', False)
+''', str(repo)], cwd=launch, env=dict(ctx.environment, PWD=str(launch)),
+            options=['--no-global-config=false'])
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, (repo / 'ordinary').read_text() == 'primary workspace writeback',
+              f'38 {launch.name}: repeated same-root Git mounts preserve writable workspace and selectors')
     nonrepo = ctx.workdir.resolve() / 'not a repository'
     nonrepo.mkdir()
     for directory, entries, message in (
-        (repo, [{'type': 'git-root', 'mode': 'ro'}], 'conflicting modes'),
+        # Skipping discovery must not hide an explicit readonly workspace alias.
+        (repo, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(link), 'mode': 'ro'}], 'conflicting modes'),
         (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}], 'conflicting modes'),
         (nonrepo, [{'type': 'git-root'}], 'type "git-root": git worktree list'),
     ):

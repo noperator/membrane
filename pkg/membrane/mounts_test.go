@@ -98,12 +98,6 @@ func TestResolveGitRootMounts(t *testing.T) {
 	} {
 		for _, mode := range []string{"rw", "ro"} {
 			mounts, err := resolveMounts(test.workspace, []directoryMount{{Type: "git-root", Mode: mode}})
-			if test.workspace == test.main && mode == "ro" {
-				if err == nil || !strings.Contains(err.Error(), `mounts[0] type "git-root"`) || !strings.Contains(err.Error(), "conflicting modes") {
-					t.Fatalf("same-root readonly conflict: %v", err)
-				}
-				continue
-			}
 			want := []directoryMount{{Path: test.workspace, Mode: "rw"}}
 			if test.workspace != test.main {
 				want = append(want, directoryMount{Path: test.main, Mode: mode})
