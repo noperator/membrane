@@ -54,6 +54,9 @@ func resolveMounts(workspace string, configured []directoryMount) ([]directoryMo
 		if _, err := os.ReadDir(path); err != nil {
 			return nil, fmt.Errorf("%s: %w", source, err)
 		}
+		if mount.Type == "git-root" && path == workspace {
+			continue
+		}
 		if previous, ok := seen[path]; ok {
 			if previous != mount.Mode {
 				return nil, fmt.Errorf("%s: conflicting modes %s and %s for %q", source, previous, mount.Mode, path)
