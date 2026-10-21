@@ -1692,12 +1692,33 @@ print('PASS anchors, component boundaries and selected-tree containment', flush=
     result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
     check(ctx, result.returncode != 0 and 'must resolve within a selected directory' in result.stderr
           and 'workload-started' not in result.stdout, '37 protected symlink escape rejected before startup')
+    # Equal-path conflicts must reach both bind and inode enforcement. Select
+    # the existing symlink targets so the escape check above is independent.
+    for entries, readonly_root in (
+        ([{'path': '.', 'mode': 'ro'}], workspace),
+        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], shared),
+    ):
+        (workspace / '.membrane.yaml').write_text(json.dumps({
+            'mounts': entries + [{'path': str(shared)}, {'path': str(unselected)}]}))
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+readonly = Path(sys.argv[1])
+assert os.statvfs(readonly).f_flag & os.ST_RDONLY
+p['access'](readonly / 'unrelated', False, readonly_mount=True)
+p['denied']('merged readonly root creation', lambda: (readonly / 'new').touch(), readonly_mount=True)
+if readonly != Path.cwd():
+    Path('written').write_text('primary remains writable')
+''', str(readonly_root)], cwd=workspace, env=env)
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(readonly_root))}' in result.stderr
+              and 'using ro' in result.stderr,
+              '37 equal-path conflict resolves readonly with one warning: ' + readonly_root.name)
     for entries, message in (
         ([{'path': '../shared library', 'mode': 'invalid'}], 'must be ro or rw'),
         ([{'path': '../missing'}], 'no such file'),
         ([{'path': '../parent-only'}], 'not a directory'),
-        ([{'path': '.', 'mode': 'ro'}], 'conflicting modes'),
-        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], 'conflicting modes'),
     ):
         (workspace / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
         result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
@@ -1848,11 +1869,12 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
     check(ctx, (repo / 'tracked').read_text() == 'main repository writeback\n'
           and (external / 'tracked').read_text() == 'external edit\n', '38 typed rw mount host writeback')
 
-    # Merged Git-root entries must not make the primary workspace readonly,
-    # including through a launch symlink; explicit selectors must still apply.
+    # Repeated equal-path Git requests must make the workspace readonly,
+    # including through a launch symlink, while preserving explicit selectors.
     link = ctx.workdir / 'repo alias'
     link.symlink_to(repo, target_is_directory=True)
     copy_policy_workload(repo)
+    (repo / 'ordinary').write_text('primary workspace readonly fixture')
     (Path(ctx.environment['HOME']) / '.membrane/config.yaml').write_text(
         'mounts: [{type: git-root, mode: ro}]\n')
     (repo / '.membrane.yaml').write_text(json.dumps({
@@ -1863,27 +1885,134 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
 from pathlib import Path
 p = runpy.run_path('policy-workload.py')
 assert str(Path.cwd()) == sys.argv[1]
-assert not os.statvfs('.').f_flag & os.ST_RDONLY
-Path('ordinary').write_text('primary workspace writeback')
-p['access']('sealed', True)
-p['access']('readonly/rw/file', False)
+assert os.statvfs('.').f_flag & os.ST_RDONLY
+p['access']('ordinary', False, readonly_mount=True)
+p['denied']('readonly workspace creation', lambda: Path('new').touch(), readonly_mount=True)
+p['access']('sealed', True, readonly_mount=True)
+p['access']('readonly/rw/file', False, readonly_mount=True)
 ''', str(repo)], cwd=launch, env=dict(ctx.environment, PWD=str(launch)),
             options=['--no-global-config=false'])
         ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
-        check(ctx, (repo / 'ordinary').read_text() == 'primary workspace writeback',
-              f'38 {launch.name}: repeated same-root Git mounts preserve writable workspace and selectors')
-    nonrepo = ctx.workdir.resolve() / 'not a repository'
-    nonrepo.mkdir()
-    for directory, entries, message in (
-        # Skipping discovery must not hide an explicit readonly workspace alias.
-        (repo, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(link), 'mode': 'ro'}], 'conflicting modes'),
-        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}], 'conflicting modes'),
-        (nonrepo, [{'type': 'git-root'}], 'type "git-root": git worktree list'),
+        check(ctx, (repo / 'ordinary').read_text() == 'primary workspace readonly fixture'
+              and result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(repo))}' in result.stderr
+              and 'primary workspace: rw' in result.stderr and 'using ro' in result.stderr,
+              f'38 {launch.name}: repeated same-root Git mounts resolve readonly and preserve selectors')
+    # Explicit/discovered conflicts must merge regardless of whether the
+    # canonical repository is the workspace or an additional mount.
+    for directory, entries in (
+        (repo, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(link), 'mode': 'ro'}]),
+        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}]),
     ):
         (directory / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
-        result = membrane(ctx, ['echo', 'workload-started'], cwd=directory, expected=None)
-        check(ctx, result.returncode != 0 and 'mounts[' in result.stderr and message in result.stderr
-              and 'workload-started' not in result.stdout, '38 typed mount fails before workload: ' + message)
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo = Path(sys.argv[1])
+assert os.statvfs(repo).f_flag & os.ST_RDONLY
+assert bool(os.statvfs('.').f_flag & os.ST_RDONLY) == (Path.cwd() == repo)
+p['access'](repo / 'tracked', False, readonly_mount=True)
+if Path.cwd() != repo:
+    Path('tracked').write_text('workspace remains writable')
+''', str(repo)], cwd=directory)
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(repo))}' in result.stderr
+              and 'using ro' in result.stderr,
+              '38 explicit/discovered conflict resolves readonly: ' + directory.name)
+    # Metadata-only discovery must keep sources editable without exposing other
+    # checkouts. Actual Git writes and private mmap distinguish rw, mount ro,
+    # and inode policy enforcement; Docker inspection also catches duplicate binds.
+    metadata = repo / '.git'
+    # Reuse the main-checkout launch alias to check canonical discovery too.
+    for directory, launch, mode in ((repo, link, 'ro'), (workspace, workspace, 'ro'), (external, external, 'rw')):
+        (directory / '.membrane.yaml').write_text(json.dumps({
+            'mounts': [{'type': 'git-meta', 'mode': mode}]}))
+        command = ['sudo', 'python3', '-c', '''import os, runpy, subprocess, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo, metadata, sibling, workspace = map(Path, sys.argv[1:5])
+readonly = sys.argv[5] == 'ro'
+assert Path.cwd() == workspace
+assert not os.statvfs('.').f_flag & os.ST_RDONLY
+assert bool(os.statvfs(metadata).f_flag & os.ST_RDONLY) == readonly
+assert (metadata / 'worktrees/sibling/HEAD').read_text()
+if workspace != repo:
+    for source in (repo / 'tracked', sibling / 'tracked'):
+        assert not source.exists(), 'unselected checkout exposed: ' + str(source)
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+Path('tracked').write_text('metadata-only edit\\n')
+assert '+metadata-only edit' in subprocess.check_output(['git', 'diff', '--', 'tracked'], text=True)
+for args in (['add', 'tracked'], ['update-ref', 'refs/heads/git-meta-write', 'HEAD']):
+    result = subprocess.run(['git', *args], text=True, capture_output=True)
+    if readonly:
+        assert result.returncode != 0 and any(message in result.stderr for message in
+                                            ('Permission denied', 'Read-only file system')), result
+    else:
+        assert result.returncode == 0, result
+if readonly:
+    p['access'](metadata / 'HEAD', False, readonly_mount=True)
+    p['denied']('readonly metadata child creation', lambda: (metadata / 'new').touch(), readonly_mount=True)
+else:
+    assert '+metadata-only edit' in subprocess.check_output(['git', 'diff', '--cached', '--', 'tracked'], text=True)
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/heads/git-meta-write']) == subprocess.check_output(['git', 'rev-parse', 'HEAD'])
+print('PASS git-meta history, source edits and metadata ' + sys.argv[5], flush=True)
+p['gate']()
+''', str(repo), str(metadata), str(sibling), str(directory), mode]
+        with Session(ctx, launch, command, options=['--no-trace'],
+                     env=dict(ctx.environment, PWD=str(launch))) as session:
+            session.wait_for('ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            expected = {str(directory): True, str(metadata): mode == 'rw'}
+            selected = [m for m in agent['Mounts'] if m['Source'] in
+                        {str(path) for path in (repo, workspace, external, sibling, metadata)}]
+            check(ctx, len(selected) == len(expected)
+                  and {m['Destination'] for m in selected} == set(expected)
+                  and all(m['Source'] == m['Destination'] and m['RW'] == expected[m['Source']] for m in selected),
+                  f'38 git-meta {directory.name} {mode}: only workspace and common metadata binds')
+            session.release()
+            output = session.wait()
+            ctx.output.extend(line for line in output.splitlines() if line.startswith('PASS '))
+        for name in ('ready', 'continue'):
+            (directory / name).unlink()
+        check(ctx, 'conflicting mount modes' not in output
+              and (directory / 'tracked').read_text() == 'metadata-only edit\n',
+              f'38 git-meta {directory.name} {mode}: source writeback without overlap warnings')
+    check(ctx, (metadata / 'refs/heads/git-meta-write').read_text().strip()
+          == run(ctx, [*git, '-C', str(repo), 'rev-parse', 'HEAD']).stdout.strip(),
+          '38 git-meta rw persists Git metadata writes on host')
+
+    # Bare metadata equals the implicit workspace. The ro request must reach
+    # both mount and inode enforcement even when combined with git-root: rw.
+    bare = ctx.workdir.resolve() / 'bare repo.git'
+    run(ctx, [*git, 'clone', '--bare', str(repo), str(bare)])
+    copy_policy_workload(bare)
+    (bare / '.membrane.yaml').write_text(json.dumps({
+        'mounts': [{'type': 'git-meta', 'mode': 'ro'}, {'type': 'git-root', 'mode': 'rw'}]}))
+    result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, subprocess
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+assert os.statvfs('.').f_flag & os.ST_RDONLY
+assert subprocess.check_output(['git', 'log', '-1', '--format=%s'], text=True).strip() == 'fixture'
+p['access']('HEAD', False, readonly_mount=True)
+p['denied']('bare metadata creation', lambda: Path('new').touch(), readonly_mount=True)
+result = subprocess.run(['git', 'update-ref', 'refs/heads/must-not-exist', 'HEAD'], text=True, capture_output=True)
+assert result.returncode != 0 and any(message in result.stderr for message in
+                                    ('Permission denied', 'Read-only file system')), result
+'''], cwd=bare)
+    ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+    check(ctx, result.stderr.count('membrane: warning: conflicting mount modes') == 1
+          and f'conflicting mount modes for {json.dumps(str(bare))}' in result.stderr
+          and 'using ro' in result.stderr,
+          '38 combined selectors in bare workspace resolve readonly with one warning')
+
+    nonrepo = ctx.workdir.resolve() / 'not a repository'
+    nonrepo.mkdir()
+    for kind, command in (('git-root', 'git worktree list'), ('git-meta', 'git rev-parse --git-common-dir')):
+        (nonrepo / '.membrane.yaml').write_text(json.dumps({'mounts': [{'type': kind}]}))
+        result = membrane(ctx, ['echo', 'workload-started'], cwd=nonrepo, expected=None)
+        check(ctx, result.returncode != 0 and f'mounts[0] type "{kind}": {command}' in result.stderr
+              and 'workload-started' not in result.stdout, f'38 {kind}: non-repository fails before workload')
 
 
 def group_39(ctx):
@@ -2031,8 +2160,9 @@ print('trust-probe-ok', flush=True)
               and 'workload-started' not in result.stdout, '39 approved config retains strict validation: ' + message)
     # Invalid values, host Git discovery and missing mount paths stay behind the gate.
     store.write_text(original_store)
-    path.write_text('mounts: [{type: git-root}, {path: /nonexistent-membrane-trust-mount}]\nargs: [--invalid-trust-option]\n')
-    membrane(ctx, probe(), cwd=workspace, options=options)
+    for kind in ('git-root', 'git-meta'):
+        path.write_text(f'mounts: [{{type: {kind}}}, {{path: /nonexistent-membrane-trust-mount}}]\nargs: [--invalid-trust-option]\n')
+        membrane(ctx, probe(), cwd=workspace, options=options)
     path.write_text('unknown_key: true\n')
     membrane(ctx, probe(), cwd=workspace, options=options)
 

@@ -13,10 +13,25 @@ import (
 func TestAgentDockerArguments(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	workspace := filepath.Join(t.TempDir(), "workspace with spaces")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent"}}
-	for _, parent := range []string{"/membrane-test", ""} {
+	// A merged readonly workspace must reach Docker without losing its workdir
+	// or adding a second bind for the same destination.
+	for _, test := range []struct{ parent, mode string }{{"/membrane-test", "rw"}, {"/membrane-test", "ro"}, {"", "rw"}} {
+		parent := test.parent
+		mounts, _, err := resolveMountsWithWarnings(t, workspace, []directoryMount{{Path: ".", Mode: test.mode}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mounts = append(mounts, directoryMount{Path: "/extra with spaces", Mode: "ro"})
 		args, err := buildAgentArgs(workspace, cfg, nil,
-			sessionNames{cgroupParent: parent, directoryMounts: []directoryMount{{Path: workspace, Mode: "rw"}, {Path: "/extra with spaces", Mode: "ro"}}}, "172.20.0.2", false)
+			sessionNames{cgroupParent: parent, directoryMounts: mounts}, "172.20.0.2", false)
 		if parent == "" {
 			if err == nil {
 				t.Fatal("accepted a workload without a session cgroup")
@@ -32,7 +47,11 @@ func TestAgentDockerArguments(t *testing.T) {
 		}
 		mount := slices.Index(args, "--mount")
 		workdir := slices.Index(args, "--workdir")
-		if mount < 0 || args[mount+1] != "type=bind,src="+workspace+",dst="+workspace || workdir < 0 || args[workdir+1] != workspace {
+		wantBind := "type=bind,src=" + workspace + ",dst=" + workspace
+		if test.mode == "ro" {
+			wantBind += ",readonly"
+		}
+		if mount < 0 || args[mount+1] != wantBind || strings.Count(joined, "dst="+workspace) != 1 || workdir < 0 || args[workdir+1] != workspace {
 			t.Fatalf("workspace mount and working directory must preserve the host path: %v", args)
 		}
 		if !slices.Contains(args, "type=bind,src=/extra with spaces,dst=/extra with spaces,readonly") {

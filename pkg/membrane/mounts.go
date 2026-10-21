@@ -8,30 +8,50 @@ import (
 	"strings"
 )
 
-// The primary workspace is always the first, implicit writable mount.
+// The primary workspace is always first, with an implicit rw request.
 func resolveMounts(workspace string, configured []directoryMount) ([]directoryMount, error) {
 	mounts := []directoryMount{{Path: workspace, Mode: "rw"}}
-	seen := map[string]string{workspace: "rw"}
+	type mountSource struct {
+		index  int
+		label  string
+		warned bool
+	}
+	seen := map[string]mountSource{workspace: {label: "primary workspace"}}
 	for i, mount := range configured {
 		path := mount.Path
 		source := fmt.Sprintf("mounts[%d] path %q", i, path)
-		if mount.Type == "git-root" {
+		if mount.Type != "" {
 			source = fmt.Sprintf("mounts[%d] type %q", i, mount.Type)
-			cmd := exec.Command("git", "-C", workspace, "worktree", "list", "--porcelain", "-z")
+			args := []string{"worktree", "list", "--porcelain", "-z"}
+			command := "git worktree list"
+			if mount.Type == "git-meta" {
+				args = []string{"rev-parse", "--path-format=absolute", "--git-common-dir"}
+				command = "git rev-parse --git-common-dir"
+			}
+			cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
 			out, err := cmd.Output()
 			if err != nil {
-				return nil, fmt.Errorf("%s: git worktree list: %w: %s", source, err, strings.TrimSpace(stderr.String()))
+				return nil, fmt.Errorf("%s: %s: %w: %s", source, command, err, strings.TrimSpace(stderr.String()))
 			}
-			// Git lists the main worktree (or bare repository) first, with
-			// worktree as its first attribute. NULs preserve spaces/newlines.
-			record, _, complete := strings.Cut(string(out), "\x00\x00")
-			attribute, _, _ := strings.Cut(record, "\x00")
-			var valid bool
-			path, valid = strings.CutPrefix(attribute, "worktree ")
-			if !complete || !valid || !filepath.IsAbs(path) {
-				return nil, fmt.Errorf("%s: git worktree list returned no usable repository path", source)
+			if mount.Type == "git-meta" {
+				// Only the final newline belongs to Git; whitespace before it
+				// can be part of the common directory's name.
+				path = strings.TrimSuffix(string(out), "\n")
+			} else {
+				// Git lists the main worktree (or bare repository) first, with
+				// worktree as its first attribute. NULs preserve spaces/newlines.
+				record, _, complete := strings.Cut(string(out), "\x00\x00")
+				attribute, _, _ := strings.Cut(record, "\x00")
+				var valid bool
+				path, valid = strings.CutPrefix(attribute, "worktree ")
+				if !complete || !valid {
+					path = ""
+				}
+			}
+			if !filepath.IsAbs(path) {
+				return nil, fmt.Errorf("%s: %s returned no usable repository path", source, command)
 			}
 			source += fmt.Sprintf(" path %q", path)
 		}
@@ -54,16 +74,20 @@ func resolveMounts(workspace string, configured []directoryMount) ([]directoryMo
 		if _, err := os.ReadDir(path); err != nil {
 			return nil, fmt.Errorf("%s: %w", source, err)
 		}
-		if mount.Type == "git-root" && path == workspace {
-			continue
-		}
+		// Merge in place to preserve the workspace position and policy root indexes.
 		if previous, ok := seen[path]; ok {
-			if previous != mount.Mode {
-				return nil, fmt.Errorf("%s: conflicting modes %s and %s for %q", source, previous, mount.Mode, path)
+			if mounts[previous.index].Mode != mount.Mode {
+				if !previous.warned {
+					fmt.Fprintf(os.Stderr, "membrane: warning: conflicting mount modes for %q (%s: %s; %s: %s); using ro\n",
+						path, previous.label, mounts[previous.index].Mode, source, mount.Mode)
+					previous.warned = true
+					seen[path] = previous
+				}
+				mounts[previous.index].Mode = "ro"
 			}
 			continue
 		}
-		seen[path] = mount.Mode
+		seen[path] = mountSource{index: len(mounts), label: source}
 		mounts = append(mounts, directoryMount{Path: path, Mode: mount.Mode})
 	}
 	return mounts, nil
