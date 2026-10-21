@@ -351,8 +351,8 @@ func parseConfig(path string, data []byte) (*config, error) {
 		if node.ShortTag() != "!!str" || value == "" {
 			return nil, fmt.Errorf("parse %s: mounts[%d]: %s must be a nonempty string", path, i, field)
 		}
-		if hasType && mount.Type != "git-root" {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: unsupported type %q: must be git-root", path, i, mount.Type)
+		if hasType && mount.Type != "git-root" && mount.Type != "git-meta" {
+			return nil, fmt.Errorf("parse %s: mounts[%d]: unsupported type %q: must be git-root or git-meta", path, i, mount.Type)
 		}
 		mode, present := entry["mode"]
 		if !present {

@@ -121,7 +121,9 @@ func TestResolveMounts(t *testing.T) {
 	}
 }
 
-func TestResolveGitRootMounts(t *testing.T) {
+// A linked checkout needs the shared metadata, not just its private worktree
+// directory. These real Git layouts also catch path trimming and .git guessing.
+func TestResolveGitMounts(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -134,83 +136,168 @@ func TestResolveGitRootMounts(t *testing.T) {
 		}
 	}
 	repo := filepath.Join(root, "main repo\nwith newline")
-	linked := filepath.Join(root, "linked worktree")
-	bare := filepath.Join(root, "bare repo.git")
+	linked := filepath.Join(repo, "worktrees", "linked worktree")
+	bare := filepath.Join(root, "bare repo.git \n")
 	bareLinked := filepath.Join(root, "bare linked worktree")
+	separate := filepath.Join(root, "separate checkout")
+	metadata := filepath.Join(root, "shared metadata\nwith trailing space ")
 	git("init", repo)
 	git("-C", repo, "-c", "user.name=Membrane Test", "-c", "user.email=membrane@example.invalid",
 		"commit", "--allow-empty", "-m", "fixture")
 	git("-C", repo, "worktree", "add", "--detach", linked)
 	git("clone", "--bare", repo, bare)
 	git("-C", bare, "worktree", "add", "--detach", bareLinked)
-	for _, workspace := range []string{repo, linked} {
+	git("init", "--separate-git-dir", metadata, separate)
+	// Git can report a common directory through an alias; the bind must still
+	// use its canonical target, including whitespace in the directory name.
+	metadataAlias := filepath.Join(root, "metadata alias\nwith trailing space ")
+	if err := os.Symlink(metadata, metadataAlias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(separate, ".git"), []byte("gitdir: "+metadataAlias+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, workspace := range []string{repo, linked, bareLinked, separate} {
 		if err := os.Mkdir(filepath.Join(workspace, "subdir"), 0700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, test := range []struct{ workspace, main string }{
-		{repo, repo}, {filepath.Join(repo, "subdir"), repo},
-		{linked, repo}, {filepath.Join(linked, "subdir"), repo},
-		{bare, bare}, {bareLinked, bare},
-	} {
-		for _, mode := range []string{"rw", "ro"} {
-			mounts, warnings, err := resolveMountsWithWarnings(t, test.workspace, []directoryMount{{Type: "git-root", Mode: mode}})
-			want := []directoryMount{{Path: test.workspace, Mode: "rw"}}
-			if test.workspace != test.main {
-				want = append(want, directoryMount{Path: test.main, Mode: mode})
-			} else {
-				want[0].Mode = mode
-			}
-			if err != nil || !reflect.DeepEqual(mounts, want) {
-				t.Fatalf("workspace %q mode %s: %v, %v; want %v", test.workspace, mode, mounts, err, want)
-			}
-			// Main and bare workspaces must honor discovery just like explicit
-			// equal-path mounts; distinct parent/child paths remain silent.
-			if test.workspace == test.main && mode == "ro" {
-				if strings.Count(warnings, "\n") != 1 || !strings.Contains(warnings, fmt.Sprintf("%q", test.main)) {
-					t.Fatalf("expected one warning with the escaped canonical path: %q", warnings)
+	for _, kind := range []string{"git-root", "git-meta"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, test := range []struct{ workspace, main, common string }{
+				{repo, repo, filepath.Join(repo, ".git")},
+				{filepath.Join(repo, "subdir"), repo, filepath.Join(repo, ".git")},
+				{linked, repo, filepath.Join(repo, ".git")},
+				{filepath.Join(linked, "subdir"), repo, filepath.Join(repo, ".git")},
+				{bare, bare, bare}, {bareLinked, bare, bare},
+				{filepath.Join(bareLinked, "subdir"), bare, bare},
+				{separate, separate, metadata}, {filepath.Join(separate, "subdir"), separate, metadata},
+			} {
+				// Separate Git directories are a git-meta case: worktree list
+				// can report the metadata directory itself as the main worktree.
+				if kind == "git-root" && test.common == metadata {
+					continue
 				}
-			} else if warnings != "" {
-				t.Fatalf("workspace %q mode %s: unexpected warning: %q", test.workspace, mode, warnings)
+				selected := test.main
+				if kind == "git-meta" {
+					selected = test.common
+				}
+				for _, mode := range []string{"rw", "ro"} {
+					mounts, warnings, err := resolveMountsWithWarnings(t, test.workspace, []directoryMount{{Type: kind, Mode: mode}})
+					want := []directoryMount{{Path: test.workspace, Mode: "rw"}}
+					if test.workspace != selected {
+						want = append(want, directoryMount{Path: selected, Mode: mode})
+					} else {
+						want[0].Mode = mode
+					}
+					if err != nil || !reflect.DeepEqual(mounts, want) {
+						t.Fatalf("workspace %q mode %s: %v, %v; want %v", test.workspace, mode, mounts, err, want)
+					}
+					// Equality merges with the implicit workspace; nesting alone
+					// must not warn or suppress a readonly metadata mount.
+					if test.workspace == selected && mode == "ro" {
+						if strings.Count(warnings, "\n") != 1 || !strings.Contains(warnings, fmt.Sprintf("%q", selected)) {
+							t.Fatalf("expected one warning with the escaped canonical path: %q", warnings)
+						}
+					} else if warnings != "" {
+						t.Fatalf("workspace %q mode %s: unexpected warning: %q", test.workspace, mode, warnings)
+					}
+				}
+			}
+			selected := repo
+			if kind == "git-meta" {
+				selected = filepath.Join(repo, ".git")
+			}
+			alias := filepath.Join(root, kind+" alias")
+			if err := os.Symlink(selected, alias); err != nil {
+				t.Fatal(err)
+			}
+			want := []directoryMount{{Path: linked, Mode: "rw"}, {Path: selected, Mode: "ro"}}
+			// Discovery and explicit aliases must not create competing binds or
+			// let declaration order loosen a readonly request.
+			for _, mode := range []string{"ro", "rw"} {
+				for _, reverse := range []bool{false, true} {
+					configured := []directoryMount{{Type: kind, Mode: mode}, {Path: alias, Mode: "ro"}}
+					if reverse {
+						configured[0], configured[1] = configured[1], configured[0]
+					}
+					mounts, warnings, err := resolveMountsWithWarnings(t, linked, configured)
+					if err != nil || !reflect.DeepEqual(mounts, want) || (warnings != "") != (mode == "rw") {
+						t.Fatalf("canonical explicit/typed duplicates, mode=%s reverse=%v: %v, %v, %q", mode, reverse, mounts, err, warnings)
+					}
+				}
+			}
+			configured := []directoryMount{{Type: kind, Mode: "rw"}}
+			label := fmt.Sprintf("mounts[0] type %q", kind)
+			if _, err := resolveMounts(root, configured); err == nil || !strings.Contains(err.Error(), label) {
+				t.Fatalf("non-repository must fail discovery: %v", err)
+			}
+			gitDir := t.TempDir()
+			t.Setenv("PATH", gitDir)
+			if _, err := resolveMounts(linked, []directoryMount{{Path: repo, Mode: "ro"}}); err != nil {
+				t.Fatalf("explicit mounts must not require Git: %v", err)
+			}
+			if _, err := resolveMounts(linked, configured); err == nil || !strings.Contains(err.Error(), label) {
+				t.Fatalf("missing Git must fail discovery: %v", err)
+			}
+			// A successful Git process can still give unusable output. Reject it
+			// before Docker can create a missing source or bind the wrong object.
+			if err := os.WriteFile(filepath.Join(gitDir, "git"), []byte("#!/bin/sh\nexec /bin/cat \"$MEMBRANE_TEST_GIT_OUTPUT\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			outputPath := filepath.Join(gitDir, "output")
+			t.Setenv("MEMBRANE_TEST_GIT_OUTPUT", outputPath)
+			for _, test := range []struct{ path, message string }{
+				{"", "no usable repository path"}, {"relative", "no usable repository path"},
+				{filepath.Join(root, "missing"), "no such file"},
+				{filepath.Join(separate, ".git"), "not a directory"},
+			} {
+				output := test.path
+				if output != "" {
+					if kind == "git-meta" {
+						output += "\n"
+					} else {
+						output = "worktree " + output + "\x00\x00"
+					}
+				}
+				if err := os.WriteFile(outputPath, []byte(output), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := resolveMounts(linked, configured); err == nil || !strings.Contains(err.Error(), label) || !strings.Contains(err.Error(), test.message) {
+					t.Fatalf("invalid discovery %q: %v", test.path, err)
+				}
+			}
+		})
+	}
+	// In a bare repository the two selectors name the same directory. Exercise
+	// both orders so mixed requests cannot accidentally produce competing binds.
+	t.Run("combined", func(t *testing.T) {
+		for _, test := range []struct{ rootMode, metaMode, wantMode string }{
+			{"rw", "rw", "rw"}, {"ro", "ro", "ro"},
+			{"rw", "ro", "ro"}, {"ro", "rw", "ro"},
+		} {
+			for _, reverse := range []bool{false, true} {
+				configured := []directoryMount{{Type: "git-root", Mode: test.rootMode}, {Type: "git-meta", Mode: test.metaMode}}
+				if reverse {
+					configured[0], configured[1] = configured[1], configured[0]
+				}
+				mounts, warnings, err := resolveMountsWithWarnings(t, bareLinked, configured)
+				want := []directoryMount{{Path: bareLinked, Mode: "rw"}, {Path: bare, Mode: test.wantMode}}
+				count := 0
+				if test.rootMode != test.metaMode {
+					count = 1
+				}
+				if err != nil || !reflect.DeepEqual(mounts, want) || strings.Count(warnings, "\n") != count {
+					t.Fatalf("combined modes=%+v reverse=%v: %v, %v, %q", test, reverse, mounts, err, warnings)
+				}
 			}
 		}
-	}
-	alias := filepath.Join(root, "repo alias")
-	if err := os.Symlink(repo, alias); err != nil {
-		t.Fatal(err)
-	}
-	want := []directoryMount{{Path: linked, Mode: "rw"}, {Path: repo, Mode: "ro"}}
-	// Discovery and explicit aliases must not create competing binds or let
-	// declaration order loosen a readonly request.
-	for _, mode := range []string{"ro", "rw"} {
-		for _, reverse := range []bool{false, true} {
-			configured := []directoryMount{{Type: "git-root", Mode: mode}, {Path: alias, Mode: "ro"}}
-			if reverse {
-				configured[0], configured[1] = configured[1], configured[0]
-			}
-			mounts, warnings, err := resolveMountsWithWarnings(t, linked, configured)
-			if err != nil || !reflect.DeepEqual(mounts, want) || (warnings != "") != (mode == "rw") {
-				t.Fatalf("canonical explicit/typed duplicates, mode=%s reverse=%v: %v, %v, %q", mode, reverse, mounts, err, warnings)
-			}
+		// In a normal checkout metadata is a distinct child, so its writable
+		// request must coexist with a readonly main checkout without a warning.
+		mounts, warnings, err := resolveMountsWithWarnings(t, linked, []directoryMount{{Type: "git-root", Mode: "ro"}, {Type: "git-meta", Mode: "rw"}})
+		want := []directoryMount{{Path: linked, Mode: "rw"}, {Path: repo, Mode: "ro"}, {Path: filepath.Join(repo, ".git"), Mode: "rw"}}
+		if err != nil || !reflect.DeepEqual(mounts, want) || warnings != "" {
+			t.Fatalf("distinct combined mounts: %v, %v, %q", mounts, err, warnings)
 		}
-	}
-	configured := []directoryMount{{Type: "git-root", Mode: "rw"}}
-	if _, err := resolveMounts(root, configured); err == nil || !strings.Contains(err.Error(), `mounts[0] type "git-root"`) {
-		t.Fatalf("non-repository must fail discovery: %v", err)
-	}
-	gitDir := t.TempDir()
-	t.Setenv("PATH", gitDir)
-	if _, err := resolveMounts(linked, []directoryMount{{Path: repo, Mode: "ro"}}); err != nil {
-		t.Fatalf("explicit mounts must not require Git: %v", err)
-	}
-	if _, err := resolveMounts(linked, configured); err == nil || !strings.Contains(err.Error(), `mounts[0] type "git-root"`) {
-		t.Fatalf("missing Git must fail discovery: %v", err)
-	}
-	// Even a successful command must supply usable porcelain output.
-	if err := os.WriteFile(filepath.Join(gitDir, "git"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := resolveMounts(linked, configured); err == nil || !strings.Contains(err.Error(), "no usable repository path") {
-		t.Fatalf("empty Git output must fail discovery: %v", err)
-	}
+	})
 }

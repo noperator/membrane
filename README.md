@@ -233,12 +233,13 @@ Configuration is YAML and works at two levels:
 # primary workspace remains the working directory and defaults to `rw`. Entries
 # require exactly one nonempty string: `path` or `type`. `mode` is `ro` or `rw`
 # (default `rw`) for either form. Relative paths resolve from the canonical
-# primary workspace. The only supported type, `git-root`, uses host Git to
-# discover the main working tree (or bare repository). For overlapping mount
-# paths, the longest (most specific) path wins. For exactly matching mount
-# paths, `ro` wins over `rw`.
+# primary workspace. Host Git discovers the main working tree (or bare
+# repository) with `git-root`, or only shared metadata with `git-meta`. Both
+# types can be configured together. For overlapping mount paths, the longest
+# (most specific) path wins. For exactly matching mount paths, `ro` wins over
+# `rw`.
 mounts:
-  - type: git-root
+  - type: git-meta
     mode: ro
   - path: ../shared-library
 

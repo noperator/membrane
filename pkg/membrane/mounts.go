@@ -20,23 +20,38 @@ func resolveMounts(workspace string, configured []directoryMount) ([]directoryMo
 	for i, mount := range configured {
 		path := mount.Path
 		source := fmt.Sprintf("mounts[%d] path %q", i, path)
-		if mount.Type == "git-root" {
+		if mount.Type != "" {
 			source = fmt.Sprintf("mounts[%d] type %q", i, mount.Type)
-			cmd := exec.Command("git", "-C", workspace, "worktree", "list", "--porcelain", "-z")
+			args := []string{"worktree", "list", "--porcelain", "-z"}
+			command := "git worktree list"
+			if mount.Type == "git-meta" {
+				args = []string{"rev-parse", "--path-format=absolute", "--git-common-dir"}
+				command = "git rev-parse --git-common-dir"
+			}
+			cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
 			out, err := cmd.Output()
 			if err != nil {
-				return nil, fmt.Errorf("%s: git worktree list: %w: %s", source, err, strings.TrimSpace(stderr.String()))
+				return nil, fmt.Errorf("%s: %s: %w: %s", source, command, err, strings.TrimSpace(stderr.String()))
 			}
-			// Git lists the main worktree (or bare repository) first, with
-			// worktree as its first attribute. NULs preserve spaces/newlines.
-			record, _, complete := strings.Cut(string(out), "\x00\x00")
-			attribute, _, _ := strings.Cut(record, "\x00")
-			var valid bool
-			path, valid = strings.CutPrefix(attribute, "worktree ")
-			if !complete || !valid || !filepath.IsAbs(path) {
-				return nil, fmt.Errorf("%s: git worktree list returned no usable repository path", source)
+			if mount.Type == "git-meta" {
+				// Only the final newline belongs to Git; whitespace before it
+				// can be part of the common directory's name.
+				path = strings.TrimSuffix(string(out), "\n")
+			} else {
+				// Git lists the main worktree (or bare repository) first, with
+				// worktree as its first attribute. NULs preserve spaces/newlines.
+				record, _, complete := strings.Cut(string(out), "\x00\x00")
+				attribute, _, _ := strings.Cut(record, "\x00")
+				var valid bool
+				path, valid = strings.CutPrefix(attribute, "worktree ")
+				if !complete || !valid {
+					path = ""
+				}
+			}
+			if !filepath.IsAbs(path) {
+				return nil, fmt.Errorf("%s: %s returned no usable repository path", source, command)
 			}
 			source += fmt.Sprintf(" path %q", path)
 		}

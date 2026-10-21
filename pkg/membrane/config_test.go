@@ -186,6 +186,12 @@ func TestMountValidation(t *testing.T) {
 		{"[{path: .}]", []directoryMount{{Path: ".", Mode: "rw"}}},
 		{"[{type: git-root}]", []directoryMount{{Type: "git-root", Mode: "rw"}}},
 		{"[{type: git-root, mode: ro}]", []directoryMount{{Type: "git-root", Mode: "ro"}}},
+		// Metadata discovery shares the existing defaults and strict validation;
+		// accepting ambiguous entries could silently expose the wrong directory.
+		{"[{type: git-meta}]", []directoryMount{{Type: "git-meta", Mode: "rw"}}},
+		{"[{type: git-meta, mode: rw}]", []directoryMount{{Type: "git-meta", Mode: "rw"}}},
+		{"[{type: git-meta, mode: ro}]", []directoryMount{{Type: "git-meta", Mode: "ro"}}},
+		{"[{path: ., type: git-meta}]", nil}, {"[{type: git-meta, mode: read}]", nil},
 		{"[null]", nil}, {"[{}]", nil}, {"[{mode: ro}]", nil},
 		{"[{path: '', type: git-root}]", nil}, {"[{path: ., type: ''}]", nil},
 		{"[{path: ., type: git-root}]", nil}, {"[{path: null, type: git-root}]", nil},
@@ -211,6 +217,9 @@ func TestMountValidation(t *testing.T) {
 				}
 			} else if err == nil || !strings.Contains(err.Error(), path) {
 				t.Fatalf("invalid mounts must identify config file: %v", err)
+			}
+			if test.mounts == "[{type: unknown}]" && (!strings.Contains(err.Error(), "git-root") || !strings.Contains(err.Error(), "git-meta")) {
+				t.Fatalf("unsupported type must list both discovery options: %v", err)
 			}
 		})
 	}
