@@ -8,10 +8,15 @@ import (
 	"strings"
 )
 
-// The primary workspace is always the first, implicit writable mount.
+// The primary workspace is always first, with an implicit rw request.
 func resolveMounts(workspace string, configured []directoryMount) ([]directoryMount, error) {
 	mounts := []directoryMount{{Path: workspace, Mode: "rw"}}
-	seen := map[string]string{workspace: "rw"}
+	type mountSource struct {
+		index  int
+		label  string
+		warned bool
+	}
+	seen := map[string]mountSource{workspace: {label: "primary workspace"}}
 	for i, mount := range configured {
 		path := mount.Path
 		source := fmt.Sprintf("mounts[%d] path %q", i, path)
@@ -54,16 +59,20 @@ func resolveMounts(workspace string, configured []directoryMount) ([]directoryMo
 		if _, err := os.ReadDir(path); err != nil {
 			return nil, fmt.Errorf("%s: %w", source, err)
 		}
-		if mount.Type == "git-root" && path == workspace {
-			continue
-		}
+		// Merge in place to preserve the workspace position and policy root indexes.
 		if previous, ok := seen[path]; ok {
-			if previous != mount.Mode {
-				return nil, fmt.Errorf("%s: conflicting modes %s and %s for %q", source, previous, mount.Mode, path)
+			if mounts[previous.index].Mode != mount.Mode {
+				if !previous.warned {
+					fmt.Fprintf(os.Stderr, "membrane: warning: conflicting mount modes for %q (%s: %s; %s: %s); using ro\n",
+						path, previous.label, mounts[previous.index].Mode, source, mount.Mode)
+					previous.warned = true
+					seen[path] = previous
+				}
+				mounts[previous.index].Mode = "ro"
 			}
 			continue
 		}
-		seen[path] = mount.Mode
+		seen[path] = mountSource{index: len(mounts), label: source}
 		mounts = append(mounts, directoryMount{Path: path, Mode: mount.Mode})
 	}
 	return mounts, nil

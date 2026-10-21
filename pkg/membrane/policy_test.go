@@ -104,7 +104,12 @@ func TestFilesystemPolicyInitialManifest(t *testing.T) {
 }
 
 func TestFilesystemPolicySymlinkTargets(t *testing.T) {
-	root := t.TempDir()
+	// Match session startup: the temporary directory may have symlinked ancestors
+	// (such as /tmp on macOS), but policy snapshots use canonical mount paths.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(root, "tree/sub"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -164,12 +169,18 @@ func TestReadonlyMountSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &config{Readonly: []string{"locked/"}, Sealed: []string{"secret"}}
-	for _, reverse := range []bool{false, true} {
+	// Equal-path merging must reach the snapshot without changing root indexes
+	// or the independent inheritance of explicit selectors into writable children.
+	for _, test := range []struct {
+		reverse bool
+		mode    string
+	}{{false, "rw"}, {true, "rw"}, {false, "ro"}, {true, "ro"}} {
 		configured := []directoryMount{{Path: parent, Mode: "ro"}, {Path: "locked/child", Mode: "rw"}, {Path: "../empty", Mode: "ro"}}
-		if reverse {
+		if test.reverse {
 			configured[0], configured[2] = configured[2], configured[0]
 		}
-		mounts, err := resolveMounts(workspace, configured)
+		configured = append(configured, directoryMount{Path: ".", Mode: test.mode})
+		mounts, _, err := resolveMountsWithWarnings(t, workspace, configured)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,8 +202,12 @@ func TestReadonlyMountSnapshot(t *testing.T) {
 			filepath.Join(workspace, "locked/child"):        policyReadonly,
 			filepath.Join(workspace, "locked/child/secret"): policySealed,
 		}
+		if test.mode == "ro" {
+			want[workspace] = policyReadonly
+			want[filepath.Join(workspace, "ordinary")] = policyReadonly
+		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("reverse=%v: snapshot = %v, want %v", reverse, got, want)
+			t.Fatalf("reverse=%v mode=%s: snapshot = %v, want %v", test.reverse, test.mode, got, want)
 		}
 	}
 	if err := os.Symlink(t.TempDir(), filepath.Join(parent, "outside")); err != nil {

@@ -1692,12 +1692,33 @@ print('PASS anchors, component boundaries and selected-tree containment', flush=
     result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
     check(ctx, result.returncode != 0 and 'must resolve within a selected directory' in result.stderr
           and 'workload-started' not in result.stdout, '37 protected symlink escape rejected before startup')
+    # Equal-path conflicts must reach both bind and inode enforcement. Select
+    # the existing symlink targets so the escape check above is independent.
+    for entries, readonly_root in (
+        ([{'path': '.', 'mode': 'ro'}], workspace),
+        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], shared),
+    ):
+        (workspace / '.membrane.yaml').write_text(json.dumps({
+            'mounts': entries + [{'path': str(shared)}, {'path': str(unselected)}]}))
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+readonly = Path(sys.argv[1])
+assert os.statvfs(readonly).f_flag & os.ST_RDONLY
+p['access'](readonly / 'unrelated', False, readonly_mount=True)
+p['denied']('merged readonly root creation', lambda: (readonly / 'new').touch(), readonly_mount=True)
+if readonly != Path.cwd():
+    Path('written').write_text('primary remains writable')
+''', str(readonly_root)], cwd=workspace, env=env)
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(readonly_root))}' in result.stderr
+              and 'using ro' in result.stderr,
+              '37 equal-path conflict resolves readonly with one warning: ' + readonly_root.name)
     for entries, message in (
         ([{'path': '../shared library', 'mode': 'invalid'}], 'must be ro or rw'),
         ([{'path': '../missing'}], 'no such file'),
         ([{'path': '../parent-only'}], 'not a directory'),
-        ([{'path': '.', 'mode': 'ro'}], 'conflicting modes'),
-        ([{'path': '../shared link', 'mode': 'ro'}, {'path': str(shared), 'mode': 'rw'}], 'conflicting modes'),
     ):
         (workspace / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
         result = membrane(ctx, ['echo', 'workload-started'], cwd=workspace, env=env, expected=None)
@@ -1848,11 +1869,12 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
     check(ctx, (repo / 'tracked').read_text() == 'main repository writeback\n'
           and (external / 'tracked').read_text() == 'external edit\n', '38 typed rw mount host writeback')
 
-    # Merged Git-root entries must not make the primary workspace readonly,
-    # including through a launch symlink; explicit selectors must still apply.
+    # Repeated equal-path Git requests must make the workspace readonly,
+    # including through a launch symlink, while preserving explicit selectors.
     link = ctx.workdir / 'repo alias'
     link.symlink_to(repo, target_is_directory=True)
     copy_policy_workload(repo)
+    (repo / 'ordinary').write_text('primary workspace readonly fixture')
     (Path(ctx.environment['HOME']) / '.membrane/config.yaml').write_text(
         'mounts: [{type: git-root, mode: ro}]\n')
     (repo / '.membrane.yaml').write_text(json.dumps({
@@ -1863,27 +1885,47 @@ print('PASS external worktree discovers writable main repo; selectors and mount 
 from pathlib import Path
 p = runpy.run_path('policy-workload.py')
 assert str(Path.cwd()) == sys.argv[1]
-assert not os.statvfs('.').f_flag & os.ST_RDONLY
-Path('ordinary').write_text('primary workspace writeback')
-p['access']('sealed', True)
-p['access']('readonly/rw/file', False)
+assert os.statvfs('.').f_flag & os.ST_RDONLY
+p['access']('ordinary', False, readonly_mount=True)
+p['denied']('readonly workspace creation', lambda: Path('new').touch(), readonly_mount=True)
+p['access']('sealed', True, readonly_mount=True)
+p['access']('readonly/rw/file', False, readonly_mount=True)
 ''', str(repo)], cwd=launch, env=dict(ctx.environment, PWD=str(launch)),
             options=['--no-global-config=false'])
         ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
-        check(ctx, (repo / 'ordinary').read_text() == 'primary workspace writeback',
-              f'38 {launch.name}: repeated same-root Git mounts preserve writable workspace and selectors')
-    nonrepo = ctx.workdir.resolve() / 'not a repository'
-    nonrepo.mkdir()
-    for directory, entries, message in (
-        # Skipping discovery must not hide an explicit readonly workspace alias.
-        (repo, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(link), 'mode': 'ro'}], 'conflicting modes'),
-        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}], 'conflicting modes'),
-        (nonrepo, [{'type': 'git-root'}], 'type "git-root": git worktree list'),
+        check(ctx, (repo / 'ordinary').read_text() == 'primary workspace readonly fixture'
+              and result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(repo))}' in result.stderr
+              and 'primary workspace: rw' in result.stderr and 'using ro' in result.stderr,
+              f'38 {launch.name}: repeated same-root Git mounts resolve readonly and preserve selectors')
+    # Explicit/discovered conflicts must merge regardless of whether the
+    # canonical repository is the workspace or an additional mount.
+    for directory, entries in (
+        (repo, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(link), 'mode': 'ro'}]),
+        (external, [{'type': 'git-root', 'mode': 'ro'}, {'path': str(repo), 'mode': 'rw'}]),
     ):
         (directory / '.membrane.yaml').write_text(json.dumps({'mounts': entries}))
-        result = membrane(ctx, ['echo', 'workload-started'], cwd=directory, expected=None)
-        check(ctx, result.returncode != 0 and 'mounts[' in result.stderr and message in result.stderr
-              and 'workload-started' not in result.stdout, '38 typed mount fails before workload: ' + message)
+        result = membrane(ctx, ['sudo', 'python3', '-c', '''import os, runpy, sys
+from pathlib import Path
+p = runpy.run_path('policy-workload.py')
+repo = Path(sys.argv[1])
+assert os.statvfs(repo).f_flag & os.ST_RDONLY
+assert bool(os.statvfs('.').f_flag & os.ST_RDONLY) == (Path.cwd() == repo)
+p['access'](repo / 'tracked', False, readonly_mount=True)
+if Path.cwd() != repo:
+    Path('tracked').write_text('workspace remains writable')
+''', str(repo)], cwd=directory)
+        ctx.output.extend(line for line in result.stdout.splitlines() if line.startswith('PASS '))
+        check(ctx, result.stderr.count('membrane: warning: conflicting mount modes') == 1
+              and f'conflicting mount modes for {json.dumps(str(repo))}' in result.stderr
+              and 'using ro' in result.stderr,
+              '38 explicit/discovered conflict resolves readonly: ' + directory.name)
+    nonrepo = ctx.workdir.resolve() / 'not a repository'
+    nonrepo.mkdir()
+    (nonrepo / '.membrane.yaml').write_text('mounts: [{type: git-root}]\n')
+    result = membrane(ctx, ['echo', 'workload-started'], cwd=nonrepo, expected=None)
+    check(ctx, result.returncode != 0 and 'mounts[0] type "git-root": git worktree list' in result.stderr
+          and 'workload-started' not in result.stdout, '38 non-repository fails discovery before workload')
 
 
 def group_39(ctx):
