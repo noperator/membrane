@@ -1,7 +1,9 @@
 package membrane
 
 import (
+	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,8 +105,13 @@ case "$1 $2" in
   'logs -f') exec sleep 300 ;;
   'inspect -f') echo 172.20.0.2 ;;
 esac`)
-			s := sessionNames{id: "fixture", agentContainer: "agent", handlerContainer: "handler",
-				internalNetwork: "internal", externalNetwork: "external", caVolume: "ca", policyRoots: map[int]string{0: dir, 2: "/extra with spaces"}}
+			s, err := newSession(filepath.Join(dir, ".membrane"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.id, s.agentContainer, s.handlerContainer = "fixture", "agent", "handler"
+			s.internalNetwork, s.externalNetwork, s.caVolume = "internal", "external", "ca"
+			s.policyRoots = map[int]string{0: dir, 2: "/extra with spaces"}
 			policy := ""
 			if mode == "policy" {
 				policy = filepath.Join(dir, "policy.json")
@@ -165,5 +172,80 @@ esac`)
 				last = next
 			}
 		})
+	}
+}
+
+// Session inputs can contain credentials. Distinct private directories must
+// survive another session's runtime cleanup without losing retained outputs.
+func TestSessionFilesIsolation(t *testing.T) {
+	dir := t.TempDir()
+	first, err := newSession(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newSession(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.id == second.id || first.dir == second.dir {
+		t.Fatal("sessions share an identity or directory")
+	}
+	for _, s := range []sessionNames{first, second} {
+		for _, path := range []string{s.dir, s.logsDir, s.runtimeDir} {
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != 0700 {
+				t.Fatalf("session directory is not private: %s (%v)", path, err)
+			}
+		}
+		network, err := writeNetworkRulesFile(s.runtimeDir, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := writePolicyFile(s.runtimeDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{network, policy} {
+			info, err := os.Stat(path)
+			if err != nil || filepath.Dir(path) != s.runtimeDir || info.Mode().Perm() != 0600 {
+				t.Fatalf("generated input is not private session data: %s (%v)", path, err)
+			}
+		}
+		log := filepath.Join(s.logsDir, "handler.log")
+		if err := os.WriteFile(log, []byte(s.id), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := gzipFile(log + ".gz"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.RemoveAll(first.runtimeDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []sessionNames{first, second} {
+		log := filepath.Join(s.logsDir, "handler.log.gz")
+		info, err := os.Stat(log)
+		if err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("retained log is not private: %s (%v)", log, err)
+		}
+		f, err := os.Open(log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(gz)
+		gz.Close()
+		f.Close()
+		if err != nil || string(data) != s.id {
+			t.Fatalf("retained log damaged or overwritten: %q (%v)", data, err)
+		}
+	}
+	entries, err := os.ReadDir(second.runtimeDir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("cleanup affected the other session: %v (%v)", entries, err)
 	}
 }

@@ -101,7 +101,13 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return err
 	}
 
-	s := newSessionNames()
+	s, err := newSession(membraneDir)
+	if err != nil {
+		return err
+	}
+	// Retained logs stay in the session; only its disposable files are removed.
+	// Register before container teardown so mounted inputs outlive the workload.
+	defer func() { retErr = errors.Join(retErr, os.RemoveAll(s.runtimeDir)) }()
 	s.directoryMounts = mounts
 	s.policyRoots = make(map[int]string)
 	for _, entry := range policy {
@@ -117,7 +123,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	// Resolve trace log path before starting session (needed for bind mount).
 	traceLogFile := traceLog
 	if trace && traceLogFile == "" {
-		traceLogFile = filepath.Join(membraneDir, "trace", s.agentContainer+".jsonl.gz")
+		traceLogFile = filepath.Join(s.logsDir, s.agentContainer+".jsonl.gz")
 	}
 	if trace && !filepath.IsAbs(traceLogFile) {
 		traceLogFile, err = filepath.Abs(traceLogFile)
@@ -133,7 +139,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 
 	policyFile := ""
 	if len(policy) != 0 {
-		policyFile, err = writePolicyFile(policy)
+		policyFile, err = writePolicyFile(s.runtimeDir, policy)
 		if err != nil {
 			return err
 		}
@@ -179,11 +185,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		codexName, codexInstructions = name, string(data)+"\n\n"
 		break
 	}
-	tmpDir := filepath.Join(membraneDir, "tmp")
-	if err := os.MkdirAll(tmpDir, 0700); err != nil {
-		return fmt.Errorf("create session tmp dir: %w", err)
-	}
-	f, err := os.CreateTemp(tmpDir, "membrane-instructions-*.md")
+	f, err := os.CreateTemp(s.runtimeDir, "membrane-instructions-*.md")
 	if err != nil {
 		return fmt.Errorf("create Codex instruction copy: %w", err)
 	}

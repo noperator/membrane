@@ -15,7 +15,7 @@ func main() {
 	noUpdate := flag.Bool("no-update", false, "skip checking for updates")
 	noTrace := flag.Bool("no-trace", false, "disable eBPF tracing")
 	noGlobalConfig := flag.Bool("no-global-config", false, "skip reading ~/.membrane/config.yaml (workspace and CLI flags still apply)")
-	traceLog := flag.String("trace-log", "", "path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)")
+	traceLog := flag.String("trace-log", "", "path for trace log file (default: ~/.membrane/sessions/<id>/logs/membrane-agent-<id>.jsonl.gz)")
 	sealed := flag.StringArrayP("sealed", "s", []string{}, "sealed pattern (repeatable)")
 	readonly := flag.StringArrayP("readonly", "r", []string{}, "readonly pattern (repeatable)")
 	allow := flag.StringArrayP("allow", "a", []string{}, "allow rule: hostname, IP, CIDR, or URL (repeatable)")

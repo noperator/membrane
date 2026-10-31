@@ -22,6 +22,7 @@ import tempfile
 import termios
 import time
 import traceback
+import zlib
 from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -618,8 +619,14 @@ class Session:
                 self.args, "started", "not started", "", "")) from error
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, kind, error, tb):
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            if error is None:
+                raise
+            # A cleanup failure must not hide the workload failure being debugged.
+            self.ctx.output.append(f"FAIL session cleanup for {self.directory}: {cleanup_error}")
 
     @property
     def id(self):
@@ -1160,14 +1167,35 @@ def lifecycle_session(ctx, token, *, policy=False, env=None):
     directory.mkdir()
     (directory / "protected").write_text("secret\n")
     (directory / ".membrane.yaml").write_text("sealed: [protected]\n" if policy else "{}\n")
-    # Record workload liveness without relying on Docker's daemon state.
-    command = ["python3", "-c", """import os, time
+    # Record workload liveness without relying on Docker's daemon state. Capture
+    # identity on failure: a shared-filesystem permission error can otherwise
+    # look like a supervisor killed the independent session.
+    command = ["python3", "-c", """import json, os, time
 from pathlib import Path
-Path('ready').write_text('ready')
-while not Path('continue').exists():
+def identity(stage):
+    files = {}
+    for name in ('.', 'alive', 'protected'):
+        try:
+            s = os.stat(name)
+            files[name] = dict(uid=s.st_uid, gid=s.st_gid, mode=oct(s.st_mode),
+                               dev=s.st_dev, ino=s.st_ino)
+        except OSError as error:
+            files[name] = str(error)
+    print('WORKLOAD_IDENTITY', json.dumps(dict(stage=stage, uid=os.getresuid(),
+          gid=os.getresgid(), groups=os.getgroups(), files=files,
+          uid_map=Path('/proc/self/uid_map').read_text(),
+          gid_map=Path('/proc/self/gid_map').read_text())), flush=True)
+identity('startup')
+try:
     Path('alive').write_text(str(time.monotonic_ns()))
-    time.sleep(0.02)
-Path('completed').touch()
+    Path('ready').write_text('ready')
+    while not Path('continue').exists():
+        Path('alive').write_text(str(time.monotonic_ns()))
+        time.sleep(0.02)
+    Path('completed').touch()
+except OSError:
+    identity('failure')
+    raise
 """]
     return Session(ctx, directory, command, options=["--no-trace"], env=env)
 
@@ -1220,8 +1248,10 @@ os.kill(pids[0], signal.SIGKILL)
                     time.sleep(0.1)
                     check(ctx, (session.directory / "alive").read_text() == before
                           and not (session.directory / "completed").exists(), component + ": workload killed")
-                    events_b = run(ctx, [*host_root(), "cat", survivor_cgroup + "/cgroup.events"]).stdout
-                    check(ctx, "populated 1" in events_b.splitlines(), component + ": session B stays populated")
+                    events_b = run(ctx, [*host_root(), "cat", survivor_cgroup + "/cgroup.events"], expected=None)
+                    populated = events_b.returncode == 0 and "populated 1" in events_b.stdout.splitlines()
+                    detail = "" if populated else "\n" + survivor.details("still running")
+                    check(ctx, populated, component + ": session B stays populated" + detail)
                     before_b = (survivor.directory / "alive").read_text()
                     time.sleep(0.1)
                     check(ctx, (survivor.directory / "alive").read_text() != before_b, component + ": session B remains running")
@@ -1252,7 +1282,7 @@ os.kill(pids[0], signal.SIGKILL)
             session.wait(expected=None, timeout=45)
             check(ctx, not (session.directory / "completed").exists(), sig.name + ": workload terminated")
             cleaned(ctx, session)
-            path = Path(session.env["HOME"]) / ".membrane/logs" / ("membrane-handler-" + session.id + ".log.gz")
+            path = Path(session.env["HOME"]) / ".membrane/sessions" / session.id / "logs" / ("membrane-handler-" + session.id + ".log.gz")
             with gzip.open(path, "rt") as log:
                 text = log.read()
             check(ctx, "tracer exited cleanly" in text and "exited unexpectedly" not in text,
@@ -1531,7 +1561,7 @@ print('editable-instructions-ok')
               (state / "AGENTS.md").read_text() == guidance and
               (number == 0 or all(os.readlink(state / name) == name + ".user" for name in ("config.yaml", "AGENTS.md"))),
               "user edits and symlinks preserved on subsequent starts")
-        check(ctx, not list((state / "tmp").glob("membrane-instructions-*")), "session copy cleaned up")
+        check(ctx, not list((state / "sessions").glob("*/runtime")), "session copies cleaned up")
 
 
 def group_37(ctx):
@@ -2199,6 +2229,95 @@ print('trust-probe-ok', flush=True)
     check(ctx, not list(state.glob('.trusted-workspaces-*')), '39 no temporary trust files left behind')
 
 
+def group_40(ctx):
+    # Retained diagnostics must stay private and separate from disposable inputs,
+    # including when one of two live sessions finishes or tracing is disabled.
+    build_trace_workload(ctx)
+    state = Path(ctx.environment["HOME"]) / ".membrane"
+    command = ["python3", "-c", """from pathlib import Path
+import time
+for i in range(3000):
+    Path('/tmp/session-path-event-' + str(i)).write_text(str(i))
+Path('ready').touch()
+while not Path('continue').exists():
+    time.sleep(.1)
+"""]
+    with ExitStack() as stack:
+        active = []
+        for name in ("output-a", "output-b"):
+            directory = ctx.workdir / name
+            directory.mkdir()
+            (directory / "protected").write_text("fixture")
+            (directory / ".membrane.yaml").write_text("readonly: [protected]\n")
+            session = stack.enter_context(Session(ctx, directory, command))
+            session.wait_for("ready")
+            root = state / "sessions" / session.id
+            for path in (root, root / "logs", root / "runtime"):
+                check(ctx, path.is_dir() and path.stat().st_mode & 0o777 == 0o700,
+                      name + ": private " + path.name)
+            runtime_files = {p.name for p in (root / "runtime").iterdir()}
+            check(ctx, all(any(p.startswith(prefix) for p in runtime_files) for prefix in
+                           ("membrane-instructions-", "membrane-network-rules-", "membrane-policy-")),
+                  name + ": generated inputs belong to the session")
+            agent = inspect(ctx, "membrane-agent-" + session.id)
+            check(ctx, all(m["Source"] not in (str(root), str(root.parent), str(root / "runtime"))
+                           for m in agent["Mounts"]), name + ": session directories are not agent mounts")
+            trace = root / "logs" / ("membrane-agent-" + session.id + ".jsonl.gz")
+            log = root / "logs" / ("membrane-handler-" + session.id + ".log")
+            deadline = time.monotonic() + 10
+            delivered = b""
+            while time.monotonic() < deadline:
+                if trace.exists():
+                    delivered = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(trace.read_bytes())
+                if b'"type":' in delivered and log.exists() and log.stat().st_size:
+                    break
+                time.sleep(.1)
+            check(ctx, b'"type":' in delivered and log.exists() and log.stat().st_size > 0
+                  and session.process.poll() is None, name + ": trace events and diagnostics arrive live")
+            check(ctx, all(p.stat().st_mode & 0o777 == 0o600 and p.stat().st_uid == os.getuid()
+                           for p in (trace, log)), name + ": host owns private output files")
+            active.append((session, root, trace))
+
+        first, first_root, first_trace = active[0]
+        second, second_root, _ = active[1]
+        check(ctx, first.id != second.id, "concurrent sessions have distinct identities")
+        first.release()
+        first.wait()
+        trace_events(ctx, first_trace)
+        retained = first_trace.read_bytes()
+        check(ctx, not (first_root / "runtime").exists() and (second_root / "runtime").is_dir()
+              and second.process.poll() is None, "cleanup removes only the completed session's runtime")
+        second.release()
+        second.wait()
+        check(ctx, first_trace.read_bytes() == retained, "later cleanup preserves earlier output")
+        for session, root, trace in active:
+            cleaned(ctx, session)
+            check(ctx, not (root / "runtime").exists(), "completed runtime removed")
+            path = root / "logs" / ("membrane-handler-" + session.id + ".log.gz")
+            with gzip.open(path, "rt") as stream:
+                check(ctx, bool(stream.read()), "handler diagnostics retain their gzip text format")
+            check(ctx, path.stat().st_mode & 0o777 == 0o600, "compressed diagnostics remain private")
+
+    for name, options in (("no-trace", ["--no-trace"]),
+                          ("explicit-trace", ["--trace-log=chosen.jsonl.gz"])):
+        directory = ctx.workdir / name
+        directory.mkdir()
+        with Session(ctx, directory, ["true"], options=options) as session:
+            session.wait()
+            root = state / "sessions" / session.id
+            check(ctx, list((root / "logs").glob("*.log.gz"))
+                  and not list((root / "logs").glob("*.jsonl.gz"))
+                  and not (root / "runtime").exists(), name + ": diagnostics retained without a default trace")
+            if name == "explicit-trace":
+                trace_events(ctx, directory / "chosen.jsonl.gz")
+            else:
+                check(ctx, not (directory / "chosen.jsonl.gz").exists(), "no trace output when disabled")
+            cleaned(ctx, session)
+    check(ctx, not (state / "tmp").exists() and not (state / "trace").exists()
+          and all(p.name.startswith("build-") for p in (state / "logs").glob("*")),
+          "only installation build logs may use the shared log directory")
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -2245,6 +2364,7 @@ GROUPS = {
     37: TestGroup("additional directory mounts, configuration and readonly roots", group_37),
     38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
     39: TestGroup("workspace configuration trust, persistence and strict parsing", group_39),
+    40: TestGroup("private session outputs, live delivery and runtime cleanup", group_40),
 }
 
 
@@ -2271,7 +2391,7 @@ def run_group(number, membrane_cmd, environment, artifacts, keep_artifacts):
                     if not session_id:
                         continue
                     log = next(directory.rglob(f"membrane-handler-{session_id}.log*"),
-                               Path.home() / ".membrane/logs" / f"membrane-handler-{session_id}.log")
+                               Path.home() / ".membrane/sessions" / session_id / "logs" / f"membrane-handler-{session_id}.log")
                     if not log.exists():
                         log = log.with_suffix(".log.gz")
                     if log.exists():

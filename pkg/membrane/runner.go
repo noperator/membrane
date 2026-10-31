@@ -27,27 +27,20 @@ import (
 
 // writeNetworkRulesFile serialises allow and deny rules to a temp file and returns its path.
 // The caller is responsible for removing the file when done.
-func writeNetworkRulesFile(allow, deny []NetworkRule) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("get home dir: %w", err)
-	}
-	dir := filepath.Join(home, ".membrane", "tmp")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("create tmp dir: %w", err)
-	}
+func writeNetworkRulesFile(dir string, allow, deny []NetworkRule) (string, error) {
 	f, err := os.CreateTemp(dir, "membrane-network-rules-*.json")
 	if err != nil {
 		return "", fmt.Errorf("create network rules file: %w", err)
 	}
-	defer f.Close()
 	if allow == nil {
 		allow = []NetworkRule{}
 	}
 	if deny == nil {
 		deny = []NetworkRule{}
 	}
-	if err := json.NewEncoder(f).Encode(map[string][]NetworkRule{"allow": allow, "deny": deny}); err != nil {
+	err = json.NewEncoder(f).Encode(map[string][]NetworkRule{"allow": allow, "deny": deny})
+	err = errors.Join(err, f.Close())
+	if err != nil {
 		os.Remove(f.Name())
 		return "", fmt.Errorf("write network rules file: %w", err)
 	}
@@ -71,6 +64,9 @@ type sessionNames struct {
 	internalNetwork  string
 	externalNetwork  string
 	caVolume         string
+	dir              string
+	logsDir          string
+	runtimeDir       string
 
 	agentFileMounts []string
 	directoryMounts []directoryMount
@@ -137,11 +133,13 @@ func createSessionCgroup(ctx context.Context, s *sessionNames) (func() error, er
 	return cleanup, nil
 }
 
-func newSessionNames() sessionNames {
+func newSession(membraneDir string) (sessionNames, error) {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return sessionNames{}, fmt.Errorf("generate session ID: %w", err)
+	}
 	id := hex.EncodeToString(b[:])
-	return sessionNames{
+	s := sessionNames{
 		id:               id,
 		agentContainer:   "membrane-agent-" + id,
 		handlerContainer: "membrane-handler-" + id,
@@ -149,6 +147,23 @@ func newSessionNames() sessionNames {
 		externalNetwork:  "membrane-external-" + id,
 		caVolume:         "membrane-ca-" + id,
 	}
+	parent := filepath.Join(membraneDir, "sessions")
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return s, fmt.Errorf("create sessions directory: %w", err)
+	}
+	s.dir = filepath.Join(parent, id)
+	s.logsDir = filepath.Join(s.dir, "logs")
+	s.runtimeDir = filepath.Join(s.dir, "runtime")
+	// Exclusive creation establishes ownership: never reuse an existing session.
+	if err := os.Mkdir(s.dir, 0700); err != nil {
+		return s, fmt.Errorf("create session directory: %w", err)
+	}
+	for _, dir := range []string{s.logsDir, s.runtimeDir} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			return s, fmt.Errorf("create session subdirectory: %w", err)
+		}
+	}
+	return s, nil
 }
 
 // brNetfilterLoaded reports whether the br_netfilter kernel module is
@@ -265,7 +280,7 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		return err
 	}
 
-	networkRulesFile, err := writeNetworkRulesFile(cfg.Allow, cfg.Deny)
+	networkRulesFile, err := writeNetworkRulesFile(s.runtimeDir, cfg.Allow, cfg.Deny)
 	if err != nil {
 		return cleanup, "", fmt.Errorf("write network rules file: %w", err)
 	}
@@ -297,8 +312,18 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 	}
 	if trace {
 		traceDir := filepath.Dir(traceLogFile)
-		if err := os.MkdirAll(traceDir, 0755); err != nil {
+		if err := os.MkdirAll(traceDir, 0700); err != nil {
 			return cleanup, "", err
+		}
+		// Create as the host user so the handler can write private diagnostics
+		// without leaving a root-owned 0600 file unreadable on native Linux.
+		f, err := os.OpenFile(traceLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return cleanup, "", fmt.Errorf("create trace file: %w", err)
+		}
+		err = errors.Join(f.Chmod(0600), f.Close())
+		if err != nil {
+			return cleanup, "", fmt.Errorf("prepare trace file: %w", err)
 		}
 		handlerArgs = append(handlerArgs,
 			"-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
@@ -326,6 +351,38 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		return cleanup, "", fmt.Errorf("start handler: %s: %w", out, err)
 	}
 
+	// Keep handler logs readable during the session; gzip them on cleanup.
+	logPath := filepath.Join(s.logsDir, s.handlerContainer+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
+	}
+	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
+	logCmd.Stdout = logFile
+	logCmd.Stderr = logFile
+	if err := logCmd.Start(); err != nil {
+		logFile.Close()
+		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
+	}
+
+	prevCleanup2 := cleanup
+	cleanup = func() error {
+		err := prevCleanup2()
+		_ = logCmd.Process.Kill()
+		_ = logCmd.Wait()
+		logErr := logFile.Close()
+		if logErr == nil {
+			logErr = gzipFile(logPath + ".gz")
+		}
+		if logErr == nil {
+			logErr = os.Remove(logPath)
+		}
+		if logErr != nil {
+			err = errors.Join(err, fmt.Errorf("retain handler log %s: %w", logPath, logErr))
+		}
+		return err
+	}
+
 	if out, err := exec.CommandContext(ctx, "docker", "network", "connect",
 		s.internalNetwork, s.handlerContainer).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("connect handler to internal network: %s: %w", out, err)
@@ -348,40 +405,6 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 				"handler exited or did not become ready within 30s\nHandler logs:\n%s", logs)
 		}
 		time.Sleep(time.Second)
-	}
-
-	// Keep handler logs readable during the session; gzip them on cleanup.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return cleanup, "", fmt.Errorf("get home dir: %w", err)
-	}
-	logDir := filepath.Join(home, ".membrane", "logs")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return cleanup, "", fmt.Errorf("create handler log dir: %w", err)
-	}
-	logPath := filepath.Join(logDir, s.handlerContainer+".log")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
-	}
-	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
-	logCmd.Stdout = logFile
-	logCmd.Stderr = logFile
-	if err := logCmd.Start(); err != nil {
-		logFile.Close()
-		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
-	}
-
-	prevCleanup2 := cleanup
-	cleanup = func() error {
-		err := prevCleanup2()
-		_ = logCmd.Process.Kill()
-		_ = logCmd.Wait()
-		logFile.Close()
-		if err := gzipFile(logPath + ".gz"); err == nil {
-			os.Remove(logPath)
-		}
-		return err
 	}
 
 	out, err = exec.Command("docker", "inspect", "-f",
@@ -463,19 +486,19 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 }
 
 // gzipFile compresses a closed handler log, independently of eBPF trace output.
-func gzipFile(dst string) error {
+func gzipFile(dst string) (retErr error) {
 	in, err := os.Open(strings.TrimSuffix(dst, ".gz"))
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.Create(dst)
+	defer func() { retErr = errors.Join(retErr, in.Close()) }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { retErr = errors.Join(retErr, out.Close()) }()
 	gz := gzip.NewWriter(out)
-	defer gz.Close()
+	defer func() { retErr = errors.Join(retErr, gz.Close()) }()
 	_, err = io.Copy(gz, in)
 	return err
 }

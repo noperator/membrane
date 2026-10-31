@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -92,15 +91,7 @@ grep -q '^populated 0$' "$1/cgroup.events"
 	return nil
 }
 
-func writePolicyFile(entries []filesystemPolicyEntry) (string, error) {
-	home, err := membraneHome()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(home, "tmp")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
+func writePolicyFile(dir string, entries []filesystemPolicyEntry) (string, error) {
 	f, err := os.CreateTemp(dir, "membrane-policy-*.json")
 	if err != nil {
 		return "", err
