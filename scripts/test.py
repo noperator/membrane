@@ -1497,6 +1497,11 @@ def group_36(ctx):
     check(ctx, all((state / name).read_bytes() == (REPO_ROOT / name).read_bytes()
                    and not (state / name).is_symlink() for name in ("config.yaml", "AGENTS.md")),
           "both missing user files initialized as independent copies")
+    template = state / "agent-root"
+    check(ctx, all((template / name).read_bytes() == (REPO_ROOT / "AGENTS.md").read_bytes()
+                   and not (template / name).is_symlink()
+                   for name in ("etc/membrane/AGENTS.md", "etc/claude-code/CLAUDE.md")),
+          "agent-root guidance defaults initialized at explicit destinations")
     global_yaml = "# User policy\nallow: [192.0.2.0/24]\ndeny: [192.0.2.128/25]\nargs: [-e, VISIBLE_LITERAL=fixture]\n"
     (state / "config.yaml").write_text(global_yaml)
     config(ctx, "allow: [198.51.100.0/24]\nreadonly: [.membrane.yaml]\n")
@@ -1562,6 +1567,52 @@ print('editable-instructions-ok')
               (number == 0 or all(os.readlink(state / name) == name + ".user" for name in ("config.yaml", "AGENTS.md"))),
               "user edits and symlinks preserved on subsequent starts")
         check(ctx, not list((state / "sessions").glob("*/runtime")), "session copies cleaned up")
+
+    # Preparation must happen on each invocation without changing the active
+    # home yet. Readonly template directories must not strand disposable state.
+    private = template / "home/agent"
+    private.mkdir(parents=True)
+    original = private / "membrane-template-fixture"
+    original.write_text("first")
+    private.chmod(0o555)
+    try:
+        for revision in ("first", "later"):
+            directory = ctx.workdir / ("prepared-" + revision)
+            directory.mkdir()
+            command = ["python3", "-c", """from pathlib import Path
+import time
+assert not Path('/home/agent/membrane-template-fixture').exists()
+Path('ready').touch()
+while not Path('continue').exists():
+    time.sleep(.02)
+"""]
+            with Session(ctx, directory, command, env=env, options=["--no-trace"]) as session:
+                session.wait_for("ready")
+                runtime = state / "sessions" / session.id / "runtime"
+                prepared = runtime / "agent-root/home/agent/membrane-template-fixture"
+                check(ctx, prepared.read_text() == revision and prepared.parent.stat().st_mode & 0o777 == 0o555,
+                      revision + ": private staged contents and readonly directory mode")
+                original.write_text("later")
+                check(ctx, prepared.read_text() == revision, "template edit does not alter prepared input")
+                prepared.write_text("session edit")
+                check(ctx, original.read_text() == "later", "staged edit does not alter template")
+                session.release()
+                session.wait()
+                check(ctx, not runtime.exists(), "readonly staging cleaned up")
+                cleaned(ctx, session)
+    finally:
+        private.chmod(0o755)
+
+    # A malformed source must fail before any workload command can run.
+    broken = template / "broken-import"
+    broken.symlink_to("missing-import-target")
+    try:
+        result = membrane(ctx, ["touch", "invalid-template-workload"], env=env, expected=1)
+        check(ctx, str(broken) in result.stderr and not (ctx.workdir / "invalid-template-workload").exists(),
+              "invalid template rejected before workload execution")
+        check(ctx, not list((state / "sessions").glob("*/runtime")), "failed preparation cleaned up")
+    finally:
+        broken.unlink()
 
 
 def group_37(ctx):

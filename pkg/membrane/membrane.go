@@ -107,7 +107,15 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	}
 	// Retained logs stay in the session; only its disposable files are removed.
 	// Register before container teardown so mounted inputs outlive the workload.
-	defer func() { retErr = errors.Join(retErr, os.RemoveAll(s.runtimeDir)) }()
+	stagedRoot := filepath.Join(s.runtimeDir, "agent-root")
+	defer func() {
+		retErr = errors.Join(retErr, removePreparedAgentRoot(stagedRoot), os.RemoveAll(s.runtimeDir))
+	}()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	if err := prepareAgentRoot(ctx, filepath.Join(membraneDir, "agent-root"), stagedRoot); err != nil {
+		return err
+	}
 	s.directoryMounts = mounts
 	s.policyRoots = make(map[int]string)
 	for _, entry := range policy {
@@ -131,8 +139,6 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 			return fmt.Errorf("resolve trace log path: %w", err)
 		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
 	if err := checkBPFLSM(ctx); err != nil {
 		return err
 	}

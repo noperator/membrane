@@ -267,9 +267,22 @@ func buildImageFromDir(name, dir string) error {
 // writeDefaultFiles initializes independent user-managed copies, never replacing
 // existing files or symlinks, including dangling links.
 func writeDefaultFiles(membraneHomeDir string) error {
-	for _, name := range []string{"config.yaml", "AGENTS.md"} {
-		dest := filepath.Join(membraneHomeDir, name)
+	// Legacy guidance stays active until private-home activation. Both new
+	// defaults are independent copies of shipped guidance, never legacy state.
+	defaults := []struct{ source, destination string }{
+		{"config.yaml", "config.yaml"},
+		{"AGENTS.md", "AGENTS.md"},
+		{"AGENTS.md", "agent-root/etc/membrane/AGENTS.md"},
+		{"AGENTS.md", "agent-root/etc/claude-code/CLAUDE.md"},
+	}
+nextDefault:
+	for _, file := range defaults {
+		dest := filepath.Join(membraneHomeDir, file.destination)
+		template := strings.HasPrefix(file.destination, "agent-root/")
 		if _, err := os.Lstat(dest); err == nil {
+			if template {
+				continue // Preparation validates existing template references.
+			}
 			info, err := os.Stat(dest)
 			if err != nil {
 				return fmt.Errorf("unusable existing %s (check symlink target): %w", dest, err)
@@ -281,9 +294,37 @@ func writeDefaultFiles(membraneHomeDir string) error {
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("inspect %s: %w", dest, err)
 		}
-		data, err := os.ReadFile(filepath.Join(membraneHomeDir, "src", name))
+		if template {
+			parent := membraneHomeDir
+			for i, component := range strings.Split(filepath.Dir(file.destination), string(filepath.Separator)) {
+				parent = filepath.Join(parent, component)
+				info, err := os.Lstat(parent)
+				if os.IsNotExist(err) {
+					mode := os.FileMode(0755)
+					if i == 0 {
+						mode = 0700 // The template may later contain credentials.
+					}
+					if err := os.Mkdir(parent, mode); err != nil && !os.IsExist(err) {
+						return fmt.Errorf("create template directory %s: %w", parent, err)
+					}
+					info, err = os.Lstat(parent)
+				}
+				if err != nil {
+					return fmt.Errorf("inspect template directory %s: %w", parent, err)
+				}
+				if info.Mode()&os.ModeSymlink != 0 {
+					// A directory reference is user-managed. Do not initialize
+					// anything in its potentially external target.
+					continue nextDefault
+				}
+				if !info.IsDir() {
+					return fmt.Errorf("template parent %s must be a directory", parent)
+				}
+			}
+		}
+		data, err := os.ReadFile(filepath.Join(membraneHomeDir, "src", file.source))
 		if err != nil {
-			return fmt.Errorf("read default %s: %w", name, err)
+			return fmt.Errorf("read default %s: %w", file.source, err)
 		}
 		// Exclusive creation also protects originals during concurrent starts.
 		f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
