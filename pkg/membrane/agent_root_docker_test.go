@@ -35,10 +35,17 @@ func TestCopyAgentRootDocker(t *testing.T) {
 	}
 	var image bytes.Buffer
 	tw := tar.NewWriter(&image)
-	for _, name := range []string{"etc", "dev", "home", "home/agent", "existing", "dir", "target", "host-real", "redirected"} {
+	for _, name := range []string{"etc", "dev", "home", "home/agent", "existing", "dir", "target", "host-real", "redirected", "usr", "usr/local", "usr/local/share", "usr/local/share/membrane", "usr/lib", "usr/lib/startup-runtime"} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0755}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	reserved := "/usr/local/share/membrane/startup-paths\n/usr/local/bin/entrypoint.sh\n/etc/passwd\n/etc/group\n/usr/lib/startup-runtime\n"
+	if err := tw.WriteHeader(&tar.Header{Name: "usr/local/share/membrane/startup-paths", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(reserved))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(reserved)); err != nil {
+		t.Fatal(err)
 	}
 	for _, name := range []string{"existing/keep", "existing/replaced", "file", "dir/keep", "target/marker", "home/agent/image-file"} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0644, Size: 5}); err != nil {
@@ -48,7 +55,7 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for name, target := range map[string]string{"link": "/target", "leaf-link": "/target/marker", "host-alias": "/host-real"} {
+	for name, target := range map[string]string{"link": "/target", "leaf-link": "/target/marker", "host-alias": "/host-real", "startup-alias": "/usr/lib/startup-runtime"} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Mode: 0777, Linkname: target}); err != nil {
 			t.Fatal(err)
 		}
@@ -167,7 +174,24 @@ func TestCopyAgentRootDocker(t *testing.T) {
 		}
 	})
 
-	for _, name := range []string{"link/escape", "leaf-link", "file/child", "dir", "usr/local/bin/entrypoint.sh"} {
+	// A configured mount must not hide the trusted startup list or redirect
+	// setup into replacement libraries through an image-side alias.
+	for _, destination := range []string{"/usr/local/share/membrane", "/usr/lib/startup-runtime", "/startup-alias"} {
+		t.Run("reserved-mount-"+destination, func(t *testing.T) {
+			stage := t.TempDir()
+			write(stage, "existing/replaced", "must not be sent", 0644)
+			id := create("--tmpfs", destination)
+			err := copyAgentRoot(ctx, stage, id, 1000, 1000)
+			if err == nil || !strings.Contains(err.Error(), destination) {
+				t.Fatalf("expected reserved mount rejection for %s: %v", destination, err)
+			}
+			contents, _ := read(id, "/existing/replaced")
+			if contents["replaced"] != "image" {
+				t.Fatalf("failed mount preflight copied template: %v", contents)
+			}
+		})
+	}
+	for _, name := range []string{"link/escape", "leaf-link", "file/child", "dir", "usr/local/bin/entrypoint.sh", "etc/passwd", "usr/lib/startup-runtime/loader.so"} {
 		t.Run("reject-"+name, func(t *testing.T) {
 			stage := filepath.Join(t.TempDir(), "stage")
 			write(stage, "existing/replaced", "must not be sent", 0644)

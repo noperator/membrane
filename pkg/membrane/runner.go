@@ -68,10 +68,12 @@ type sessionNames struct {
 	logsDir          string
 	runtimeDir       string
 
-	agentFileMounts []string
+	agentFileMounts []agentFileMount
 	directoryMounts []directoryMount
 	policyRoots     map[int]string
 }
+
+type agentFileMount struct{ source, destination string }
 
 // --mount refuses missing bind sources, unlike -v which can create them. CSV
 // encoding preserves source and destination paths as individual fields.
@@ -428,7 +430,7 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 	if s.cgroupParent == "" {
 		return nil, errors.New("workload requires a pre-created session cgroup")
 	}
-	args := []string{"create", "-it", "--rm", "--init", "--name", s.agentContainer}
+	args := []string{"create", "-it", "--init", "--name", s.agentContainer}
 
 	if sysbox {
 		args = append(args, "--runtime=sysbox-runc", "-e", "MEMBRANE_DIND=1")
@@ -447,15 +449,6 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		args = append(args, "--mount", directoryBind(mount.Path, mount.Path, mount.Mode == "ro"))
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-	agentHome := filepath.Join(home, ".membrane", "home")
-	if err := os.MkdirAll(agentHome, 0755); err != nil {
-		return nil, fmt.Errorf("create agent home dir: %w", err)
-	}
-	args = append(args, "-v", agentHome+":/home/agent")
 	args = append(args, "-v", s.caVolume+":/membrane-ca:ro")
 	args = append(args,
 		// CA trust for runtimes that don't use the system store by default
@@ -466,11 +459,77 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
 	)
 
-	args = append(args, s.agentFileMounts...)
+	// Explicit live mounts also mask generated instruction/config files. Docker
+	// otherwise mounts our more-specific file through a user-mounted parent.
+	var destinations []string
+	for _, mount := range s.directoryMounts {
+		destinations = append(destinations, mount.Path)
+	}
+	for i := 0; i < len(cfg.Args); i++ {
+		arg, value, kind := cfg.Args[i], "", ""
+		for _, flag := range []string{"--mount", "--volume", "--volumes-from", "--tmpfs", "-v"} {
+			if arg == flag {
+				if i+1 == len(cfg.Args) {
+					return nil, fmt.Errorf("%s requires a mount value", flag)
+				}
+				i++
+				kind, value = flag, cfg.Args[i]
+				break
+			}
+			if strings.HasPrefix(arg, flag+"=") {
+				kind, value = flag, strings.TrimPrefix(arg, flag+"=")
+				break
+			}
+		}
+		if kind == "" && strings.HasPrefix(arg, "-v") && len(arg) > 2 {
+			kind, value = "-v", arg[2:]
+		}
+		if kind == "--volumes-from" {
+			container, _, _ := strings.Cut(value, ":")
+			out, err := exec.Command("docker", "inspect", "-f", "{{json .Mounts}}", container).Output()
+			if err != nil {
+				return nil, fmt.Errorf("inspect inherited mounts from %s: %w", container, err)
+			}
+			var mounts []struct{ Destination string }
+			if err := json.Unmarshal(out, &mounts); err != nil {
+				return nil, fmt.Errorf("decode inherited mounts from %s: %w", container, err)
+			}
+			for _, mount := range mounts {
+				destinations = append(destinations, filepath.Clean(mount.Destination))
+			}
+		} else if kind == "--mount" {
+			fields, err := csv.NewReader(strings.NewReader(value)).Read()
+			if err != nil {
+				return nil, fmt.Errorf("parse --mount: %w", err)
+			}
+			for _, field := range fields {
+				key, val, _ := strings.Cut(field, "=")
+				if key = strings.ToLower(key); key == "dst" || key == "destination" || key == "target" {
+					destinations = append(destinations, filepath.Clean(val))
+				}
+			}
+		} else if kind != "" {
+			fields := strings.Split(value, ":")
+			destination := fields[0]
+			if kind != "--tmpfs" && len(fields) > 1 {
+				destination = fields[1]
+			}
+			destinations = append(destinations, filepath.Clean(destination))
+		}
+	}
+files:
+	for _, file := range s.agentFileMounts {
+		for _, destination := range destinations {
+			if file.destination == destination || strings.HasPrefix(file.destination, strings.TrimSuffix(destination, "/")+"/") {
+				continue files
+			}
+		}
+		args = append(args, "--mount", directoryBind(file.source, file.destination, true))
+	}
 	// Extra args from config.
 	args = append(args, cfg.Args...)
 	// Session identity takes precedence over a configured Docker parent.
-	args = append(args, "--cgroup-parent="+s.cgroupParent)
+	args = append(args, "--cgroup-parent="+s.cgroupParent, "--rm=false")
 
 	if title := os.Getenv("MEMBRANE_TITLE"); title != "" {
 		args = append(args, "-e", "MEMBRANE_TITLE="+title)
@@ -505,10 +564,34 @@ func gzipFile(dst string) (retErr error) {
 
 // runAgent keeps the existing terminal proxy for start/attach and stops the
 // workload if its handler exits. Creation never executes image code.
-func runAgent(ctx context.Context, s sessionNames, args []string) error {
+func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Watch required services throughout preparation, which can take longer
+	// than container creation. A failed handler must cancel copy-in too.
+	setupCtx, cancelSetup := context.WithCancel(ctx)
+	defer cancelSetup()
+	waitCtx, cancel := context.WithCancel(context.Background())
+	handlerDone := make(chan error, 1)
+	waitFinished := make(chan struct{})
+	defer func() {
+		cancel()
+		<-waitFinished
+		select {
+		case err := <-handlerDone:
+			retErr = errors.Join(retErr, err)
+		default:
+		}
+	}()
+	go func() {
+		defer close(waitFinished)
+		out, err := exec.CommandContext(waitCtx, "docker", "wait", s.handlerContainer).CombinedOutput()
+		if waitCtx.Err() == nil {
+			handlerDone <- fmt.Errorf("handler exited during session: %s (%v)", strings.TrimSpace(string(out)), err)
+			cancelSetup()
+		}
+	}()
 	if args[0] == "create" {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			for i, arg := range args {
@@ -517,28 +600,19 @@ func runAgent(ctx context.Context, s sessionNames, args []string) error {
 				}
 			}
 		}
-		if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(setupCtx, "docker", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("create agent: %s: %w", out, err)
+		}
+		// The bundled agent starts as UID/GID 1000. Its entrypoint then adjusts
+		// only private home objects to the workspace's container-side identity.
+		if err := copyAgentRoot(setupCtx, filepath.Join(s.runtimeDir, "agent-root"), s.agentContainer, 1000, 1000); err != nil {
+			return fmt.Errorf("prepare agent filesystem: %w", err)
 		}
 		args = []string{"start", "--attach", "--interactive", s.agentContainer}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := setupCtx.Err(); err != nil {
 		return err
 	}
-	// Cancellation is handled by the select below. Canceling docker wait at
-	// the same time would incorrectly report an intentional stop as failure.
-	waitCtx, cancel := context.WithCancel(context.Background())
-	handlerDone := make(chan error, 1)
-	waitFinished := make(chan struct{})
-	defer func() {
-		cancel()
-		<-waitFinished
-	}()
-	go func() {
-		defer close(waitFinished)
-		out, err := exec.CommandContext(waitCtx, "docker", "wait", s.handlerContainer).CombinedOutput()
-		handlerDone <- fmt.Errorf("handler exited during session: %s (%v)", strings.TrimSpace(string(out)), err)
-	}()
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- execDocker(args) }()
 	select {

@@ -590,9 +590,10 @@ class Session:
     started process is stopped even when a host-side assertion fails.
     """
 
-    def __init__(self, ctx, directory, command, *, options=(), env=None, terminal=False):
+    def __init__(self, ctx, directory, command, *, options=(), env=None, terminal=False, name=""):
         self.ctx, self.directory = ctx, directory
-        self.idfile = directory / "session-id"
+        self.idfile = directory / ("session-id-" + name if name else "session-id")
+        self.logfile = directory / ("output-" + name + ".log" if name else "output.log")
         self.args = [ctx.membrane_cmd, "--no-update", "--no-global-config",
                      f"--session-id-file={self.idfile}", *options, "--", *command]
         self.env = env if env is not None else ctx.environment
@@ -605,7 +606,7 @@ class Session:
     def __enter__(self):
         trust_fixture(self.ctx, self.directory, self.env)
         try:
-            self.log = (self.directory / "output.log").open("w")
+            self.log = self.logfile.open("w")
             if self.use_terminal:
                 self.terminal = pty.openpty()
                 self.terminal_state = termios.tcgetattr(self.terminal[1])
@@ -633,7 +634,7 @@ class Session:
         return self.idfile.read_text().strip()
 
     def output(self):
-        return (self.directory / "output.log").read_text()
+        return self.logfile.read_text()
 
     def details(self, expected):
         return command_details(self.args, expected, self.process.poll(),
@@ -1489,14 +1490,15 @@ for secure, method, expected in ((False, 'DELETE', b'403'), (True, 'DELETE', b'4
 
 
 def group_36(ctx):
-    # Isolate user-managed files and shared client home from the real user.
+    # Instruction composition must use a session snapshot and preserve all host
+    # originals, including independently customized Codex and Claude guidance.
     home = ctx.workdir / "host-home"
     state = home / ".membrane"
     env = isolated_home(ctx, home)
     membrane(ctx, ["true"], env=env)
-    check(ctx, all((state / name).read_bytes() == (REPO_ROOT / name).read_bytes()
-                   and not (state / name).is_symlink() for name in ("config.yaml", "AGENTS.md")),
-          "both missing user files initialized as independent copies")
+    check(ctx, (state / "config.yaml").read_bytes() == (REPO_ROOT / "config.yaml").read_bytes()
+          and not (state / "home").exists() and not (state / "AGENTS.md").exists(),
+          "configuration initialized without creating legacy home or guidance")
     template = state / "agent-root"
     check(ctx, all((template / name).read_bytes() == (REPO_ROOT / "AGENTS.md").read_bytes()
                    and not (template / name).is_symlink()
@@ -1508,29 +1510,34 @@ def group_36(ctx):
     project = {name: "project " + name + "\n" for name in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md")}
     for name, content in project.items():
         (ctx.workdir / name).write_text(content)
-    codex = state / "home/.codex"
+    codex = template / "home/agent/.codex"
+    codex.mkdir(parents=True)
+    canonical = template / "etc/membrane/AGENTS.md"
+    claude = template / "etc/claude-code/CLAUDE.md"
     base = "Existing Codex instructions.\n"
     (codex / "AGENTS.md").write_text(base)
     shipped = (REPO_ROOT / "AGENTS.md").read_text()
     for number, (override, skip) in enumerate(((None, False), ("User override.\n", False), (" \n", True))):
         if number == 1:
-            for name in ("config.yaml", "AGENTS.md"):
-                (state / name).rename(state / (name + ".user"))
-                (state / name).symlink_to(name + ".user")
+            for source in (state / "config.yaml", canonical, claude):
+                source.rename(source.with_name(source.name + ".user"))
+                source.symlink_to(source.name + ".user")
         guidance = shipped + f"\nUser guidance revision {number}\n"
-        (state / "AGENTS.md").write_text(guidance)
+        canonical.write_text(guidance)
+        claude_guidance = f"Independent Claude guidance {number}\n"
+        claude.write_text(claude_guidance)
         if override is not None:
             (codex / "AGENTS.override.md").write_text(override)
         active = "AGENTS.override.md" if override and override.strip() else "AGENTS.md"
         original = override if active == "AGENTS.override.md" else base
         result = membrane(ctx, ["python3", "-c", r"""import errno, json, sys
 from pathlib import Path
-active, original, guidance, global_yaml, skip, project = sys.argv[1:]
+active, original, guidance, claude_guidance, global_yaml, skip, project = sys.argv[1:]
 canonical = Path('/etc/membrane/AGENTS.md')
 claude = Path('/etc/claude-code/CLAUDE.md')
 codex = Path('/home/agent/.codex') / active
 assert canonical.read_text() == guidance
-assert claude.read_text() == guidance
+assert claude.read_text() == claude_guidance
 assert codex.read_text() == original + '\n\n' + guidance
 files = [canonical, claude, codex]
 global_file = Path('/etc/membrane/config.yaml')
@@ -1553,25 +1560,26 @@ for file in files:
     else:
         raise AssertionError(str(file) + ' is writable')
 print('editable-instructions-ok')
-""", active, original, guidance, global_yaml, str(skip).lower(), json.dumps(project)], env=env,
+""", active, original, guidance, claude_guidance, global_yaml, str(skip).lower(), json.dumps(project)], env=env,
             options=["--no-global-config=" + str(skip).lower(), "--allow=203.0.113.0/24"])
         check(ctx, "editable-instructions-ok" in result.stdout,
               f"revision {number}: latest guidance, readonly files, Codex {active}, skip global={skip}")
         check(ctx, (codex / "AGENTS.md").read_text() == base and
               (override is None or (codex / "AGENTS.override.md").read_text() == override),
-              "shared Codex originals unchanged")
+              "template Codex originals unchanged")
         check(ctx, all((ctx.workdir / name).read_text() == content for name, content in project.items()),
               "project instructions unchanged")
         check(ctx, (state / "config.yaml").read_text() == global_yaml and
-              (state / "AGENTS.md").read_text() == guidance and
-              (number == 0 or all(os.readlink(state / name) == name + ".user" for name in ("config.yaml", "AGENTS.md"))),
+              canonical.read_text() == guidance and claude.read_text() == claude_guidance and
+              (number == 0 or all(os.readlink(source) == source.name + ".user"
+                                 for source in (state / "config.yaml", canonical, claude))),
               "user edits and symlinks preserved on subsequent starts")
         check(ctx, not list((state / "sessions").glob("*/runtime")), "session copies cleaned up")
 
-    # Preparation must happen on each invocation without changing the active
-    # home yet. Readonly template directories must not strand disposable state.
-    private = template / "home/agent"
-    private.mkdir(parents=True)
+    # Readonly imported directories must retain modes without stranding runtime
+    # cleanup. Later template edits cannot change a staged or running session.
+    private = template / "home/agent/readonly-fixture"
+    private.mkdir()
     original = private / "membrane-template-fixture"
     original.write_text("first")
     private.chmod(0o555)
@@ -1581,15 +1589,20 @@ print('editable-instructions-ok')
             directory.mkdir()
             command = ["python3", "-c", """from pathlib import Path
 import time
-assert not Path('/home/agent/membrane-template-fixture').exists()
+import sys
+file = Path('/home/agent/readonly-fixture/membrane-template-fixture')
+assert file.read_text() == sys.argv[1]
+assert file.parent.stat().st_mode & 0o777 == 0o555
 Path('ready').touch()
 while not Path('continue').exists():
     time.sleep(.02)
-"""]
+assert file.read_text() == sys.argv[1]
+file.write_text('private workload edit')
+""", revision]
             with Session(ctx, directory, command, env=env, options=["--no-trace"]) as session:
                 session.wait_for("ready")
                 runtime = state / "sessions" / session.id / "runtime"
-                prepared = runtime / "agent-root/home/agent/membrane-template-fixture"
+                prepared = runtime / "agent-root/home/agent/readonly-fixture/membrane-template-fixture"
                 check(ctx, prepared.read_text() == revision and prepared.parent.stat().st_mode & 0o777 == 0o555,
                       revision + ": private staged contents and readonly directory mode")
                 original.write_text("later")
@@ -1598,7 +1611,8 @@ while not Path('continue').exists():
                 check(ctx, original.read_text() == "later", "staged edit does not alter template")
                 session.release()
                 session.wait()
-                check(ctx, not runtime.exists(), "readonly staging cleaned up")
+                check(ctx, original.read_text() == "later" and not runtime.exists(),
+                      "private writes leave template unchanged; readonly staging cleaned up")
                 cleaned(ctx, session)
     finally:
         private.chmod(0o755)
@@ -2369,6 +2383,234 @@ while not Path('continue').exists():
           "only installation build logs may use the shared log directory")
 
 
+def group_41(ctx):
+    # Actual concurrent agents must have independent private homes even in the
+    # same workspace. Nested live mounts must win without copy/chown writeback.
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    template = state / 'agent-root'
+    home = template / 'home/agent'
+    home.mkdir(parents=True)
+    workspace = ctx.workdir / 'workspace'
+    workspace.mkdir()
+    source = ctx.workdir / 'external template source'
+    source.mkdir()
+    (source / 'seed').write_text('first')
+    (source / 'tool').write_text('#!/bin/sh\nprintf template-tool')
+    (source / 'tool').chmod(0o750)
+    (home / 'imported').symlink_to(source, target_is_directory=True)
+    (home / 'empty').mkdir(mode=0o750)
+    extra = template / 'opt/template-fixture'
+    extra.mkdir(parents=True)
+    (extra / 'config').write_text('outside home')
+    # These tools are not invoked by trusted startup: mkdir/dirname are build
+    # helpers, and the other names are unused aliases of absolute invocations.
+    # Replacements must be copied successfully and run only as workload code.
+    custom_tools = ('/usr/bin/mkdir', '/usr/bin/dirname', '/usr/sbin/python3',
+                    '/usr/bin/capsh', '/usr/bin/gosu', '/usr/sbin/crun')
+    for name in custom_tools:
+        tool = template / name.lstrip('/')
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text('#!/bin/sh\nif [ "$(id -u)" = 0 ]; then\n'
+                        '  echo intercepted > /startup-tool-intercepted\n  exit 97\nfi\n'
+                        'printf workload-only-customization')
+        tool.chmod(0o755)
+    # ldconfig inputs are inert until the workload invokes ldconfig; startup
+    # must continue using the image's protected loader cache and preload file.
+    for name in ('etc/ld.so.conf', 'etc/ld.so.conf.d/membrane-fixture.conf'):
+        file = template / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('/opt/template-fixture\n')
+    # Dangling legacy paths would abort startup if any old implicit read remained.
+    for name in ('home', 'AGENTS.md'):
+        (state / name).symlink_to('unused-legacy-' + name)
+    shared = ctx.workdir / 'shared'
+    shared.mkdir()
+    (shared / 'readonly').mkdir()
+    (shared / 'marker').write_text('host shared')
+    readonly = ctx.workdir / 'readonly'
+    readonly.mkdir()
+    (readonly / 'marker').write_text('host readonly')
+    host_file = ctx.workdir / 'host-file'
+    host_file.write_text('host file')
+    codex = ctx.workdir / 'explicit-codex'
+    codex.mkdir()
+    (codex / 'AGENTS.md').write_text('explicit Codex')
+    guidance = ctx.workdir / 'explicit-guidance'
+    guidance.mkdir()
+    (guidance / 'AGENTS.md').write_text('explicit guidance')
+    for name in ('shared/marker', 'shared/not-on-host', 'shared/readonly/marker',
+                 'mounted-file', '.codex/AGENTS.md'):
+        file = home / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('masked template')
+    args = ['--mount', f'type=bind,src={shared},dst=/home/agent/shared',
+            '--mount', f'type=bind,src={readonly},dst=/home/agent/shared/readonly,readonly',
+            '-v', f'{host_file}:/home/agent/mounted-file:ro',
+            '--volume', f'{codex}:/home/agent/.codex:ro',
+            '--mount', f'type=bind,src={guidance},dst=/etc/membrane,readonly']
+    (workspace / '.membrane.yaml').write_text(json.dumps({'args': args}))
+    originals = {}
+    for root in (shared, readonly, host_file, codex, guidance):
+        for file in [root, *(root.rglob('*') if root.is_dir() else [])]:
+            stat = file.stat()
+            originals[file] = (stat.st_uid, stat.st_gid, stat.st_mode,
+                               file.read_bytes() if file.is_file() else None)
+    command = ['/usr/bin/python3', '-c', r'''import errno, os, subprocess, sys, time
+from pathlib import Path
+name, revision, tools = sys.argv[1:]
+home = Path('/home/agent')
+assert os.getuid() != 0
+assert (home / 'imported/seed').read_text() == revision
+assert not (home / 'imported').is_symlink()
+assert (home / 'empty').stat().st_mode & 0o777 == 0o750
+assert (home / 'imported/tool').stat().st_mode & 0o777 == 0o750
+assert subprocess.check_output([str(home / 'imported/tool')]) == b'template-tool'
+assert Path('/opt/template-fixture/config').read_text() == 'outside home'
+assert not Path('/startup-tool-intercepted').exists(), 'custom tool intercepted trusted startup'
+for tool in tools.split():
+    assert subprocess.check_output([tool]) == b'workload-only-customization'
+for config_path in ('/etc/ld.so.conf', '/etc/ld.so.conf.d/membrane-fixture.conf'):
+    assert Path(config_path).read_text() == '/opt/template-fixture\n'
+private = home / 'session-private'
+assert not private.exists(), 'state leaked from another session'
+private.write_text(name)
+assert private.stat().st_uid == os.getuid()
+(home / 'imported/seed').write_text(name)
+assert (home / '.codex/AGENTS.md').read_text() == 'explicit Codex'
+assert Path('/etc/membrane/AGENTS.md').read_text() == 'explicit guidance'
+assert not (home / 'shared/not-on-host').exists()
+assert (home / 'shared/marker').read_text() == 'host shared'
+for file, expected in ((home / 'mounted-file', 'host file'),
+                       (home / 'shared/readonly/marker', 'host readonly')):
+    assert file.read_text() == expected
+    try:
+        file.write_text('must fail')
+    except OSError as error:
+        assert error.errno == errno.EROFS, error
+    else:
+        raise AssertionError('readonly mount accepted a write')
+(home / ('shared/' + name)).write_text(name)
+Path(name + '-ready').touch()
+while not Path(name + '-continue').exists():
+    time.sleep(.02)
+assert private.read_text() == name
+assert (home / 'imported/seed').read_text() == name
+if name == 'a':
+    assert (home / 'shared/b').read_text() == 'b'
+if name == 'b':
+    assert (home / 'shared/a').read_text() == 'a'
+Path(name + '-completed').touch()
+''']
+    with ExitStack() as stack:
+        sessions = []
+        for name in ('a', 'b'):
+            session = stack.enter_context(Session(ctx, workspace, [*command, name, 'first', ' '.join(custom_tools)],
+                                                  name=name, options=['--no-trace']))
+            session.wait_for(name + '-ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            check(ctx, not agent['HostConfig']['AutoRemove']
+                  and all(m['Destination'] != '/home/agent' for m in agent['Mounts']),
+                  name + ': private home and explicit container removal')
+            check(ctx, all(m['Source'] not in (str(template), str(state / 'home'), str(state / 'AGENTS.md'))
+                           for m in agent['Mounts']), name + ': no template or legacy mount')
+            check(ctx, 'legacy ~/.membrane/' not in session.output(), name + ': no legacy migration notice')
+            check(ctx, 'Built membrane-agent' not in session.output(), name + ': no forced image rebuild')
+            sessions.append(session)
+
+        # An unmapped bind can report nobody's UID. Account adjustment must not
+        # create duplicate identities and break sudo. A private fixture workdir
+        # makes the occupied/free/root UID cases deterministic on either host.
+        ca = next(m['Name'] for m in agent['Mounts'] if m['Destination'] == '/membrane-ca')
+        for uid in (65534, 23456, 0):
+            result = run(ctx, ['docker', 'run', '--rm', '--network=none',
+                              '--mount', f'type=volume,src={ca},dst=/membrane-ca,readonly',
+                              '-e', 'MEMBRANE_GATEWAY=127.0.0.1', '--entrypoint=/bin/bash',
+                              'membrane-agent', '-ec', '''
+image_uid=$(id -u agent)
+mkdir /identity-workspace
+chown "$1:$1" /identity-workspace
+cd /identity-workspace
+shift
+exec /usr/local/bin/entrypoint.sh "$@" "$image_uid"
+''', 'identity-check', str(uid), 'python3', '-c', '''import grp, os, pwd, subprocess, sys
+from pathlib import Path
+requested, original = map(int, sys.argv[1:])
+expected = original if requested in (0, 65534) else requested
+assert os.getuid() == expected, (os.getuid(), expected)
+assert pwd.getpwuid(os.getuid()).pw_name == 'agent'
+assert grp.getgrgid(os.getgid()).gr_name == 'agent'
+assert Path.home() == Path('/home/agent')
+Path.home().joinpath('ordinary-write').write_text('private')
+assert subprocess.check_output(['sudo', '-n', 'id', '-u'], text=True).strip() == '0'
+print('identity-and-sudo-ok')
+''', str(uid)])
+            check(ctx, 'identity-and-sudo-ok' in result.stdout,
+                  f'workspace UID {uid}: unique agent identity, writable home and passwordless sudo')
+        (source / 'seed').write_text('later')
+        for name, session in zip(('a', 'b'), sessions):
+            session.release(name + '-continue')
+            session.wait()
+            check(ctx, (workspace / (name + '-completed')).exists(),
+                  name + ': private changes isolated; workspace and shared writes live')
+            cleaned(ctx, session)
+    with Session(ctx, workspace, [*command, 'later', 'later', ' '.join(custom_tools)],
+                 name='later', options=['--no-trace']) as session:
+        session.wait_for('later-ready')
+        session.release('later-continue')
+        session.wait()
+        cleaned(ctx, session)
+    for file, expected in originals.items():
+        stat = file.stat()
+        check(ctx, (stat.st_uid, stat.st_gid, stat.st_mode,
+                    file.read_bytes() if file.is_file() else None) == expected,
+              'copy and private ownership leave host object unchanged: ' + file.name)
+    check(ctx, (source / 'seed').read_text() == 'later' and (home / 'imported').is_symlink()
+          and not (home / 'session-private').exists() and not (shared / 'not-on-host').exists(),
+          'no private writes reach template, link target or masked host tree')
+    check(ctx, all(os.readlink(state / name) == 'unused-legacy-' + name for name in ('home', 'AGENTS.md')),
+          'legacy originals untouched and unread')
+    check(ctx, True, 'build-only helpers, unused executable aliases and ldconfig inputs can be customized')
+
+    # Destination rejection must happen before the user command, and teardown
+    # must remove a created agent even though automatic removal is disabled.
+    # Negative controls retain the actual executables used by CA setup, private
+    # ownership adjustment, capability dropping, user switching and nested Docker.
+    for name in ('bin/membrane-copy-sentinel', 'etc/passwd', 'usr/bin/cp',
+                 'usr/bin/python3', 'usr/sbin/capsh', 'usr/sbin/gosu', 'usr/bin/crun', 'etc/ld.so.preload'):
+        bad = template / name
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text('must not install')
+        directory = ctx.workdir / ('failed-copy-' + bad.name)
+        directory.mkdir()
+        try:
+            with Session(ctx, directory, ['touch', 'workload-started'], options=['--no-trace']) as session:
+                output = session.wait(expected=1)
+                check(ctx, 'prepare agent filesystem' in output and not (directory / 'workload-started').exists(),
+                      name + ': failed copy never starts workload')
+                if not name.startswith('bin/'):
+                    check(ctx, '/' + name in output and 'reserved for Membrane startup' in output,
+                          name + ': reports requested destination and reservation')
+                cleaned(ctx, session)
+        finally:
+            bad.unlink()
+            # Remove the empty /bin overlay before the next collision case.
+            if name.startswith('bin/'):
+                bad.parent.rmdir()
+    # Raw mounts must not hide startup tools or their manifest, including an
+    # ancestor mount of the manifest. Existing copy tests cover image aliases.
+    for destination, protected in (('/usr/sbin/cp', '/usr/sbin/cp'),
+                                   ('/usr/local/share/membrane', '/usr/local/share/membrane/startup-paths')):
+        directory = ctx.workdir / ('failed-mount-' + Path(destination).name)
+        directory.mkdir()
+        (directory / '.membrane.yaml').write_text(json.dumps({'args': ['--tmpfs', destination]}))
+        with Session(ctx, directory, ['touch', 'workload-started'], options=['--no-trace']) as session:
+            output = session.wait(expected=1)
+            check(ctx, destination in output and protected in output and 'reserved Membrane startup path' in output
+                  and not (directory / 'workload-started').exists(), 'startup mount collision: ' + destination)
+            cleaned(ctx, session)
+    check(ctx, not list((state / 'sessions').glob('*/runtime')), 'all private preparation state cleaned up')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -2416,6 +2658,7 @@ GROUPS = {
     38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
     39: TestGroup("workspace configuration trust, persistence and strict parsing", group_39),
     40: TestGroup("private session outputs, live delivery and runtime cleanup", group_40),
+    41: TestGroup("private agent state, nested mount precedence and failed-copy cleanup", group_41),
 }
 
 

@@ -21,14 +21,17 @@ func TestWriteDefaultFiles(t *testing.T) {
 				if err := os.Mkdir(filepath.Join(dir, "src"), 0755); err != nil {
 					t.Fatal(err)
 				}
-				states := map[string]string{"config.yaml": configState, "AGENTS.md": agentsState}
+				states := map[string]string{"config.yaml": configState, "agent-root/etc/membrane/AGENTS.md": agentsState}
 				for name, state := range states {
-					if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("shipped "+name), 0644); err != nil {
+					if err := os.WriteFile(filepath.Join(dir, "src", filepath.Base(name)), []byte("shipped "+name), 0644); err != nil {
 						t.Fatal(err)
 					}
 					dest := filepath.Join(dir, name)
+					if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+						t.Fatal(err)
+					}
 					if state == "symlink" {
-						if err := os.Symlink(name+".user", dest); err != nil {
+						if err := os.Symlink(filepath.Base(name)+".user", dest); err != nil {
 							t.Fatal(err)
 						}
 						dest += ".user"
@@ -54,12 +57,12 @@ func TestWriteDefaultFiles(t *testing.T) {
 						}
 						if state == "symlink" {
 							target, err := os.Readlink(filepath.Join(dir, name))
-							if err != nil || target != name+".user" {
+							if err != nil || target != filepath.Base(name)+".user" {
 								t.Fatalf("replaced symlink %s: %s, %v", name, target, err)
 							}
 						}
 						// A subsequent repository update must not refresh either copy.
-						if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("updated"), 0644); err != nil {
+						if err := os.WriteFile(filepath.Join(dir, "src", filepath.Base(name)), []byte("updated"), 0644); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -70,7 +73,7 @@ func TestWriteDefaultFiles(t *testing.T) {
 }
 
 func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
-	for _, name := range []string{"config.yaml", "AGENTS.md"} {
+	for _, name := range []string{"config.yaml"} {
 		for _, target := range []string{"missing", name, "src"} {
 			t.Run(name+"/"+target, func(t *testing.T) {
 				dir := t.TempDir()
@@ -97,6 +100,42 @@ func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Existing images need no version label; setup should build only missing images.
+// A command fixture catches accidental inspections/upgrades without a real build.
+func TestEnsureImagesBuildsOnlyMissing(t *testing.T) {
+	for _, missing := range []string{"", agentImageName, handlerImageName} {
+		t.Run("missing-"+missing, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("MISSING_IMAGE", missing)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  images) [ "$3" = "$MISSING_IMAGE" ] || echo unlabeled-image ;;
+  build) printf '%s\n' "$*" >> "$TEST_ROOT/builds" ;;
+  *) exit 99 ;;
+esac
+exit 0`)
+			if err := ensureImages(dir); err != nil {
+				t.Fatal(err)
+			}
+			builds, err := os.ReadFile(filepath.Join(dir, "builds"))
+			if missing == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("rebuilt existing images: %s (%v)", builds, err)
+				}
+			} else {
+				context := strings.TrimPrefix(missing, "membrane-")
+				want := "build -t " + missing + " " + filepath.Join(dir, "docker", context) + "\n"
+				if err != nil || string(builds) != want {
+					t.Fatalf("missing image build: %q, want %q (%v)", builds, want, err)
+				}
+			}
+		})
 	}
 }
 

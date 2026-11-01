@@ -1,6 +1,7 @@
 package membrane
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"context"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAgentDockerArguments(t *testing.T) {
@@ -22,7 +24,7 @@ func TestAgentDockerArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent"}}
+	cfg := &config{Args: []string{"--cgroup-parent=/configured-parent", "--rm"}}
 	// A merged readonly workspace must reach Docker without losing its workdir
 	// or adding a second bind for the same destination.
 	for _, test := range []struct{ parent, mode string }{{"/membrane-test", "rw"}, {"/membrane-test", "ro"}, {"", "rw"}} {
@@ -65,6 +67,131 @@ func TestAgentDockerArguments(t *testing.T) {
 		if strings.LastIndex(joined, "--cgroup-parent=") != strings.Index(joined, "--cgroup-parent="+parent) {
 			t.Fatalf("configuration overrode session parent: %v", args)
 		}
+		// Private state must survive workload exit until owned cleanup runs;
+		// a legacy home bind would also silently restore previous agent writes.
+		if strings.Contains(joined, ":/home/agent") || slices.Index(args, "--rm=false") < slices.Index(args, "--rm") {
+			t.Fatalf("private home or explicit removal was overridden: %v", args)
+		}
+	}
+}
+
+// A generated file below an explicit mount would mask the user's live file and
+// could make Docker create its mountpoint in host data. Cover supported flag
+// spellings, while leaving Docker's existing user-mount conflict rules intact.
+func TestAgentInstructionMountPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	hostFixtureCommand(t, dir, "docker", `
+test "$1 $2 $3 $4" = 'inspect -f {{json .Mounts}} fixture' || exit 99
+echo '[{"Destination":"/home/agent"}]'`)
+	for _, args := range [][]string{
+		{"--mount", "type=bind,src=/source,dst=/home/agent"},
+		{"--mount=type=bind,src=/source,destination=/home/agent/.codex"},
+		{"--mount", "type=volume,src=codex,target=/home/agent/.codex/AGENTS.md"},
+		{"-v", "/source:/home/agent"},
+		{"-v/source:/home/agent"},
+		{"--volume=/source:/home/agent:ro"},
+		{"--tmpfs", "/home/agent:rw"},
+		{"--volumes-from=fixture:ro"},
+	} {
+		s := sessionNames{cgroupParent: "/test", agentFileMounts: []agentFileMount{
+			{"/generated-codex", "/home/agent/.codex/AGENTS.md"},
+			{"/generated-membrane", "/etc/membrane/AGENTS.md"},
+		}}
+		got, err := buildAgentArgs("/workspace", &config{Args: args}, nil, s, "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(got, " ")
+		if strings.Contains(joined, "src=/generated-codex") || !strings.Contains(joined, "src=/generated-membrane") {
+			t.Errorf("incorrect implicit mount masking for %v: %v", args, got)
+		}
+	}
+}
+
+// Copy-in can outlast handler readiness. Required-service death must interrupt
+// preparation and retain the actual failure, never launch an unprotected agent.
+func TestHandlerFailureDuringAgentPreparation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TEST_ROOT", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  create) exit 0 ;;
+  inspect) touch "$TEST_ROOT/copying"; exec sleep 30 ;;
+  wait) while [ ! -e "$TEST_ROOT/copying" ]; do sleep .01; done; echo 137 ;;
+  start) touch "$TEST_ROOT/started" ;;
+esac`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := runAgent(ctx, sessionNames{handlerContainer: "handler", agentContainer: "agent"}, []string{"create"})
+	if err == nil || !strings.Contains(err.Error(), "handler exited during session: 137") || ctx.Err() != nil {
+		t.Fatalf("handler failure did not interrupt copy-in: %v (context %v)", err, ctx.Err())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "started")); !os.IsNotExist(err) {
+		t.Fatal("workload started after handler failure")
+	}
+}
+
+// An old or damaged image must fail with a rebuild command before user code can
+// run. Exercise the launcher, including cancellation of its handler watcher.
+func TestAgentRequiresStartupManifest(t *testing.T) {
+	for _, mode := range []string{"missing", "invalid-tar", "symlink", "incomplete", "invalid-path"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if mode != "missing" {
+				f, err := os.Create(filepath.Join(dir, "manifest.tar"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "invalid-tar" {
+					_, err = f.WriteString("not an archive")
+				} else {
+					data := "/usr/local/share/membrane/startup-paths\n"
+					if mode == "invalid-path" {
+						data += "/usr/local/bin/entrypoint.sh\n../outside\n"
+					}
+					header := &tar.Header{Name: "startup-paths", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(data))}
+					if mode == "symlink" {
+						header.Typeflag, header.Linkname, header.Size, data = tar.TypeSymlink, "/untrusted", 0, ""
+					}
+					tw := tar.NewWriter(f)
+					if err = tw.WriteHeader(header); err == nil {
+						_, err = tw.Write([]byte(data))
+					}
+					if closeErr := tw.Close(); err == nil {
+						err = closeErr
+					}
+				}
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  create) exit 0 ;;
+  inspect) echo '[{"ID":"agent","State":{"Status":"created"}}]' ;;
+  cp) test "$2" = 'agent:/usr/local/share/membrane/startup-paths' || exit 99
+      cat "$TEST_ROOT/manifest.tar" ;;
+  wait) exec sleep 30 ;;
+  start) touch "$TEST_ROOT/started" ;;
+  *) exit 99 ;;
+esac`)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := runAgent(ctx, sessionNames{handlerContainer: "handler", agentContainer: "agent"}, []string{"create"})
+			if err == nil || !strings.Contains(err.Error(), "startup path") || !strings.Contains(err.Error(), "docker build -t membrane-agent docker/agent") || ctx.Err() != nil {
+				t.Fatalf("missing actionable manifest failure: %v (context %v)", err, ctx.Err())
+			}
+			if _, err := os.Stat(filepath.Join(dir, "started")); !os.IsNotExist(err) {
+				t.Fatal("workload started without a valid startup manifest")
+			}
+		})
 	}
 }
 

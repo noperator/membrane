@@ -267,11 +267,9 @@ func buildImageFromDir(name, dir string) error {
 // writeDefaultFiles initializes independent user-managed copies, never replacing
 // existing files or symlinks, including dangling links.
 func writeDefaultFiles(membraneHomeDir string) error {
-	// Legacy guidance stays active until private-home activation. Both new
-	// defaults are independent copies of shipped guidance, never legacy state.
+	// Defaults are independent copies of shipped guidance, never legacy state.
 	defaults := []struct{ source, destination string }{
 		{"config.yaml", "config.yaml"},
-		{"AGENTS.md", "AGENTS.md"},
 		{"AGENTS.md", "agent-root/etc/membrane/AGENTS.md"},
 		{"AGENTS.md", "agent-root/etc/claude-code/CLAUDE.md"},
 	}

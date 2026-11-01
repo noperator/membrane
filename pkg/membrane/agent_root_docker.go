@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -23,7 +25,6 @@ import (
 // copyAgentRoot overlays a prepared tree onto a never-started container. Docker
 // archive operations mount configured volumes even in this state, so exclusions
 // are resolved in Docker's own filesystem view before constructing the upload.
-// This is exercised on disposable containers; workload activation is separate.
 func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) (retErr error) {
 	out, err := exec.CommandContext(ctx, "docker", "inspect", container).Output()
 	if err != nil {
@@ -42,6 +43,48 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 		return errors.New("template destination must be a never-started container")
 	}
 	container = containers[0].ID
+	// Include tmpfs even on Engines which omit it from inspect's Mounts list.
+	var configuredMounts []string
+	for _, mount := range containers[0].Mounts {
+		configuredMounts = append(configuredMounts, path.Clean(mount.Destination))
+	}
+	for name := range containers[0].HostConfig.Tmpfs {
+		configuredMounts = append(configuredMounts, path.Clean(name))
+	}
+	const startupPaths = "/usr/local/share/membrane/startup-paths"
+	const rebuild = "rebuild the agent image from the Membrane source directory: docker build -t membrane-agent docker/agent"
+	for _, mount := range configuredMounts {
+		if startupPaths == mount || strings.HasPrefix(startupPaths, strings.TrimSuffix(mount, "/")+"/") {
+			return fmt.Errorf("mount %s masks reserved Membrane startup path %s", mount, startupPaths)
+		}
+	}
+	// This file belongs to the bundled image, before any template writes. It
+	// includes the actual interpreter/library locations used by that image.
+	out, err = exec.CommandContext(ctx, "docker", "cp", container+":"+startupPaths, "-").Output()
+	if err != nil {
+		return fmt.Errorf("read trusted startup path list %s; %s: %w", startupPaths, rebuild, err)
+	}
+	tr := tar.NewReader(bytes.NewReader(out))
+	header, err := tr.Next()
+	if err != nil {
+		return fmt.Errorf("invalid trusted startup path list; %s: %w", rebuild, err)
+	}
+	if header.Typeflag != tar.TypeReg {
+		return fmt.Errorf("trusted startup path list must be a regular file; %s", rebuild)
+	}
+	data, err := io.ReadAll(tr)
+	if err != nil {
+		return fmt.Errorf("read trusted startup path list; %s: %w", rebuild, err)
+	}
+	reserved := strings.Fields(string(data))
+	if !slices.Contains(reserved, startupPaths) || !slices.Contains(reserved, "/usr/local/bin/entrypoint.sh") {
+		return fmt.Errorf("incomplete trusted startup path list; %s", rebuild)
+	}
+	for _, name := range reserved {
+		if !path.IsAbs(name) || path.Clean(name) != name || name == "/" {
+			return fmt.Errorf("invalid reserved startup path %q; %s", name, rebuild)
+		}
+	}
 	// The CLI transports the small Engine stat requests using the selected
 	// Docker context, including Colima/SSH/TLS, without another client library.
 	proxy := exec.CommandContext(ctx, "docker", "system", "dial-stdio")
@@ -112,12 +155,7 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 	// Runtime filesystems and Docker-generated host files are never template
 	// targets. Include all configured mount kinds, not just Membrane's binds.
 	mounts := []string{"/dev", "/proc", "/sys", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf"}
-	for _, mount := range containers[0].Mounts {
-		mounts = append(mounts, mount.Destination)
-	}
-	for name := range containers[0].HostConfig.Tmpfs {
-		mounts = append(mounts, name)
-	}
+	mounts = append(mounts, configuredMounts...)
 	sort.Slice(mounts, func(i, j int) bool { return len(mounts[i]) < len(mounts[j]) })
 	var excluded []string
 	isExcluded := func(name string) bool {
@@ -145,6 +183,13 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 					return fmt.Errorf("unresolved mounted destination %s: %q", mount, info.LinkTarget)
 				}
 				resolved = path.Clean(info.LinkTarget)
+			}
+		}
+		for _, destination := range []string{mount, resolved} {
+			for _, name := range reserved {
+				if name == destination || strings.HasPrefix(name, strings.TrimSuffix(destination, "/")+"/") || strings.HasPrefix(destination, name+"/") {
+					return fmt.Errorf("mount %s overlaps reserved Membrane startup path %s", mount, name)
+				}
 			}
 		}
 		excluded = append(excluded, path.Clean(mount), resolved)
@@ -182,8 +227,10 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported staged template path %s", source)
 		}
-		if name == "/usr/local/bin/entrypoint.sh" {
-			return fmt.Errorf("template path %s is reserved for Membrane startup", name)
+		for _, protected := range reserved {
+			if name == protected || strings.HasPrefix(name, protected+"/") {
+				return fmt.Errorf("template path %s is reserved for Membrane startup (%s)", name, protected)
+			}
 		}
 		// Walk visits every ancestor first. Reject links even when their target
 		// is private, and reject type collisions before sending any file bytes.
