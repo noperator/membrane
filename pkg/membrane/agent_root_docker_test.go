@@ -3,6 +3,7 @@ package membrane
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"os"
@@ -16,7 +17,8 @@ import (
 // Real Engine archive operations can materialize mounts before docker start.
 // This regression must prove safe copy-in on an actual container filesystem,
 // including symlinked mount destinations, rather than mocking Docker's view.
-// Opt in with MEMBRANE_TEST_DOCKER=1; no pulls, builds or workload code are used.
+// Opt in with MEMBRANE_TEST_DOCKER=1; no pulls or image builds are used. A tiny
+// static exit program lets the archive case inspect a genuinely exited source.
 func TestCopyAgentRootDocker(t *testing.T) {
 	if os.Getenv("MEMBRANE_TEST_DOCKER") != "1" {
 		t.Skip("set MEMBRANE_TEST_DOCKER=1 to test disposable Docker containers")
@@ -35,6 +37,28 @@ func TestCopyAgentRootDocker(t *testing.T) {
 	}
 	var image bytes.Buffer
 	tw := tar.NewWriter(&image)
+	program := t.TempDir()
+	if err := os.WriteFile(filepath.Join(program, "main.go"), []byte(`package main
+import "os"
+func main() { if err := os.WriteFile("/executed", []byte("ran"), 0600); err != nil { panic(err) } }
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", filepath.Join(program, "exit"), filepath.Join(program, "main.go"))
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+strings.TrimSpace(string(docker(nil, "version", "--format", "{{.Server.Arch}}"))))
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build disposable exit program: %s (%v)", out, err)
+	}
+	executable, err := os.ReadFile(filepath.Join(program, "exit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "exit", Typeflag: tar.TypeReg, Mode: 0755, Size: int64(len(executable))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(executable); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"etc", "dev", "home", "home/agent", "existing", "dir", "target", "host-real", "redirected", "usr", "usr/local", "usr/local/share", "usr/local/share/membrane", "usr/lib", "usr/lib/startup-runtime"} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0755}); err != nil {
 			t.Fatal(err)
@@ -55,6 +79,31 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for _, name := range []string{"home/agent/project", "home/agent/project/child"} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0755}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, data := range map[string]string{
+		"home/agent/project/hidden": "hidden directory bytes", "home/agent/file-mount": "hidden file bytes",
+		"a-private-source": "hardlink bytes", "etc/chosen": "selected elsewhere",
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0640, Size: int64(len(data))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, header := range []tar.Header{
+		{Name: "home/agent/hardlink", Typeflag: tar.TypeLink, Linkname: "a-private-source", Mode: 0640},
+		{Name: "home/agent/host-link", Typeflag: tar.TypeSymlink, Linkname: "/home/agent/project/host-only", Mode: 0777},
+		{Name: "home/agent/pipe", Typeflag: tar.TypeFifo, Mode: 0600},
+	} {
+		if err := tw.WriteHeader(&header); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for name, target := range map[string]string{"link": "/target", "leaf-link": "/target/marker", "host-alias": "/host-real", "startup-alias": "/usr/lib/startup-runtime"} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Mode: 0777, Linkname: target}); err != nil {
 			t.Fatal(err)
@@ -72,7 +121,7 @@ func TestCopyAgentRootDocker(t *testing.T) {
 	create := func(args ...string) string {
 		t.Helper()
 		args = append([]string{"create", "--network=none"}, args...)
-		args = append(args, imageID, "/must-never-run")
+		args = append(args, imageID, "/exit")
 		id := strings.TrimSpace(string(docker(nil, args...)))
 		t.Cleanup(func() {
 			if out, err := exec.Command("docker", "rm", "-f", id).CombinedOutput(); err != nil {
@@ -146,7 +195,7 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			"--mount", directoryBind(filepath.Join(fixture, "host"), "/host-alias", false),
 			"--mount", directoryBind(filepath.Join(fixture, "nested-host"), "/home/agent/project/nested-link", false),
 			"--mount", directoryBind(filepath.Join(fixture, "host-file"), "/file-mount", true))
-		if err := copyAgentRoot(ctx, stage, id, 1234, 2345); err != nil {
+		if _, err := copyAgentRoot(ctx, stage, id, 1234, 2345); err != nil {
 			t.Fatal(err)
 		}
 		contents, headers := read(id, "/existing")
@@ -181,7 +230,7 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			stage := t.TempDir()
 			write(stage, "existing/replaced", "must not be sent", 0644)
 			id := create("--tmpfs", destination)
-			err := copyAgentRoot(ctx, stage, id, 1000, 1000)
+			_, err := copyAgentRoot(ctx, stage, id, 1000, 1000)
 			if err == nil || !strings.Contains(err.Error(), destination) {
 				t.Fatalf("expected reserved mount rejection for %s: %v", destination, err)
 			}
@@ -197,7 +246,7 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			write(stage, "existing/replaced", "must not be sent", 0644)
 			write(stage, name, "must not be sent", 0644)
 			id := create()
-			err := copyAgentRoot(ctx, stage, id, 1000, 1000)
+			_, err := copyAgentRoot(ctx, stage, id, 1000, 1000)
 			if err == nil || !strings.Contains(err.Error(), "/"+strings.Split(name, "/")[0]) {
 				t.Fatalf("expected path-specific collision failure for %s: %v", name, err)
 			}
@@ -211,4 +260,105 @@ func TestCopyAgentRootDocker(t *testing.T) {
 			}
 		})
 	}
+
+	// Export must omit host bytes before filtering, while the filter also omits
+	// hidden image/template data at mounts. Use the existing real Engine fixture
+	// to cover nested/file mounts, aliases, private hardlinks and stopped retrieval.
+	t.Run("archive-private-export", func(t *testing.T) {
+		fixture, err := os.MkdirTemp(".", ".archive-test-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(fixture) })
+		fixture, err = filepath.Abs(fixture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"host/host-only", "nested/sealed", "file-source"} {
+			write(fixture, name, "MOUNTED-HOST-CONTENT-MUST-NOT-BE-READ", 0600)
+		}
+		stage := filepath.Join(fixture, "stage")
+		write(stage, "home/agent/tool dir/literal [*] file", "private bytes", 0750)
+		write(stage, "home/agent/project/masked-template", "must not copy or archive", 0644)
+		id := create("--mount", directoryBind(filepath.Join(fixture, "host"), "/home/agent/project", false),
+			"--mount", directoryBind(filepath.Join(fixture, "nested"), "/home/agent/project/child", true),
+			"--mount", directoryBind(filepath.Join(fixture, "file-source"), "/home/agent/file-mount", true),
+			"--mount", directoryBind(filepath.Join(fixture, "host"), "/host-alias", true),
+			"--tmpfs", "/home/agent/runtime")
+		excluded, err := copyAgentRoot(ctx, stage, id, 1000, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		docker(nil, "start", "-a", id)
+		raw := docker(nil, "export", id)
+		if bytes.Contains(raw, []byte("MOUNTED-HOST-CONTENT-MUST-NOT-BE-READ")) || !bytes.Contains(raw, []byte("hidden directory bytes")) || !bytes.Contains(raw, []byte("hidden file bytes")) {
+			t.Fatal("raw Docker export did not isolate mounted host data from underlying private contents")
+		}
+		for _, paths := range [][]string{{"/home/agent", "/etc/chosen", "/missing", "/link/marker", "/host-real"}, {"/home/agent/tool dir"}, {}} {
+			s := sessionNames{agentContainer: id, dir: t.TempDir(), archivePaths: paths}
+			if err := archiveAgent(ctx, s, excluded); err != nil {
+				t.Fatal(err)
+			}
+			archive := filepath.Join(s.dir, "artifacts.tar.gz")
+			if len(paths) == 0 {
+				if _, err := os.Stat(archive); !os.IsNotExist(err) {
+					t.Fatalf("disabled collection created an archive: %v", err)
+				}
+				continue
+			}
+			f, err := os.Open(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := f.Stat()
+			if err != nil || info.Mode().Perm() != 0600 {
+				t.Fatalf("archive permissions: %v (%v)", info, err)
+			}
+			gz, err := gzip.NewReader(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := tar.NewReader(gz)
+			contents, headers := map[string]string{}, map[string]tar.Header{}
+			for {
+				h, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, exists := headers[h.Name]; exists || strings.HasPrefix(h.Name, "/") || strings.Contains(h.Name, "..") {
+					t.Fatalf("invalid/duplicate archive member: %s", h.Name)
+				}
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				contents[h.Name], headers[h.Name] = string(data), *h
+			}
+			if _, err := io.Copy(io.Discard, gz); err != nil {
+				t.Fatal(err)
+			}
+			gz.Close()
+			f.Close()
+			if contents["home/agent/tool dir/literal [*] file"] != "private bytes" || headers["home/agent/tool dir/literal [*] file"].Mode != 0750 {
+				t.Fatalf("lost selected private bytes or permissions: %v", contents)
+			}
+			if len(paths) > 1 && (contents["home/agent/hardlink"] != "hardlink bytes" || contents["etc/chosen"] != "selected elsewhere" || headers["home/agent/host-link"].Linkname != "/home/agent/project/host-only") {
+				t.Fatalf("lost hardlink/selected file/symlink: %v", contents)
+			}
+			for name := range headers {
+				if strings.HasPrefix(name, "home/agent/project") || name == "home/agent/file-mount" || strings.HasPrefix(name, "host-real") || name == "home/agent/pipe" || strings.HasPrefix(name, "link/") || (len(paths) == 1 && !strings.HasPrefix(name, "home/agent/tool dir")) {
+					t.Fatalf("retained excluded/unselected member %q", name)
+				}
+			}
+			if _, err := os.Stat(archive + ".partial"); !os.IsNotExist(err) {
+				t.Fatalf("successful archive left partial file: %v", err)
+			}
+		}
+		if state := strings.TrimSpace(string(docker(nil, "inspect", "-f", "{{.State.Status}}", id))); state != "exited" {
+			t.Fatalf("collection restarted or removed source: %s", state)
+		}
+	})
 }

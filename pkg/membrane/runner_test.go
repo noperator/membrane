@@ -4,15 +4,112 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Collection has its own outcome: a failed producer must leave only a partial
+// file, fail an otherwise successful command, and preserve an existing workload
+// exit code. Exercise the lifecycle rather than only testing tar filtering.
+func TestAgentArchiveOutcome(t *testing.T) {
+	for _, workloadExit := range []int{0, 37} {
+		t.Run(strconv.Itoa(workloadExit), func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("WORKLOAD_EXIT", strconv.Itoa(workloadExit))
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  start) exit "$WORKLOAD_EXIT" ;;
+  wait) exec sleep 30 ;;
+  stop) touch "$TEST_ROOT/stopped" ;;
+  inspect)
+    if [ "$2" = '-f' ]; then echo true
+    else echo '[{"Id":"source","State":{"Status":"exited"}}]'; fi ;;
+  export)
+    test -f "$TEST_ROOT/stopped" || exit 91
+    printf 'broken stream'
+    echo 'producer fixture failed' >&2
+    exit 7 ;;
+  *) exit 92 ;;
+esac`)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			s := sessionNames{dir: dir, agentContainer: "source", handlerContainer: "handler", archivePaths: []string{"/home/agent"}}
+			err := runAgent(ctx, s, []string{"start"})
+			if err == nil || !strings.Contains(err.Error(), "producer fixture failed") {
+				t.Fatalf("lost collection failure: %v", err)
+			}
+			var exitErr *ExitError
+			if workloadExit != 0 && (!errors.As(err, &exitErr) || exitErr.Code != workloadExit) {
+				t.Fatalf("lost workload exit status: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz")); !os.IsNotExist(err) {
+				t.Fatalf("published failed export: %v", err)
+			}
+			info, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz.partial"))
+			if err != nil || info.Mode().Perm() != 0600 {
+				t.Fatalf("missing private partial: %v (%v)", info, err)
+			}
+		})
+	}
+}
+
+// Cancellation must interrupt a blocked export producer after stopping writers,
+// retain the partial result, and return control to the caller's resource cleanup.
+func TestArchiveCancellation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TEST_ROOT", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  inspect) echo '[{"Id":"source","State":{"Status":"exited"}}]' ;;
+  stop) touch "$TEST_ROOT/stopped" ;;
+  export) touch "$TEST_ROOT/exporting"; exec sleep 30 ;;
+  *) exit 92 ;;
+esac`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- archiveAgent(ctx, sessionNames{dir: dir, agentContainer: "source", archivePaths: []string{"/home/agent"}}, nil)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "exporting")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("collector never started export")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("export producer did not stop")
+	}
+	for _, name := range []string{"stopped", "artifacts.tar.gz.partial"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz")); !os.IsNotExist(err) {
+		t.Fatalf("published interrupted export: %v", err)
+	}
+}
 
 func TestAgentDockerArguments(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

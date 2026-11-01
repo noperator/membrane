@@ -16,8 +16,10 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
 import time
@@ -2611,6 +2613,202 @@ print('identity-and-sudo-ok')
     check(ctx, not list((state / 'sessions').glob('*/runtime')), 'all private preparation state cleaned up')
 
 
+# Export must be checked on Sysbox itself: ordinary Docker's volume behavior is
+# insufficient evidence for sealed host data or nested Docker descendants. The
+# shim scans the raw stream before Membrane filters it, without saving a root tar.
+def group_42(ctx):
+    build_trace_workload(ctx)
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    marker = 'HOST-ONLY-ARCHIVE-MARKER-' + os.urandom(16).hex()
+    shared, nested = ctx.workdir / 'shared', ctx.workdir / 'nested'
+    shared.mkdir()
+    nested.mkdir()
+    (shared / 'child').mkdir()
+    (shared / 'host-marker').write_text(marker)
+    (nested / 'nested-marker').write_text(marker)
+    hostfile = ctx.workdir / 'host-file'
+    hostfile.write_text(marker)
+    template = state / 'agent-root/home/agent'
+    (template / 'project').mkdir(parents=True)
+    (template / 'project/hidden-template').write_text('must not retain masked template')
+    wrapper = ctx.workdir / 'archive-bin'
+    wrapper.mkdir()
+    shim = wrapper / 'docker'
+    shim.write_text(f'''#!{sys.executable}
+import json, os, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+if args[0] != 'export' or not os.getenv('ARCHIVE_GATE'):
+    os.execv({shutil.which('docker')!r}, ['docker'] + args)
+gate = Path(os.environ['ARCHIVE_GATE'])
+(gate / 'before-export').touch()
+deadline = time.monotonic() + 90
+while not (gate / 'export').exists():
+    if time.monotonic() > deadline:
+        sys.exit('test export gate timed out')
+    time.sleep(.02)
+started = time.monotonic()
+producer = subprocess.Popen([{shutil.which('docker')!r}, *args], stdout=subprocess.PIPE)
+needle = os.environ['ARCHIVE_HOST_MARKER'].encode()
+total, tail, leaked = 0, b'', False
+try:
+    while True:
+        chunk = producer.stdout.read(65536)
+        if not chunk: break
+        total += len(chunk)
+        leaked = leaked or needle in tail + chunk
+        tail = chunk[-len(needle):]
+        sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
+    code = producer.wait()
+finally:
+    if producer.poll() is None:
+        producer.kill()
+        producer.wait()
+with (gate / 'export-metrics.jsonl').open('a') as log:
+    log.write(json.dumps(dict(bytes=total, seconds=time.monotonic()-started, leaked=leaked)) + '\\n')
+sys.exit(code or int(leaked))
+''')
+    shim.chmod(0o755)
+    selections = ['/home/agent/tool dir', '/home/agent/tool dir/literal [*] file',
+                  '/opt/archive-file', '/missing', '/home/agent/private-link/literal [*] file',
+                  '/home/agent/project/host-marker']
+    cases = [('default', 'normal', None), ('narrow', 'docker-stop', selections),
+             ('cancel', 'signal', ['/home/agent/tool dir']),
+             ('disabled', 'normal', []), ('missing', 'normal', ['/missing'])]
+    for label, stop, paths in cases:
+        directory = ctx.workdir / label
+        directory.mkdir()
+        (directory / 'sealed-marker').write_text(marker)
+        shutil.copy2(REPO_ROOT / 'scripts/testdata/archive-workload.py', directory)
+        shutil.copy2(ctx.workdir / 'trace-workload', directory)
+        cfg = {'sealed': ['sealed-marker'], 'args': [
+            '--mount', f'type=bind,src={shared},dst=/home/agent/project',
+            '--mount', f'type=bind,src={nested},dst=/home/agent/project/child,readonly',
+            # .bashrc has underlying image contents: both it and host bytes must
+            # be absent, even though raw Docker export can include the former.
+            '--mount', f'type=bind,src={hostfile},dst=/home/agent/.bashrc,readonly']}
+        if paths is not None:
+            cfg['archive_paths'] = paths
+        (directory / '.membrane.yaml').write_text(json.dumps(cfg))
+        env = dict(ctx.environment, PATH=str(wrapper) + os.pathsep + ctx.environment['PATH'],
+                   ARCHIVE_GATE=str(directory), ARCHIVE_HOST_MARKER=marker)
+        command = ['python3', 'archive-workload.py', 'full' if label == 'default' else 'basic',
+                   '37' if label == 'default' else '0']
+        if label in ('disabled', 'missing'):
+            command = ['sh', '-c', 'touch ready; while [ ! -e continue ]; do sleep .05; done']
+        with Session(ctx, directory, command, options=['--no-trace'], env=env) as session:
+            session.wait_for('ready')
+            agent = 'membrane-agent-' + session.id
+            cgroup = workload_cgroup(ctx, session)
+            if label not in ('disabled', 'missing'):
+                # Show both descendant writers are live before any stop signal.
+                size = run(ctx, ['docker', 'exec', agent, 'stat', '-c', '%s', '/home/agent/tool dir/live.sqlite-wal']).stdout
+                check(ctx, int(size) > 0, label + ': SQLite descendant has live WAL state')
+            if label == 'default':
+                check(ctx, run(ctx, ['docker', 'exec', agent, 'docker', 'inspect', '-f',
+                                    '{{.State.Running}}', 'archive-writer']).stdout.strip() == 'true',
+                      'DinD descendant is running before shutdown')
+            if stop == 'normal':
+                session.release()
+            elif stop == 'docker-stop':
+                run(ctx, ['docker', 'stop', '-t', '2', agent])
+            else:
+                session.process.send_signal(signal.SIGTERM)
+            if paths != []:
+                session.wait_for('before-export', timeout=120)
+                source = inspect(ctx, agent)
+                handler = inspect(ctx, 'membrane-handler-' + session.id)
+                check(ctx, source['State']['Status'] == 'exited' and not source['HostConfig']['AutoRemove'],
+                      label + ': stopped source retained until export')
+                events = run(ctx, [*host_root(), 'cat', cgroup + '/cgroup.events']).stdout
+                check(ctx, 'populated 0' in events and handler['State']['Running'],
+                      label + ': descendants drained while handler remains active')
+                processes = run(ctx, ['docker', 'top', 'membrane-handler-' + session.id, '-eo', 'pid,comm']).stdout.splitlines()[1:]
+                commands = {line.split(maxsplit=1)[1].strip() for line in processes}
+                check(ctx, 'tracer' in commands, label + ': filesystem enforcement retained through collection')
+                session.release('export')
+            output = session.wait(expected=37 if label == 'default' else (0 if stop == 'normal' else None), timeout=300)
+            if stop != 'normal':
+                check(ctx, session.process.returncode != 0, label + ': controlled stop remains nonzero')
+            cleaned(ctx, session)
+            archive_path = state / 'sessions' / session.id / 'artifacts.tar.gz'
+            check(ctx, not archive_path.with_suffix('.gz.partial').exists(), label + ': no partial after completion')
+            if paths == []:
+                check(ctx, not archive_path.exists() and not (directory / 'before-export').exists(),
+                      'disabled collection performs no export and creates no archive')
+                continue
+            metrics = [json.loads(line) for line in (directory / 'export-metrics.jsonl').read_text().splitlines()]
+            check(ctx, all(not item['leaked'] for item in metrics),
+                  label + ': raw backend export excludes host, sealed, nested and alias contents')
+            ctx.output.append(f'MEASURE {label}: export {sum(m["bytes"] for m in metrics)} bytes in '
+                              f'{sum(m["seconds"] for m in metrics):.3f}s; archive {archive_path.stat().st_size} bytes')
+            check(ctx, archive_path.stat().st_mode & 0o777 == 0o600, label + ': private archive permissions')
+            members, data = {}, {}
+            verification = directory / 'database-check'
+            verification.mkdir()
+            with gzip.open(archive_path, 'rb') as compressed:
+                with tarfile.open(fileobj=compressed, mode='r|') as archive:
+                    for member in archive:
+                        name = member.name.rstrip('/')
+                        assert not name.startswith('/') and '..' not in name.split('/') and name not in members, name
+                        members[name] = member
+                        assert not any(name == mount or name.startswith(mount + '/') for mount in
+                                       ('home/agent/project', 'home/agent/.bashrc')), name
+                        assert not name.startswith('home/agent/workload-alias/'), name
+                        if member.isfile():
+                            content = archive.extractfile(member).read()
+                            assert marker.encode() not in content, name
+                            if (name.startswith('home/agent/tool dir/') or name == 'opt/archive-file'
+                                    or name == 'home/agent/codex-report.json' or '/archived_sessions/' in name):
+                                data[name] = content
+                            # Only SQLite files from this disposable fixture are
+                            # copied for integrity checks; never extract links.
+                            if re.search(r'\.sqlite(?:-wal|-shm)?$', name):
+                                target = verification / name
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                target.write_bytes(content)
+                while compressed.read(65536):
+                    pass  # Read through gzip's CRC/trailer as well as tar EOF.
+            if label == 'missing':
+                check(ctx, not members and 'archive missing "/missing"' in output,
+                      'missing selection produces a valid empty archive and diagnostic')
+                continue
+            check(ctx, data['home/agent/tool dir/literal [*] file'] == b'private selected bytes'
+                  and members['home/agent/tool dir/literal [*] file'].mode == 0o750,
+                  label + ': literal names, selected contents and modes preserved')
+            check(ctx, not any(m.isfifo() or m.isdev() for m in members.values())
+                  and 'archive skipped special file' in output, label + ': special files skipped and reported')
+            databases = list(verification.rglob('*.sqlite'))
+            check(ctx, bool(databases), label + ': SQLite database and WAL retained')
+            for dbfile in databases:
+                with sqlite3.connect(dbfile) as db:
+                    check(ctx, db.execute('pragma integrity_check').fetchall() == [('ok',)],
+                          label + ': SQLite integrity: ' + dbfile.name)
+                    if dbfile.name == 'live.sqlite':
+                        check(ctx, db.execute('select value from state').fetchone()[0] > 0,
+                              label + ': committed descendant WAL recovered')
+            if label == 'default':
+                check(ctx, members['home/agent/host-link'].issym()
+                      and members['home/agent/private-link'].issym(), 'symlinks archived without traversal')
+                report = json.loads(data['home/agent/codex-report.json'])
+                history = data['home/agent/' + report['history']]
+                check(ctx, hashlib.sha256(history).hexdigest() == report['sha256']
+                      and report['thread'].encode() in history, 'offline Codex history retained: ' + report['version'])
+                state_db = next(verification.rglob('state_*.sqlite'))
+                with sqlite3.connect(state_db) as db:
+                    check(ctx, db.execute('select id from threads where id = ?', (report['thread'],)).fetchone()
+                          == (report['thread'],), 'offline Codex thread present in recovered state database')
+                check(ctx, bool(data['home/agent/tool dir/dind-writer']), 'DinD descendant writes archived')
+            else:
+                check(ctx, 'home/agent/unselected' not in members, label + ': narrow selection excludes other private files')
+            if label == 'narrow':
+                check(ctx, data['opt/archive-file'] == b'selected outside home'
+                      and 'symlink ancestor' in output and 'archive missing "/missing"' in output
+                      and 'archive skipped mount "/home/agent/project"' in output,
+                      'selected file, missing path, symlink ancestor and explicit mounted selection')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -2659,6 +2857,7 @@ GROUPS = {
     39: TestGroup("workspace configuration trust, persistence and strict parsing", group_39),
     40: TestGroup("private session outputs, live delivery and runtime cleanup", group_40),
     41: TestGroup("private agent state, nested mount precedence and failed-copy cleanup", group_41),
+    42: TestGroup("selected private archives, stopped writers and backend mount exclusion", group_42),
 }
 
 

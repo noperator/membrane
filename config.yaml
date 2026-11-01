@@ -12,6 +12,12 @@
 # `rw`.
 mounts: []
 
+# Private container paths retained in sessions/<id>/artifacts.tar.gz at shutdown.
+# A workspace list replaces this selection; [] disables collection. Live mounts
+# are excluded. Archives never become input to a later session.
+archive_paths:
+  - /home/agent
+
 # `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
 # Defaults to 1.1.1.1 if not set.
 dns_resolver:

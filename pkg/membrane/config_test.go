@@ -180,6 +180,71 @@ func TestLoadConfigSealed(t *testing.T) {
 	}
 }
 
+// Archive selection must replace (including []) rather than append; otherwise
+// a workspace cannot narrow retained secrets or disable collection. Untrusted
+// workspace values must not change what is retained.
+func TestArchiveConfigPrecedence(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = previous; stdin.Close() })
+	for _, test := range []struct {
+		name, global, workspace string
+		skipGlobal, untrusted   bool
+		want                    []string
+	}{
+		{"default", "", "", false, false, []string{"/home/agent"}},
+		{"inherit", "archive_paths: [/etc/tool.conf]", "", false, false, []string{"/etc/tool.conf"}},
+		{"replace", "archive_paths: [/home/agent]", "archive_paths: [/home/agent/.codex]", false, false, []string{"/home/agent/.codex"}},
+		{"disable", "archive_paths: [/home/agent]", "archive_paths: []", false, false, []string{}},
+		{"inherit-disabled", "archive_paths: []", "", false, false, []string{}},
+		{"skip-global", "archive_paths: []", "", true, false, []string{"/home/agent"}},
+		{"skip-global-replace", "archive_paths: [/etc/tool.conf]", "archive_paths: []", true, false, []string{}},
+		{"untrusted", "archive_paths: [/etc/tool.conf]", "archive_paths: []", false, true, []string{"/etc/tool.conf"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, workspace := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			if err := os.Mkdir(filepath.Join(home, ".membrane"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for filename, data := range map[string]string{
+				filepath.Join(home, ".membrane/config.yaml"): test.global,
+				filepath.Join(workspace, ".membrane.yaml"):   test.workspace,
+			} {
+				if err := os.WriteFile(filename, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !test.untrusted {
+				trustConfigFixture(t, home, workspace)
+			}
+			cfg, err := loadConfig(workspace, test.skipGlobal)
+			if err != nil || !reflect.DeepEqual(cfg.ArchivePaths, test.want) {
+				t.Fatalf("archive configuration: %+v, want %v (%v)", cfg, test.want, err)
+			}
+		})
+	}
+}
+
+// Invalid paths must fail before execution, and overlapping literal selections
+// must neither duplicate members nor accidentally consume a similarly named tree.
+func TestArchivePathValidation(t *testing.T) {
+	for _, value := range []string{"null", "relative", "[null]", "[3]", "[true]", "['']", "[relative]", "['/home/../etc']", `["/bad\0path"]`} {
+		if _, err := parseConfig("fixture.yaml", []byte("archive_paths: "+value)); err == nil || !strings.Contains(err.Error(), "fixture.yaml") {
+			t.Errorf("accepted invalid archive_paths %s: %v", value, err)
+		}
+	}
+	cfg, err := parseConfig("fixture.yaml", []byte(`archive_paths: [/home/agent/file, /home/agent-other, /home/agent/, /home//agent, '/literal [*] file']`))
+	want := []string{"/home/agent", "/home/agent-other", "/literal [*] file"}
+	if err != nil || !reflect.DeepEqual(cfg.ArchivePaths, want) {
+		t.Fatalf("literal selections: %+v, want %v (%v)", cfg, want, err)
+	}
+}
+
 // Appending trusted workspace mounts must not loosen a global readonly mount;
 // skipping the global config must still remove that request entirely.
 func TestLoadConfigMountModes(t *testing.T) {
@@ -295,7 +360,7 @@ func TestLoadConfigRejectsLegacyPolicy(t *testing.T) {
 				}
 				if location == "workspace" {
 					cfg, err := loadConfig(workspace, false)
-					if err != nil || cfg == nil || !reflect.DeepEqual(*cfg, config{}) {
+					if err != nil || cfg == nil || !reflect.DeepEqual(*cfg, config{ArchivePaths: []string{"/home/agent"}}) {
 						t.Fatalf("untrusted config must be ignored before parsing: cfg=%+v err=%v", cfg, err)
 					}
 					trustConfigFixture(t, home, workspace)

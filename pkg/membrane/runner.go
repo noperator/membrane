@@ -71,6 +71,7 @@ type sessionNames struct {
 	agentFileMounts []agentFileMount
 	directoryMounts []directoryMount
 	policyRoots     map[int]string
+	archivePaths    []string
 }
 
 type agentFileMount struct{ source, destination string }
@@ -592,6 +593,7 @@ func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error)
 			cancelSetup()
 		}
 	}()
+	var archiveExclusions []string
 	if args[0] == "create" {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			for i, arg := range args {
@@ -605,13 +607,29 @@ func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error)
 		}
 		// The bundled agent starts as UID/GID 1000. Its entrypoint then adjusts
 		// only private home objects to the workspace's container-side identity.
-		if err := copyAgentRoot(setupCtx, filepath.Join(s.runtimeDir, "agent-root"), s.agentContainer, 1000, 1000); err != nil {
+		var err error
+		archiveExclusions, err = copyAgentRoot(setupCtx, filepath.Join(s.runtimeDir, "agent-root"), s.agentContainer, 1000, 1000)
+		if err != nil {
 			return fmt.Errorf("prepare agent filesystem: %w", err)
 		}
 		args = []string{"start", "--attach", "--interactive", s.agentContainer}
 	}
 	if err := setupCtx.Err(); err != nil {
 		return err
+	}
+	if len(s.archivePaths) != 0 {
+		defer func() {
+			// An earlier workload cancellation must not cancel orderly collection;
+			// another signal abandons the export and lets owned cleanup continue.
+			archiveCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+			defer stop()
+			if err := archiveAgent(archiveCtx, s, archiveExclusions); err != nil {
+				// The CLI preserves ExitError's status. Report collection separately
+				// so that doing so cannot hide a second failure.
+				fmt.Fprintf(os.Stderr, "membrane: archive failed: %v\n", err)
+				retErr = errors.Join(retErr, fmt.Errorf("archive agent files: %w", err))
+			}
+		}()
 	}
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- execDocker(args) }()
@@ -624,7 +642,7 @@ func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error)
 		}
 		return err
 	case err := <-handlerDone:
-		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
+		_ = exec.Command("docker", "kill", s.agentContainer).Run()
 		err = errors.Join(err, stopWorkload(s))
 		select {
 		case <-agentDone:

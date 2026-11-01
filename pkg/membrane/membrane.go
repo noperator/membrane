@@ -116,6 +116,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return err
 	}
 	s.directoryMounts = mounts
+	s.archivePaths = cfg.ArchivePaths
 	s.policyRoots = make(map[int]string)
 	for _, entry := range policy {
 		s.policyRoots[entry.Root] = mounts[entry.Root].Path

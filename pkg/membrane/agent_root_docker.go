@@ -25,10 +25,10 @@ import (
 // copyAgentRoot overlays a prepared tree onto a never-started container. Docker
 // archive operations mount configured volumes even in this state, so exclusions
 // are resolved in Docker's own filesystem view before constructing the upload.
-func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) (retErr error) {
+func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) (mountExclusions []string, retErr error) {
 	out, err := exec.CommandContext(ctx, "docker", "inspect", container).Output()
 	if err != nil {
-		return fmt.Errorf("inspect template destination: %w", err)
+		return nil, fmt.Errorf("inspect template destination: %w", err)
 	}
 	var containers []struct {
 		ID         string
@@ -37,10 +37,10 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 		HostConfig struct{ Tmpfs map[string]string }
 	}
 	if err := json.Unmarshal(out, &containers); err != nil {
-		return fmt.Errorf("decode template destination: %w", err)
+		return nil, fmt.Errorf("decode template destination: %w", err)
 	}
 	if len(containers) != 1 || containers[0].State.Status != "created" {
-		return errors.New("template destination must be a never-started container")
+		return nil, errors.New("template destination must be a never-started container")
 	}
 	container = containers[0].ID
 	// Include tmpfs even on Engines which omit it from inspect's Mounts list.
@@ -55,34 +55,34 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 	const rebuild = "rebuild the agent image from the Membrane source directory: docker build -t membrane-agent docker/agent"
 	for _, mount := range configuredMounts {
 		if startupPaths == mount || strings.HasPrefix(startupPaths, strings.TrimSuffix(mount, "/")+"/") {
-			return fmt.Errorf("mount %s masks reserved Membrane startup path %s", mount, startupPaths)
+			return nil, fmt.Errorf("mount %s masks reserved Membrane startup path %s", mount, startupPaths)
 		}
 	}
 	// This file belongs to the bundled image, before any template writes. It
 	// includes the actual interpreter/library locations used by that image.
 	out, err = exec.CommandContext(ctx, "docker", "cp", container+":"+startupPaths, "-").Output()
 	if err != nil {
-		return fmt.Errorf("read trusted startup path list %s; %s: %w", startupPaths, rebuild, err)
+		return nil, fmt.Errorf("read trusted startup path list %s; %s: %w", startupPaths, rebuild, err)
 	}
 	tr := tar.NewReader(bytes.NewReader(out))
 	header, err := tr.Next()
 	if err != nil {
-		return fmt.Errorf("invalid trusted startup path list; %s: %w", rebuild, err)
+		return nil, fmt.Errorf("invalid trusted startup path list; %s: %w", rebuild, err)
 	}
 	if header.Typeflag != tar.TypeReg {
-		return fmt.Errorf("trusted startup path list must be a regular file; %s", rebuild)
+		return nil, fmt.Errorf("trusted startup path list must be a regular file; %s", rebuild)
 	}
 	data, err := io.ReadAll(tr)
 	if err != nil {
-		return fmt.Errorf("read trusted startup path list; %s: %w", rebuild, err)
+		return nil, fmt.Errorf("read trusted startup path list; %s: %w", rebuild, err)
 	}
 	reserved := strings.Fields(string(data))
 	if !slices.Contains(reserved, startupPaths) || !slices.Contains(reserved, "/usr/local/bin/entrypoint.sh") {
-		return fmt.Errorf("incomplete trusted startup path list; %s", rebuild)
+		return nil, fmt.Errorf("incomplete trusted startup path list; %s", rebuild)
 	}
 	for _, name := range reserved {
 		if !path.IsAbs(name) || path.Clean(name) != name || name == "/" {
-			return fmt.Errorf("invalid reserved startup path %q; %s", name, rebuild)
+			return nil, fmt.Errorf("invalid reserved startup path %q; %s", name, rebuild)
 		}
 	}
 	// The CLI transports the small Engine stat requests using the selected
@@ -92,17 +92,17 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 	proxy.Stderr = &diagnostic
 	in, err := proxy.StdinPipe()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	outPipe, err := proxy.StdoutPipe()
 	if err != nil {
 		in.Close()
-		return err
+		return nil, err
 	}
 	if err := proxy.Start(); err != nil {
 		in.Close()
 		outPipe.Close()
-		return err
+		return nil, err
 	}
 	defer func() {
 		in.Close()
@@ -176,11 +176,11 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 			// a later mount to an otherwise unrelated private destination.
 			info, err := stat(resolved)
 			if err != nil {
-				return fmt.Errorf("resolve mounted destination %s: %w", mount, err)
+				return nil, fmt.Errorf("resolve mounted destination %s: %w", mount, err)
 			}
 			if info != nil && info.Mode&os.ModeSymlink != 0 {
 				if !path.IsAbs(info.LinkTarget) {
-					return fmt.Errorf("unresolved mounted destination %s: %q", mount, info.LinkTarget)
+					return nil, fmt.Errorf("unresolved mounted destination %s: %q", mount, info.LinkTarget)
 				}
 				resolved = path.Clean(info.LinkTarget)
 			}
@@ -188,7 +188,7 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 		for _, destination := range []string{mount, resolved} {
 			for _, name := range reserved {
 				if name == destination || strings.HasPrefix(name, strings.TrimSuffix(destination, "/")+"/") || strings.HasPrefix(destination, name+"/") {
-					return fmt.Errorf("mount %s overlaps reserved Membrane startup path %s", mount, name)
+					return nil, fmt.Errorf("mount %s overlaps reserved Membrane startup path %s", mount, name)
 				}
 			}
 		}
@@ -245,25 +245,25 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 		return nil
 	})
 	if err != nil || len(entries) == 0 {
-		return err
+		return excluded, err
 	}
 
 	// Build a private transfer file only after the full plan passes. No template
 	// source or parent becomes an agent mount. The tar contains no links/devices.
 	f, err := os.CreateTemp(filepath.Dir(staged), "agent-root-*.tar")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
 	tw := tar.NewWriter(f)
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		h, err := tar.FileInfoHeader(entry.info, "")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		h.Name = filepath.ToSlash(entry.name)
 		h.Uid, h.Gid, h.Uname, h.Gname = 0, 0, "", ""
@@ -271,31 +271,31 @@ func copyAgentRoot(ctx context.Context, staged, container string, uid, gid int) 
 			h.Uid, h.Gid = uid, gid
 		}
 		if err := tw.WriteHeader(h); err != nil {
-			return err
+			return nil, err
 		}
 		if entry.info.Mode().IsRegular() {
 			in, err := os.Open(filepath.Join(staged, entry.name))
 			if err != nil {
-				return err
+				return nil, err
 			}
 			copyErr := copyTemplateFile(ctx, tw, in)
 			if err := errors.Join(copyErr, in.Close()); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 	if err := errors.Join(tw.Close(), f.Close()); err != nil {
-		return err
+		return nil, err
 	}
 	f, err = os.Open(f.Name())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	copy := exec.CommandContext(ctx, "docker", "cp", "-", container+":/")
 	copy.Stdin = f
 	if out, err := copy.CombinedOutput(); err != nil {
-		return fmt.Errorf("copy template into container: %s: %w", out, err)
+		return nil, fmt.Errorf("copy template into container: %s: %w", out, err)
 	}
-	return nil
+	return excluded, nil
 }
