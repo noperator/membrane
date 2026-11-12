@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -222,9 +223,12 @@ func removeDockerUserRule(bridge string) {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, policyFile string) (func() error, string, error) {
+func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, policyFile string) (cleanup func() error, gatewayIP string, retErr error) {
+	// Teardown owns processes, mounts and an open log. Repeated calls return the
+	// original result without acting on released resources or recompressing logs.
+	defer func() { cleanup = sync.OnceValue(cleanup) }()
 	cleanupCgroup, cgroupErr := createSessionCgroup(ctx, s)
-	cleanup := func() error {
+	cleanup = func() error {
 		// Remove all workload processes before detaching BPF, including DinD.
 		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
 		if err := stopWorkload(*s); err != nil {
@@ -417,7 +421,7 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 	if err != nil {
 		return cleanup, "", fmt.Errorf("inspect handler IP: %w", err)
 	}
-	gatewayIP := strings.TrimSpace(string(out))
+	gatewayIP = strings.TrimSpace(string(out))
 	if gatewayIP == "" {
 		return cleanup, "", fmt.Errorf("handler has no IP on %s", s.internalNetwork)
 	}
@@ -576,13 +580,23 @@ func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error)
 	waitCtx, cancel := context.WithCancel(context.Background())
 	handlerDone := make(chan error, 1)
 	waitFinished := make(chan struct{})
+	var handlerErr error
 	defer func() {
 		cancel()
 		<-waitFinished
-		select {
-		case err := <-handlerDone:
-			retErr = errors.Join(retErr, err)
-		default:
+		if handlerErr == nil {
+			select {
+			case handlerErr = <-handlerDone:
+			default:
+			}
+		}
+		if handlerErr != nil {
+			logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
+			handlerErr = fmt.Errorf("%w\nHandler logs:\n%s", handlerErr, logs)
+			// ExitError keeps the workload status at the CLI. Report the service
+			// failure separately so that a concurrent exit cannot hide its cause.
+			fmt.Fprintf(os.Stderr, "membrane: %v\n", handlerErr)
+			retErr = errors.Join(retErr, handlerErr)
 		}
 	}()
 	go func() {
@@ -637,20 +651,19 @@ func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error)
 	case err := <-agentDone:
 		running, inspectErr := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", s.handlerContainer).Output()
 		if inspectErr != nil || strings.TrimSpace(string(running)) != "true" {
-			logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
-			return fmt.Errorf("handler failed during session\nHandler logs:\n%s", logs)
+			handlerErr = errors.New("handler failed during session")
 		}
 		return err
 	case err := <-handlerDone:
+		handlerErr = err
 		_ = exec.Command("docker", "kill", s.agentContainer).Run()
-		err = errors.Join(err, stopWorkload(s))
+		err = stopWorkload(s)
 		select {
-		case <-agentDone:
+		case agentErr := <-agentDone:
+			return errors.Join(agentErr, err)
 		case <-time.After(30 * time.Second):
-			return fmt.Errorf("%w; timed out waiting for workload attachment to exit", err)
+			return errors.Join(err, errors.New("timed out waiting for workload attachment to exit"))
 		}
-		logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
-		return fmt.Errorf("%w\nHandler logs:\n%s", err, logs)
 	case <-ctx.Done():
 		_ = exec.Command("docker", "stop", "-t", "2", s.agentContainer).Run()
 		err := <-agentDone

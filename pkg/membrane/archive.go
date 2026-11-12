@@ -33,9 +33,12 @@ func archiveAgent(ctx context.Context, s sessionNames, excluded []string) (retEr
 		HostConfig struct{ Tmpfs map[string]string }
 	}
 	inspect := func() error {
-		out, err := exec.CommandContext(ctx, "docker", "inspect", s.agentContainer).Output()
+		cmd := exec.CommandContext(ctx, "docker", "inspect", s.agentContainer)
+		var diagnostic bytes.Buffer
+		cmd.Stderr = &diagnostic
+		out, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("inspect archive source: %w", err)
+			return fmt.Errorf("inspect archive source: %s: %w", strings.TrimSpace(diagnostic.String()), err)
 		}
 		if err := json.Unmarshal(out, &containers); err != nil {
 			return err

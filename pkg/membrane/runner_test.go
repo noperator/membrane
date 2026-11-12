@@ -4,27 +4,53 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func archiveStreamFixture(t *testing.T, dir string) {
+	t.Helper()
+	f, err := os.Create(filepath.Join(dir, "stream.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(f)
+	const size = 256 * 1024
+	err = tw.WriteHeader(&tar.Header{Name: "home/agent/private", Mode: 0600, Size: size})
+	if err == nil {
+		_, err = io.CopyN(tw, rand.Reader, size)
+	}
+	if err := errors.Join(err, tw.Close(), f.Close()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // Collection has its own outcome: a failed producer must leave only a partial
 // file, fail an otherwise successful command, and preserve an existing workload
 // exit code. Exercise the lifecycle rather than only testing tar filtering.
 func TestAgentArchiveOutcome(t *testing.T) {
-	for _, workloadExit := range []int{0, 37} {
-		t.Run(strconv.Itoa(workloadExit), func(t *testing.T) {
+	for _, test := range []struct {
+		workloadExit int
+		completeTar  bool
+	}{{0, false}, {37, false}, {0, true}, {37, true}} {
+		t.Run(strconv.Itoa(test.workloadExit)+"/complete-tar="+strconv.FormatBool(test.completeTar), func(t *testing.T) {
 			dir := t.TempDir()
+			archiveStreamFixture(t, dir)
 			t.Setenv("TEST_ROOT", dir)
-			t.Setenv("WORKLOAD_EXIT", strconv.Itoa(workloadExit))
+			t.Setenv("WORKLOAD_EXIT", strconv.Itoa(test.workloadExit))
+			t.Setenv("COMPLETE_TAR", strconv.FormatBool(test.completeTar))
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			hostFixtureCommand(t, dir, "docker", `
 case "$1" in
@@ -36,7 +62,7 @@ case "$1" in
     else echo '[{"Id":"source","State":{"Status":"exited"}}]'; fi ;;
   export)
     test -f "$TEST_ROOT/stopped" || exit 91
-    printf 'broken stream'
+    if [ "$COMPLETE_TAR" = true ]; then cat "$TEST_ROOT/stream.tar"; else printf 'broken stream'; fi
     echo 'producer fixture failed' >&2
     exit 7 ;;
   *) exit 92 ;;
@@ -49,7 +75,7 @@ esac`)
 				t.Fatalf("lost collection failure: %v", err)
 			}
 			var exitErr *ExitError
-			if workloadExit != 0 && (!errors.As(err, &exitErr) || exitErr.Code != workloadExit) {
+			if test.workloadExit != 0 && (!errors.As(err, &exitErr) || exitErr.Code != test.workloadExit) {
 				t.Fatalf("lost workload exit status: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz")); !os.IsNotExist(err) {
@@ -67,13 +93,14 @@ esac`)
 // retain the partial result, and return control to the caller's resource cleanup.
 func TestArchiveCancellation(t *testing.T) {
 	dir := t.TempDir()
+	archiveStreamFixture(t, dir)
 	t.Setenv("TEST_ROOT", dir)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	hostFixtureCommand(t, dir, "docker", `
 case "$1" in
   inspect) echo '[{"Id":"source","State":{"Status":"exited"}}]' ;;
   stop) touch "$TEST_ROOT/stopped" ;;
-  export) touch "$TEST_ROOT/exporting"; exec sleep 30 ;;
+  export) cat "$TEST_ROOT/stream.tar"; touch "$TEST_ROOT/exporting"; exec sleep 30 ;;
   *) exit 92 ;;
 esac`)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -92,6 +119,12 @@ esac`)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// Even after tar EOF, a blocked producer must remain cancellable. Selected
+	// bytes must already be on disk instead of waiting in a whole-stream buffer.
+	info, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz.partial"))
+	if err != nil || info.Size() < 65536 {
+		t.Fatalf("archive did not stream before producer exit: %v (%v)", info, err)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -108,6 +141,52 @@ esac`)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz")); !os.IsNotExist(err) {
 		t.Fatalf("published interrupted export: %v", err)
+	}
+}
+
+// A real file-write error must cancel export and keep only the partial. Limit
+// just a subprocess's file size so this works without filling any real disk or
+// adding a production writer-injection interface solely for tests.
+func TestArchiveWriteFailure(t *testing.T) {
+	if dir := os.Getenv("MEMBRANE_ARCHIVE_WRITE_FIXTURE"); dir != "" {
+		signal.Ignore(syscall.SIGXFSZ)
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 65536, Max: 65536}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := archiveAgent(ctx, sessionNames{dir: dir, agentContainer: "source", archivePaths: []string{"/home/agent"}}, nil)
+		if !errors.Is(err, syscall.EFBIG) || ctx.Err() != nil {
+			t.Fatalf("lost file-write failure or producer did not stop: %v (context %v)", err, ctx.Err())
+		}
+		return
+	}
+	dir := t.TempDir()
+	archiveStreamFixture(t, dir)
+	t.Setenv("TEST_ROOT", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  inspect) echo '[{"Id":"source","State":{"Status":"exited"}}]' ;;
+  stop) exit 0 ;;
+  export) exec cat "$TEST_ROOT/stream.tar" ;;
+  *) exit 92 ;;
+esac`)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(executable, "-test.run=^TestArchiveWriteFailure$", "-test.timeout=10s")
+	child.Env = append(os.Environ(), "MEMBRANE_ARCHIVE_WRITE_FIXTURE="+dir)
+	if out, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("limited writer: %s (%v)", out, err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz.partial"))
+	if err != nil || info.Size() == 0 || info.Size() > 65536 || info.Mode().Perm() != 0600 {
+		t.Fatalf("missing private partial at failed write: %v (%v)", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "artifacts.tar.gz")); !os.IsNotExist(err) {
+		t.Fatalf("published failed output: %v", err)
 	}
 }
 
@@ -227,6 +306,30 @@ esac`)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "started")); !os.IsNotExist(err) {
 		t.Fatal("workload started after handler failure")
+	}
+}
+
+// Handler death can race with workload exit. Preserve both the workload status
+// and service diagnostics regardless of which waiter completes first.
+func TestHandlerFailurePreservesWorkloadExit(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TEST_ROOT", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  start) touch "$TEST_ROOT/started"; exit 37 ;;
+  wait) while [ ! -e "$TEST_ROOT/started" ]; do sleep .01; done; echo 1 ;;
+  inspect) echo false ;;
+  logs) echo 'dns-proxy exited unexpectedly' ;;
+  kill) exit 0 ;;
+  *) exit 92 ;;
+esac`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := runAgent(ctx, sessionNames{agentContainer: "agent", handlerContainer: "handler"}, []string{"start"})
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 37 || !strings.Contains(err.Error(), "dns-proxy exited unexpectedly") {
+		t.Fatalf("lost original failure or service diagnostics: %v", err)
 	}
 }
 
@@ -377,6 +480,13 @@ esac`)
 			calls, readErr := os.ReadFile(filepath.Join(dir, "calls"))
 			if readErr != nil {
 				t.Fatal(readErr)
+			}
+			// A second teardown must neither touch released resources nor try to
+			// recompress an already retained log. Failed teardown stays fail-closed.
+			again := cleanup()
+			after, readErr := os.ReadFile(filepath.Join(dir, "calls"))
+			if readErr != nil || again != err || string(after) != string(calls) {
+				t.Fatalf("repeated cleanup changed resources/result: first=%v second=%v read=%v\n%s", err, again, readErr, after)
 			}
 			if mode == "drain-failure" {
 				if err == nil || strings.Contains(string(calls), "docker stop") || strings.Contains(string(calls), "remove-cgroup") {
