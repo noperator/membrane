@@ -45,13 +45,14 @@ func Reset(components string) error {
 
 	fmt.Fprintf(os.Stderr, "This will remove:\n")
 	if doC {
-		fmt.Fprintf(os.Stderr, "  c - all running membrane containers\n")
+		fmt.Fprintf(os.Stderr, "  c - all running and stopped membrane containers (without collecting archives)\n")
 	}
 	if doI {
 		fmt.Fprintf(os.Stderr, "  i - the membrane Docker images\n")
 	}
 	if doD {
-		fmt.Fprintf(os.Stderr, "  d - ~/.membrane\n")
+		fmt.Fprintf(os.Stderr, "  d - all of ~/.membrane, including configuration, trust decisions, agent-root\n")
+		fmt.Fprintf(os.Stderr, "      templates/credentials, session archives/partials/logs, source and legacy files\n")
 	}
 	fmt.Fprintf(os.Stderr, "\nWorkspace .membrane.yaml files are not affected.\n\nContinue? [y/N] ")
 
@@ -64,7 +65,9 @@ func Reset(components string) error {
 
 	if doC {
 		for _, img := range []string{agentImageName, handlerImageName} {
-			out, err := exec.Command("docker", "ps", "-q", "--filter", "ancestor="+img).Output()
+			// Exited sources now survive until owned cleanup; reset must include
+			// those left behind by an interrupted CLI as well as live containers.
+			out, err := exec.Command("docker", "ps", "-a", "-q", "--filter", "ancestor="+img).Output()
 			if err != nil {
 				return fmt.Errorf("list containers: %w", err)
 			}

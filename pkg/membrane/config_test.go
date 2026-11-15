@@ -72,6 +72,96 @@ func TestWriteDefaultFiles(t *testing.T) {
 	}
 }
 
+// Retained containers now include exited archive sources. Reset must select
+// them explicitly, preserve records for ci, and name the data d will destroy.
+// Only temporary files and fixture Docker commands are used, never real state.
+func TestResetRetainedState(t *testing.T) {
+	for _, component := range []string{"ci", "d", "", "decline"} {
+		t.Run(component, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			hostFixtureCommand(t, dir, "docker", `
+echo "$*" >> "$TEST_ROOT/calls"
+case "$1" in
+  ps) test "$2 $3" = '-a -q' || exit 91
+      printf '%s\n' running stopped ;;
+  rm|rmi) exit 0 ;;
+  *) exit 92 ;;
+esac`)
+			files := []string{"config.yaml", "trusted-workspaces.yaml", "agent-root/home/agent/.codex/auth.json",
+				"sessions/old/artifacts.tar.gz", "sessions/failed/artifacts.tar.gz.partial", "sessions/old/logs/trace.gz", "home/legacy"}
+			for _, name := range append(files, "../workspace/.membrane.yaml") {
+				path := filepath.Join(dir, ".membrane", name)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("keep"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			answer, err := os.CreateTemp(dir, "answer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer answer.Close()
+			response := "y\n"
+			if component == "decline" {
+				response = "n\n"
+			}
+			if _, err := answer.WriteString(response); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := answer.Seek(0, 0); err != nil {
+				t.Fatal(err)
+			}
+			output, err := os.CreateTemp(dir, "confirmation")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer output.Close()
+			stdin, stderr := os.Stdin, os.Stderr
+			os.Stdin, os.Stderr = answer, output
+			defer func() { os.Stdin, os.Stderr = stdin, stderr }()
+			selection := component
+			if component == "decline" {
+				selection = "cid"
+			}
+			if err := Reset(selection); err != nil {
+				t.Fatal(err)
+			}
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if component == "ci" || component == "" {
+				if strings.Count(string(calls), "rm -f running\n") != 2 || strings.Count(string(calls), "rm -f stopped\n") != 2 || strings.Count(string(calls), "rmi membrane-") != 2 {
+					t.Fatalf("reset missed containers/images: %s", calls)
+				}
+			} else if len(calls) != 0 {
+				t.Fatalf("unexpected Docker operations: %s", calls)
+			}
+			for _, name := range files {
+				data, err := os.ReadFile(filepath.Join(dir, ".membrane", name))
+				if component == "d" || component == "" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("reset retained %s: %v", name, err)
+					}
+				} else if err != nil || string(data) != "keep" {
+					t.Fatalf("reset changed retained %s: %q (%v)", name, data, err)
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(dir, "workspace/.membrane.yaml")); err != nil || string(data) != "keep" {
+				t.Fatalf("reset changed workspace configuration: %q (%v)", data, err)
+			}
+			if component != "ci" {
+				text, err := os.ReadFile(output.Name())
+				if err != nil || !strings.Contains(string(text), "templates/credentials") || !strings.Contains(string(text), "archives/partials/logs") {
+					t.Fatalf("confirmation omits retained data: %s (%v)", text, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
 	for _, name := range []string{"config.yaml"} {
 		for _, target := range []string{"missing", name, "src"} {
