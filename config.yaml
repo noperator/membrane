@@ -12,9 +12,8 @@
 # `rw`.
 mounts: []
 
-# Private container paths retained in sessions/<id>/artifacts.tar.gz at shutdown.
-# A workspace list replaces this selection; [] disables collection. Live mounts
-# are excluded. Archives never become input to a later session.
+# `archive_paths` lists agent directories that should be saved at shutdown to
+# sessions/<id>/artifacts.tar.gz. Mounts are excluded.
 archive_paths:
   - /home/agent
 

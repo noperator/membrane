@@ -46,7 +46,7 @@ go install github.com/noperator/membrane/cmd/membrane@latest
 
 <details><summary>Initial setup</summary>
 
-On first run, Membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, initializes missing configuration and instruction files in `~/.membrane/`, and builds the `membrane-agent` and `membrane-handler` Docker images. Subsequent runs check for updates automatically while preserving user-managed files. Initial install takes about 2 minutes.
+On first run, Membrane checks that its host prerequisites are present and healthy (or otherwise offers to configure them). It then clones the repo to `~/.membrane/src/`, initializes `~/.membrane/config.yaml` and `~/.membrane/agent-root/`, and builds the `membrane-agent` and `membrane-handler` Docker images. Subsequent runs check for source updates automatically while preserving existing configuration.
 
 On **macOS**, Membrane runs inside a dedicated [Colima](https://github.com/abiosoft/colima) VM with [Sysbox](https://github.com/nestybox/sysbox) installed. If needed, Membrane offers to run [`scripts/install-macos.sh`](scripts/install-macos.sh), which installs the host tools, creates/configures the dedicated VM, activates BPF LSM in its Linux kernel, installs Sysbox, and makes its backing services persistent across VM restarts. The dedicated Colima profile keeps Membrane's containers and images isolated from your existing Docker setup.
 
@@ -67,7 +67,7 @@ Options:
       --no-update                skip checking for updates
       --reset[=cid]              remove membrane state and exit (c=containers, i=image, d=directory)
       --session-id-file string   write session ID to this file on startup (for test harnesses)
-      --trace-log string         path for trace log file (default: ~/.membrane/trace/<id>.jsonl.gz)
+      --trace-log string         path for trace log file (default: ~/.membrane/sessions/<id>/logs/membrane-agent-<id>.jsonl.gz)
 
 Config:
   -a, --allow stringArray      allow rule: hostname, IP, CIDR, or URL (repeatable)
@@ -88,6 +88,8 @@ membrane
 membrane -- claude -p "just say hello"
 membrane -- bash -c "echo hello"
 ```
+
+Each session copies a fresh `~/.membrane/agent-root/` into the agent filesystem; e.g., `agent-root/home/agent/.codex/` is written to `/home/agent/.codex/`. You may mount other files as described in the configuration section below.
 
 #### Non-interactive mode
 
@@ -124,16 +126,17 @@ If you've made local edits and an update is available, Membrane will back up `~/
 
 #### Reset
 
-`membrane --reset` will remove running containers, the Docker images, and `~/.membrane/`. Workspace `.membrane.yaml` files are not affected. You can also reset individual components:
+`membrane --reset` will remove running and stopped Membrane containers, its Docker images, and **all** of `~/.membrane/` (including configuration, trust decisions, logs, archives, etc.). You can also reset individual components:
 
 ```bash
-membrane --reset=cid   # all
-membrane --reset=ci    # containers and images only
+membrane --reset=cid   # all, including retained records and the template
+membrane --reset=ci    # containers and images; preserve ~/.membrane files
+membrane --reset=d     # delete all ~/.membrane data, without stopping containers
 ```
 
 ### Trace execution
 
-By default, Membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers.
+By default, Membrane records an eBPF trace of process executions, file opens, and network connection attempts across the agent's complete workload cgroup, including nested containers. Each invocation creates a private `~/.membrane/sessions/<id>/` directory to hold this data.
 
 Membrane creates the workload cgroup and installs and scopes the eBPF probes before starting any workload code. If required probes or filesystem policy cannot be loaded or attached, setup fails before the workload starts.
 
@@ -242,6 +245,11 @@ mounts:
   - type: git-meta
     mode: ro
   - path: ../shared-library
+
+# `archive_paths` lists agent directories that should be saved at shutdown to
+# sessions/<id>/artifacts.tar.gz. Mounts are excluded.
+archive_paths:
+  - /home/agent
 
 # `sealed` paths remain visible (e.g., `stat` still works), but file contents
 # cannot be read or modified.
@@ -367,7 +375,6 @@ See [`config.yaml`](config.yaml) for the full default allow list.
 
 - [ ] support Docker checkpoint
 - [ ] optimize startup/teardown time
-- [ ] per-session home dir overlay
 - [ ] support trusting specific CA certs
 - [ ] return error messages from proxy
 - [ ] add debug flag
@@ -385,7 +392,7 @@ See [`config.yaml`](config.yaml) for the full default allow list.
 - [x] pass config via CLI (in addition to file)
 - [x] whitelist IPs and CIDRs
 - [x] set custom DNS resolver
-- [x] mount agent home dir as ~/.membrane/home on host
+- [x] private per-session agent home initialized from agent-root
 - [x] monitor agent with eBPF
 - [x] specify allow rules at runtime
 - [x] git-aware read-only mounts
