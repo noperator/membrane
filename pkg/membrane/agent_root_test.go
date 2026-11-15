@@ -149,7 +149,11 @@ func TestPreparedAgentRootReadonlyCleanup(t *testing.T) {
 	if err := os.Chmod(source, 0555); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(source, 0755) })
+	t.Cleanup(func() {
+		if err := os.Chmod(source, 0755); err != nil {
+			t.Errorf("restore source permissions: %v", err)
+		}
+	})
 	stage := filepath.Join(root, "stage")
 	if err := prepareAgentRoot(context.Background(), source, stage); err != nil {
 		t.Fatal(err)

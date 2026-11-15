@@ -29,12 +29,13 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
         program=$(command -v "$command")
         readlink -f "$program"
         case "$command" in
-            /*) printf '%s\n' "$command" ;;
-            *)
-                # A template must not introduce an earlier PATH match.
-                for directory in /usr/sbin /usr/bin /sbin /bin; do
-                    printf '%s/%s\n' "$directory" "$command"
-                done ;;
+        /*) printf '%s\n' "$command" ;;
+        *)
+            # A template must not introduce an earlier PATH match.
+            for directory in /usr/sbin /usr/bin /sbin /bin; do
+                printf '%s/%s\n' "$directory" "$command"
+            done
+            ;;
         esac
         # Keep directories: the loader also selects hardware variants and dlopen
         # modules. Enumerating only ldd's files would miss those startup inputs.
@@ -44,5 +45,5 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     # Isolated Python still imports the stdlib and its extension modules. Keep
     # the tree rather than maintaining a version-dependent transitive import list.
     python3 -I -S -c 'import sysconfig; print(sysconfig.get_path("stdlib"))'
-} > /usr/local/share/membrane/startup-paths
+} >/usr/local/share/membrane/startup-paths
 sort -u /usr/local/share/membrane/startup-paths -o /usr/local/share/membrane/startup-paths
