@@ -58,7 +58,6 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	if err := writeDefaultFiles(membraneDir); err != nil {
 		return err
 	}
-
 	if err := ensureImages(repoDir); err != nil {
 		return err
 	}
@@ -101,8 +100,23 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 		return err
 	}
 
-	s := newSessionNames()
+	s, err := newSession(membraneDir)
+	if err != nil {
+		return err
+	}
+	// Retained logs stay in the session; only its disposable files are removed.
+	// Register before container teardown so mounted inputs outlive the workload.
+	stagedRoot := filepath.Join(s.runtimeDir, "agent-root")
+	defer func() {
+		retErr = errors.Join(retErr, removePreparedAgentRoot(stagedRoot), os.RemoveAll(s.runtimeDir))
+	}()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	if err := prepareAgentRoot(ctx, filepath.Join(membraneDir, "agent-root"), stagedRoot); err != nil {
+		return err
+	}
 	s.directoryMounts = mounts
+	s.archivePaths = cfg.ArchivePaths
 	s.policyRoots = make(map[int]string)
 	for _, entry := range policy {
 		s.policyRoots[entry.Root] = mounts[entry.Root].Path
@@ -117,7 +131,7 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 	// Resolve trace log path before starting session (needed for bind mount).
 	traceLogFile := traceLog
 	if trace && traceLogFile == "" {
-		traceLogFile = filepath.Join(membraneDir, "trace", s.agentContainer+".jsonl.gz")
+		traceLogFile = filepath.Join(s.logsDir, s.agentContainer+".jsonl.gz")
 	}
 	if trace && !filepath.IsAbs(traceLogFile) {
 		traceLogFile, err = filepath.Abs(traceLogFile)
@@ -125,81 +139,74 @@ func Run(noUpdate bool, trace bool, noGlobalConfig bool, traceLog string, sessio
 			return fmt.Errorf("resolve trace log path: %w", err)
 		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
 	if err := checkBPFLSM(ctx); err != nil {
 		return err
 	}
 
 	policyFile := ""
 	if len(policy) != 0 {
-		policyFile, err = writePolicyFile(policy)
+		policyFile, err = writePolicyFile(s.runtimeDir, policy)
 		if err != nil {
 			return err
 		}
 		defer os.Remove(policyFile)
 	}
 
-	instructionsPath, err := filepath.EvalSymlinks(filepath.Join(membraneDir, "AGENTS.md"))
-	if err != nil {
-		return fmt.Errorf("resolve user instructions: %w", err)
+	// Each instruction source comes from this invocation's independent template
+	// copy. Only narrow readonly files are bound, never the template or runtime.
+	instructions, err := os.ReadFile(filepath.Join(stagedRoot, "etc/membrane/AGENTS.md"))
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read prepared Membrane instructions: %w", err)
 	}
-	instructions, err := os.ReadFile(instructionsPath)
-	if err != nil {
-		return fmt.Errorf("read user instructions: %w", err)
+	for _, name := range []string{"etc/membrane/AGENTS.md", "etc/claude-code/CLAUDE.md"} {
+		source := filepath.Join(stagedRoot, name)
+		info, err := os.Stat(source)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("instruction source %s must be a regular file", source)
+		}
+		s.agentFileMounts = append(s.agentFileMounts, agentFileMount{source, "/" + name})
 	}
-	s.agentFileMounts = append(s.agentFileMounts,
-		"-v", instructionsPath+":/etc/membrane/AGENTS.md:ro",
-		"-v", instructionsPath+":/etc/claude-code/CLAUDE.md:ro")
 	if !noGlobalConfig {
 		globalPath, err := filepath.EvalSymlinks(filepath.Join(membraneDir, "config.yaml"))
 		if err != nil {
 			return fmt.Errorf("resolve global configuration: %w", err)
 		}
-		s.agentFileMounts = append(s.agentFileMounts, "-v", globalPath+":/etc/membrane/config.yaml:ro")
+		s.agentFileMounts = append(s.agentFileMounts, agentFileMount{globalPath, "/etc/membrane/config.yaml"})
 	}
-	// Append user-managed guidance to the active Codex global file, keeping the
-	// shared originals intact. Create parents as the host user, rather than Docker.
-	codexDir := filepath.Join(membraneDir, "home", ".codex")
-	if err := os.MkdirAll(codexDir, 0755); err != nil {
-		return fmt.Errorf("create Codex directory: %w", err)
-	}
-	codexName, codexInstructions := "AGENTS.md", ""
-	for _, name := range []string{"AGENTS.override.md", "AGENTS.md"} {
-		data, err := os.ReadFile(filepath.Join(codexDir, name))
-		if os.IsNotExist(err) {
-			continue
+	if len(instructions) != 0 {
+		codexDir := filepath.Join(stagedRoot, "home/agent/.codex")
+		codexName, codexInstructions := "AGENTS.md", ""
+		for _, name := range []string{"AGENTS.override.md", "AGENTS.md"} {
+			data, err := os.ReadFile(filepath.Join(codexDir, name))
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("read prepared Codex %s: %w", name, err)
+			}
+			if name == "AGENTS.override.md" && strings.TrimSpace(string(data)) == "" {
+				continue
+			}
+			codexName, codexInstructions = name, string(data)+"\n\n"
+			break
 		}
+		f, err := os.CreateTemp(s.runtimeDir, "membrane-instructions-*.md")
 		if err != nil {
-			return fmt.Errorf("read Codex %s: %w", name, err)
+			return fmt.Errorf("create Codex instruction copy: %w", err)
 		}
-		if name == "AGENTS.override.md" && strings.TrimSpace(string(data)) == "" {
-			continue
+		_, err = f.WriteString(codexInstructions + string(instructions))
+		err = errors.Join(err, f.Chmod(0644), f.Close())
+		if err != nil {
+			return fmt.Errorf("write Codex instruction copy: %w", err)
 		}
-		codexName, codexInstructions = name, string(data)+"\n\n"
-		break
+		s.agentFileMounts = append(s.agentFileMounts, agentFileMount{f.Name(), "/home/agent/.codex/" + codexName})
 	}
-	tmpDir := filepath.Join(membraneDir, "tmp")
-	if err := os.MkdirAll(tmpDir, 0700); err != nil {
-		return fmt.Errorf("create session tmp dir: %w", err)
-	}
-	f, err := os.CreateTemp(tmpDir, "membrane-instructions-*.md")
-	if err != nil {
-		return fmt.Errorf("create Codex instruction copy: %w", err)
-	}
-	defer os.Remove(f.Name()) // Registered before workload teardown.
-	_, err = f.WriteString(codexInstructions + string(instructions))
-	if err == nil {
-		err = f.Chmod(0644)
-	}
-	closeErr := f.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("write Codex instruction copy: %w", err)
-	}
-	s.agentFileMounts = append(s.agentFileMounts, "-v", f.Name()+":/home/agent/.codex/"+codexName+":ro")
 
 	var setupSpinner *spinner
 	if trace && term.IsTerminal(int(os.Stdin.Fd())) {

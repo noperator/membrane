@@ -21,14 +21,17 @@ func TestWriteDefaultFiles(t *testing.T) {
 				if err := os.Mkdir(filepath.Join(dir, "src"), 0755); err != nil {
 					t.Fatal(err)
 				}
-				states := map[string]string{"config.yaml": configState, "AGENTS.md": agentsState}
+				states := map[string]string{"config.yaml": configState, "agent-root/etc/membrane/AGENTS.md": agentsState}
 				for name, state := range states {
-					if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("shipped "+name), 0644); err != nil {
+					if err := os.WriteFile(filepath.Join(dir, "src", filepath.Base(name)), []byte("shipped "+name), 0644); err != nil {
 						t.Fatal(err)
 					}
 					dest := filepath.Join(dir, name)
+					if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+						t.Fatal(err)
+					}
 					if state == "symlink" {
-						if err := os.Symlink(name+".user", dest); err != nil {
+						if err := os.Symlink(filepath.Base(name)+".user", dest); err != nil {
 							t.Fatal(err)
 						}
 						dest += ".user"
@@ -54,12 +57,12 @@ func TestWriteDefaultFiles(t *testing.T) {
 						}
 						if state == "symlink" {
 							target, err := os.Readlink(filepath.Join(dir, name))
-							if err != nil || target != name+".user" {
+							if err != nil || target != filepath.Base(name)+".user" {
 								t.Fatalf("replaced symlink %s: %s, %v", name, target, err)
 							}
 						}
 						// A subsequent repository update must not refresh either copy.
-						if err := os.WriteFile(filepath.Join(dir, "src", name), []byte("updated"), 0644); err != nil {
+						if err := os.WriteFile(filepath.Join(dir, "src", filepath.Base(name)), []byte("updated"), 0644); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -69,8 +72,98 @@ func TestWriteDefaultFiles(t *testing.T) {
 	}
 }
 
+// Retained containers now include exited archive sources. Reset must select
+// them explicitly, preserve records for ci, and name the data d will destroy.
+// Only temporary files and fixture Docker commands are used, never real state.
+func TestResetRetainedState(t *testing.T) {
+	for _, component := range []string{"ci", "d", "", "decline"} {
+		t.Run(component, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			hostFixtureCommand(t, dir, "docker", `
+echo "$*" >> "$TEST_ROOT/calls"
+case "$1" in
+  ps) test "$2 $3" = '-a -q' || exit 91
+      printf '%s\n' running stopped ;;
+  rm|rmi) exit 0 ;;
+  *) exit 92 ;;
+esac`)
+			files := []string{"config.yaml", "trusted-workspaces.yaml", "agent-root/home/agent/.codex/auth.json",
+				"sessions/old/artifacts.tar.gz", "sessions/failed/artifacts.tar.gz.partial", "sessions/old/logs/trace.gz", "home/legacy"}
+			for _, name := range append(files, "../workspace/.membrane.yaml") {
+				path := filepath.Join(dir, ".membrane", name)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("keep"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			answer, err := os.CreateTemp(dir, "answer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer answer.Close()
+			response := "y\n"
+			if component == "decline" {
+				response = "n\n"
+			}
+			if _, err := answer.WriteString(response); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := answer.Seek(0, 0); err != nil {
+				t.Fatal(err)
+			}
+			output, err := os.CreateTemp(dir, "confirmation")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer output.Close()
+			stdin, stderr := os.Stdin, os.Stderr
+			os.Stdin, os.Stderr = answer, output
+			defer func() { os.Stdin, os.Stderr = stdin, stderr }()
+			selection := component
+			if component == "decline" {
+				selection = "cid"
+			}
+			if err := Reset(selection); err != nil {
+				t.Fatal(err)
+			}
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if component == "ci" || component == "" {
+				if strings.Count(string(calls), "rm -f running\n") != 2 || strings.Count(string(calls), "rm -f stopped\n") != 2 || strings.Count(string(calls), "rmi membrane-") != 2 {
+					t.Fatalf("reset missed containers/images: %s", calls)
+				}
+			} else if len(calls) != 0 {
+				t.Fatalf("unexpected Docker operations: %s", calls)
+			}
+			for _, name := range files {
+				data, err := os.ReadFile(filepath.Join(dir, ".membrane", name))
+				if component == "d" || component == "" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("reset retained %s: %v", name, err)
+					}
+				} else if err != nil || string(data) != "keep" {
+					t.Fatalf("reset changed retained %s: %q (%v)", name, data, err)
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(dir, "workspace/.membrane.yaml")); err != nil || string(data) != "keep" {
+				t.Fatalf("reset changed workspace configuration: %q (%v)", data, err)
+			}
+			if component != "ci" {
+				text, err := os.ReadFile(output.Name())
+				if err != nil || !strings.Contains(string(text), "templates/credentials") || !strings.Contains(string(text), "archives/partials/logs") {
+					t.Fatalf("confirmation omits retained data: %s (%v)", text, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
-	for _, name := range []string{"config.yaml", "AGENTS.md"} {
+	for _, name := range []string{"config.yaml"} {
 		for _, target := range []string{"missing", name, "src"} {
 			t.Run(name+"/"+target, func(t *testing.T) {
 				dir := t.TempDir()
@@ -97,6 +190,42 @@ func TestWriteDefaultFilesRejectsUnusableLinks(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Existing images need no version label; setup should build only missing images.
+// A command fixture catches accidental inspections/upgrades without a real build.
+func TestEnsureImagesBuildsOnlyMissing(t *testing.T) {
+	for _, missing := range []string{"", agentImageName, handlerImageName} {
+		t.Run("missing-"+missing, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("TEST_ROOT", dir)
+			t.Setenv("MISSING_IMAGE", missing)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			hostFixtureCommand(t, dir, "docker", `
+case "$1" in
+  images) [ "$3" = "$MISSING_IMAGE" ] || echo unlabeled-image ;;
+  build) printf '%s\n' "$*" >> "$TEST_ROOT/builds" ;;
+  *) exit 99 ;;
+esac
+exit 0`)
+			if err := ensureImages(dir); err != nil {
+				t.Fatal(err)
+			}
+			builds, err := os.ReadFile(filepath.Join(dir, "builds"))
+			if missing == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("rebuilt existing images: %s (%v)", builds, err)
+				}
+			} else {
+				context := strings.TrimPrefix(missing, "membrane-")
+				want := "build -t " + missing + " " + filepath.Join(dir, "docker", context) + "\n"
+				if err != nil || string(builds) != want {
+					t.Fatalf("missing image build: %q, want %q (%v)", builds, want, err)
+				}
+			}
+		})
 	}
 }
 
@@ -138,6 +267,71 @@ func TestLoadConfigSealed(t *testing.T) {
 		if got := effectiveFilesystemPolicy(cfg, workspace, filepath.Join(workspace, "secrets"), "secrets", policyReadonly); got != policySealed {
 			t.Fatalf("loaded sealed selector = %d, want SEALED over READONLY", got)
 		}
+	}
+}
+
+// Archive selection must replace (including []) rather than append; otherwise
+// a workspace cannot narrow retained secrets or disable collection. Untrusted
+// workspace values must not change what is retained.
+func TestArchiveConfigPrecedence(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = previous; stdin.Close() })
+	for _, test := range []struct {
+		name, global, workspace string
+		skipGlobal, untrusted   bool
+		want                    []string
+	}{
+		{"default", "", "", false, false, []string{"/home/agent"}},
+		{"inherit", "archive_paths: [/etc/tool.conf]", "", false, false, []string{"/etc/tool.conf"}},
+		{"replace", "archive_paths: [/home/agent]", "archive_paths: [/home/agent/.codex]", false, false, []string{"/home/agent/.codex"}},
+		{"disable", "archive_paths: [/home/agent]", "archive_paths: []", false, false, []string{}},
+		{"inherit-disabled", "archive_paths: []", "", false, false, []string{}},
+		{"skip-global", "archive_paths: []", "", true, false, []string{"/home/agent"}},
+		{"skip-global-replace", "archive_paths: [/etc/tool.conf]", "archive_paths: []", true, false, []string{}},
+		{"untrusted", "archive_paths: [/etc/tool.conf]", "archive_paths: []", false, true, []string{"/etc/tool.conf"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, workspace := t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			if err := os.Mkdir(filepath.Join(home, ".membrane"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for filename, data := range map[string]string{
+				filepath.Join(home, ".membrane/config.yaml"): test.global,
+				filepath.Join(workspace, ".membrane.yaml"):   test.workspace,
+			} {
+				if err := os.WriteFile(filename, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !test.untrusted {
+				trustConfigFixture(t, home, workspace)
+			}
+			cfg, err := loadConfig(workspace, test.skipGlobal)
+			if err != nil || !reflect.DeepEqual(cfg.ArchivePaths, test.want) {
+				t.Fatalf("archive configuration: %+v, want %v (%v)", cfg, test.want, err)
+			}
+		})
+	}
+}
+
+// Invalid paths must fail before execution, and overlapping literal selections
+// must neither duplicate members nor accidentally consume a similarly named tree.
+func TestArchivePathValidation(t *testing.T) {
+	for _, value := range []string{"null", "relative", "[null]", "[3]", "[true]", "['']", "[relative]", "['/home/../etc']", `["/bad\0path"]`} {
+		if _, err := parseConfig("fixture.yaml", []byte("archive_paths: "+value)); err == nil || !strings.Contains(err.Error(), "fixture.yaml") {
+			t.Errorf("accepted invalid archive_paths %s: %v", value, err)
+		}
+	}
+	cfg, err := parseConfig("fixture.yaml", []byte(`archive_paths: [/home/agent/file, /home/agent-other, /home/agent/, /home//agent, '/literal [*] file']`))
+	want := []string{"/home/agent", "/home/agent-other", "/literal [*] file"}
+	if err != nil || !reflect.DeepEqual(cfg.ArchivePaths, want) {
+		t.Fatalf("literal selections: %+v, want %v (%v)", cfg, want, err)
 	}
 }
 
@@ -256,7 +450,7 @@ func TestLoadConfigRejectsLegacyPolicy(t *testing.T) {
 				}
 				if location == "workspace" {
 					cfg, err := loadConfig(workspace, false)
-					if err != nil || cfg == nil || !reflect.DeepEqual(*cfg, config{}) {
+					if err != nil || cfg == nil || !reflect.DeepEqual(*cfg, config{ArchivePaths: []string{"/home/agent"}}) {
 						t.Fatalf("untrusted config must be ignored before parsing: cfg=%+v err=%v", cfg, err)
 					}
 					trustConfigFixture(t, home, workspace)

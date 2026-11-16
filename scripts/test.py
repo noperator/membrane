@@ -16,12 +16,15 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
 import time
 import traceback
+import zlib
 from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -589,9 +592,10 @@ class Session:
     started process is stopped even when a host-side assertion fails.
     """
 
-    def __init__(self, ctx, directory, command, *, options=(), env=None, terminal=False):
+    def __init__(self, ctx, directory, command, *, options=(), env=None, terminal=False, name=""):
         self.ctx, self.directory = ctx, directory
-        self.idfile = directory / "session-id"
+        self.idfile = directory / ("session-id-" + name if name else "session-id")
+        self.logfile = directory / ("output-" + name + ".log" if name else "output.log")
         self.args = [ctx.membrane_cmd, "--no-update", "--no-global-config",
                      f"--session-id-file={self.idfile}", *options, "--", *command]
         self.env = env if env is not None else ctx.environment
@@ -604,7 +608,7 @@ class Session:
     def __enter__(self):
         trust_fixture(self.ctx, self.directory, self.env)
         try:
-            self.log = (self.directory / "output.log").open("w")
+            self.log = self.logfile.open("w")
             if self.use_terminal:
                 self.terminal = pty.openpty()
                 self.terminal_state = termios.tcgetattr(self.terminal[1])
@@ -618,15 +622,21 @@ class Session:
                 self.args, "started", "not started", "", "")) from error
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, kind, error, tb):
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            if error is None:
+                raise
+            # A cleanup failure must not hide the workload failure being debugged.
+            self.ctx.output.append(f"FAIL session cleanup for {self.directory}: {cleanup_error}")
 
     @property
     def id(self):
         return self.idfile.read_text().strip()
 
     def output(self):
-        return (self.directory / "output.log").read_text()
+        return self.logfile.read_text()
 
     def details(self, expected):
         return command_details(self.args, expected, self.process.poll(),
@@ -1160,14 +1170,39 @@ def lifecycle_session(ctx, token, *, policy=False, env=None):
     directory.mkdir()
     (directory / "protected").write_text("secret\n")
     (directory / ".membrane.yaml").write_text("sealed: [protected]\n" if policy else "{}\n")
-    # Record workload liveness without relying on Docker's daemon state.
-    command = ["python3", "-c", """import os, time
+    # Measure supervisor liveness without repeated opens, which can hit the
+    # unresolved Colima/Sysbox/VirtioFS ownership issue. Ordinary mount writeback
+    # remains covered by groups 37/41; actual heartbeat write failures still fail.
+    command = ["python3", "-c", """import json, os, time
 from pathlib import Path
-Path('ready').write_text('ready')
-while not Path('continue').exists():
-    Path('alive').write_text(str(time.monotonic_ns()))
-    time.sleep(0.02)
-Path('completed').touch()
+def identity(stage):
+    files = {}
+    for name in ('.', 'alive', 'protected'):
+        try:
+            s = os.stat(name)
+            files[name] = dict(uid=s.st_uid, gid=s.st_gid, mode=oct(s.st_mode),
+                               dev=s.st_dev, ino=s.st_ino)
+        except OSError as error:
+            files[name] = str(error)
+    print('WORKLOAD_IDENTITY', json.dumps(dict(stage=stage, uid=os.getresuid(),
+          gid=os.getresgid(), groups=os.getgroups(), files=files,
+          uid_map=Path('/proc/self/uid_map').read_text(),
+          gid_map=Path('/proc/self/gid_map').read_text())), flush=True)
+identity('startup')
+try:
+    with Path('alive').open('w') as heartbeat:
+        heartbeat.write(f'{time.monotonic_ns():020d}')
+        heartbeat.flush()
+        Path('ready').write_text('ready')
+        while not Path('continue').exists():
+            heartbeat.seek(0)
+            heartbeat.write(f'{time.monotonic_ns():020d}')
+            heartbeat.flush()
+            time.sleep(0.02)
+    Path('completed').touch()
+except OSError:
+    identity('failure')
+    raise
 """]
     return Session(ctx, directory, command, options=["--no-trace"], env=env)
 
@@ -1220,8 +1255,10 @@ os.kill(pids[0], signal.SIGKILL)
                     time.sleep(0.1)
                     check(ctx, (session.directory / "alive").read_text() == before
                           and not (session.directory / "completed").exists(), component + ": workload killed")
-                    events_b = run(ctx, [*host_root(), "cat", survivor_cgroup + "/cgroup.events"]).stdout
-                    check(ctx, "populated 1" in events_b.splitlines(), component + ": session B stays populated")
+                    events_b = run(ctx, [*host_root(), "cat", survivor_cgroup + "/cgroup.events"], expected=None)
+                    populated = events_b.returncode == 0 and "populated 1" in events_b.stdout.splitlines()
+                    detail = "" if populated else "\n" + survivor.details("still running")
+                    check(ctx, populated, component + ": session B stays populated" + detail)
                     before_b = (survivor.directory / "alive").read_text()
                     time.sleep(0.1)
                     check(ctx, (survivor.directory / "alive").read_text() != before_b, component + ": session B remains running")
@@ -1252,7 +1289,7 @@ os.kill(pids[0], signal.SIGKILL)
             session.wait(expected=None, timeout=45)
             check(ctx, not (session.directory / "completed").exists(), sig.name + ": workload terminated")
             cleaned(ctx, session)
-            path = Path(session.env["HOME"]) / ".membrane/logs" / ("membrane-handler-" + session.id + ".log.gz")
+            path = Path(session.env["HOME"]) / ".membrane/sessions" / session.id / "logs" / ("membrane-handler-" + session.id + ".log.gz")
             with gzip.open(path, "rt") as log:
                 text = log.read()
             check(ctx, "tracer exited cleanly" in text and "exited unexpectedly" not in text,
@@ -1459,43 +1496,54 @@ for secure, method, expected in ((False, 'DELETE', b'403'), (True, 'DELETE', b'4
 
 
 def group_36(ctx):
-    # Isolate user-managed files and shared client home from the real user.
+    # Instruction composition must use a session snapshot and preserve all host
+    # originals, including independently customized Codex and Claude guidance.
     home = ctx.workdir / "host-home"
     state = home / ".membrane"
     env = isolated_home(ctx, home)
     membrane(ctx, ["true"], env=env)
-    check(ctx, all((state / name).read_bytes() == (REPO_ROOT / name).read_bytes()
-                   and not (state / name).is_symlink() for name in ("config.yaml", "AGENTS.md")),
-          "both missing user files initialized as independent copies")
+    check(ctx, (state / "config.yaml").read_bytes() == (REPO_ROOT / "config.yaml").read_bytes()
+          and not (state / "home").exists() and not (state / "AGENTS.md").exists(),
+          "configuration initialized without creating legacy home or guidance")
+    template = state / "agent-root"
+    check(ctx, all((template / name).read_bytes() == (REPO_ROOT / "AGENTS.md").read_bytes()
+                   and not (template / name).is_symlink()
+                   for name in ("etc/membrane/AGENTS.md", "etc/claude-code/CLAUDE.md")),
+          "agent-root guidance defaults initialized at explicit destinations")
     global_yaml = "# User policy\nallow: [192.0.2.0/24]\ndeny: [192.0.2.128/25]\nargs: [-e, VISIBLE_LITERAL=fixture]\n"
     (state / "config.yaml").write_text(global_yaml)
     config(ctx, "allow: [198.51.100.0/24]\nreadonly: [.membrane.yaml]\n")
     project = {name: "project " + name + "\n" for name in ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md")}
     for name, content in project.items():
         (ctx.workdir / name).write_text(content)
-    codex = state / "home/.codex"
+    codex = template / "home/agent/.codex"
+    codex.mkdir(parents=True)
+    canonical = template / "etc/membrane/AGENTS.md"
+    claude = template / "etc/claude-code/CLAUDE.md"
     base = "Existing Codex instructions.\n"
     (codex / "AGENTS.md").write_text(base)
     shipped = (REPO_ROOT / "AGENTS.md").read_text()
     for number, (override, skip) in enumerate(((None, False), ("User override.\n", False), (" \n", True))):
         if number == 1:
-            for name in ("config.yaml", "AGENTS.md"):
-                (state / name).rename(state / (name + ".user"))
-                (state / name).symlink_to(name + ".user")
+            for source in (state / "config.yaml", canonical, claude):
+                source.rename(source.with_name(source.name + ".user"))
+                source.symlink_to(source.name + ".user")
         guidance = shipped + f"\nUser guidance revision {number}\n"
-        (state / "AGENTS.md").write_text(guidance)
+        canonical.write_text(guidance)
+        claude_guidance = f"Independent Claude guidance {number}\n"
+        claude.write_text(claude_guidance)
         if override is not None:
             (codex / "AGENTS.override.md").write_text(override)
         active = "AGENTS.override.md" if override and override.strip() else "AGENTS.md"
         original = override if active == "AGENTS.override.md" else base
         result = membrane(ctx, ["python3", "-c", r"""import errno, json, sys
 from pathlib import Path
-active, original, guidance, global_yaml, skip, project = sys.argv[1:]
+active, original, guidance, claude_guidance, global_yaml, skip, project = sys.argv[1:]
 canonical = Path('/etc/membrane/AGENTS.md')
 claude = Path('/etc/claude-code/CLAUDE.md')
 codex = Path('/home/agent/.codex') / active
 assert canonical.read_text() == guidance
-assert claude.read_text() == guidance
+assert claude.read_text() == claude_guidance
 assert codex.read_text() == original + '\n\n' + guidance
 files = [canonical, claude, codex]
 global_file = Path('/etc/membrane/config.yaml')
@@ -1518,20 +1566,73 @@ for file in files:
     else:
         raise AssertionError(str(file) + ' is writable')
 print('editable-instructions-ok')
-""", active, original, guidance, global_yaml, str(skip).lower(), json.dumps(project)], env=env,
+""", active, original, guidance, claude_guidance, global_yaml, str(skip).lower(), json.dumps(project)], env=env,
             options=["--no-global-config=" + str(skip).lower(), "--allow=203.0.113.0/24"])
         check(ctx, "editable-instructions-ok" in result.stdout,
               f"revision {number}: latest guidance, readonly files, Codex {active}, skip global={skip}")
         check(ctx, (codex / "AGENTS.md").read_text() == base and
               (override is None or (codex / "AGENTS.override.md").read_text() == override),
-              "shared Codex originals unchanged")
+              "template Codex originals unchanged")
         check(ctx, all((ctx.workdir / name).read_text() == content for name, content in project.items()),
               "project instructions unchanged")
         check(ctx, (state / "config.yaml").read_text() == global_yaml and
-              (state / "AGENTS.md").read_text() == guidance and
-              (number == 0 or all(os.readlink(state / name) == name + ".user" for name in ("config.yaml", "AGENTS.md"))),
+              canonical.read_text() == guidance and claude.read_text() == claude_guidance and
+              (number == 0 or all(os.readlink(source) == source.name + ".user"
+                                 for source in (state / "config.yaml", canonical, claude))),
               "user edits and symlinks preserved on subsequent starts")
-        check(ctx, not list((state / "tmp").glob("membrane-instructions-*")), "session copy cleaned up")
+        check(ctx, not list((state / "sessions").glob("*/runtime")), "session copies cleaned up")
+
+    # Readonly imported directories must retain modes without stranding runtime
+    # cleanup. Later template edits cannot change a staged or running session.
+    private = template / "home/agent/readonly-fixture"
+    private.mkdir()
+    original = private / "membrane-template-fixture"
+    original.write_text("first")
+    private.chmod(0o555)
+    try:
+        for revision in ("first", "later"):
+            directory = ctx.workdir / ("prepared-" + revision)
+            directory.mkdir()
+            command = ["python3", "-c", """from pathlib import Path
+import time
+import sys
+file = Path('/home/agent/readonly-fixture/membrane-template-fixture')
+assert file.read_text() == sys.argv[1]
+assert file.parent.stat().st_mode & 0o777 == 0o555
+Path('ready').touch()
+while not Path('continue').exists():
+    time.sleep(.02)
+assert file.read_text() == sys.argv[1]
+file.write_text('private workload edit')
+""", revision]
+            with Session(ctx, directory, command, env=env, options=["--no-trace"]) as session:
+                session.wait_for("ready")
+                runtime = state / "sessions" / session.id / "runtime"
+                prepared = runtime / "agent-root/home/agent/readonly-fixture/membrane-template-fixture"
+                check(ctx, prepared.read_text() == revision and prepared.parent.stat().st_mode & 0o777 == 0o555,
+                      revision + ": private staged contents and readonly directory mode")
+                original.write_text("later")
+                check(ctx, prepared.read_text() == revision, "template edit does not alter prepared input")
+                prepared.write_text("session edit")
+                check(ctx, original.read_text() == "later", "staged edit does not alter template")
+                session.release()
+                session.wait()
+                check(ctx, original.read_text() == "later" and not runtime.exists(),
+                      "private writes leave template unchanged; readonly staging cleaned up")
+                cleaned(ctx, session)
+    finally:
+        private.chmod(0o755)
+
+    # A malformed source must fail before any workload command can run.
+    broken = template / "broken-import"
+    broken.symlink_to("missing-import-target")
+    try:
+        result = membrane(ctx, ["touch", "invalid-template-workload"], env=env, expected=1)
+        check(ctx, str(broken) in result.stderr and not (ctx.workdir / "invalid-template-workload").exists(),
+              "invalid template rejected before workload execution")
+        check(ctx, not list((state / "sessions").glob("*/runtime")), "failed preparation cleaned up")
+    finally:
+        broken.unlink()
 
 
 def group_37(ctx):
@@ -2199,6 +2300,750 @@ print('trust-probe-ok', flush=True)
     check(ctx, not list(state.glob('.trusted-workspaces-*')), '39 no temporary trust files left behind')
 
 
+def group_40(ctx):
+    # Retained diagnostics must stay private and separate from disposable inputs,
+    # including when one of two live sessions finishes or tracing is disabled.
+    build_trace_workload(ctx)
+    state = Path(ctx.environment["HOME"]) / ".membrane"
+    command = ["python3", "-c", """from pathlib import Path
+import time
+for i in range(3000):
+    Path('/tmp/session-path-event-' + str(i)).write_text(str(i))
+Path('ready').touch()
+while not Path('continue').exists():
+    time.sleep(.1)
+"""]
+    with ExitStack() as stack:
+        active = []
+        for name in ("output-a", "output-b"):
+            directory = ctx.workdir / name
+            directory.mkdir()
+            (directory / "protected").write_text("fixture")
+            (directory / ".membrane.yaml").write_text("readonly: [protected]\n")
+            session = stack.enter_context(Session(ctx, directory, command))
+            session.wait_for("ready")
+            root = state / "sessions" / session.id
+            for path in (root, root / "logs", root / "runtime"):
+                check(ctx, path.is_dir() and path.stat().st_mode & 0o777 == 0o700,
+                      name + ": private " + path.name)
+            runtime_files = {p.name for p in (root / "runtime").iterdir()}
+            check(ctx, all(any(p.startswith(prefix) for p in runtime_files) for prefix in
+                           ("membrane-instructions-", "membrane-network-rules-", "membrane-policy-")),
+                  name + ": generated inputs belong to the session")
+            agent = inspect(ctx, "membrane-agent-" + session.id)
+            check(ctx, all(m["Source"] not in (str(root), str(root.parent), str(root / "runtime"))
+                           for m in agent["Mounts"]), name + ": session directories are not agent mounts")
+            trace = root / "logs" / ("membrane-agent-" + session.id + ".jsonl.gz")
+            log = root / "logs" / ("membrane-handler-" + session.id + ".log")
+            deadline = time.monotonic() + 10
+            delivered = b""
+            while time.monotonic() < deadline:
+                if trace.exists():
+                    delivered = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(trace.read_bytes())
+                if b'"type":' in delivered and log.exists() and log.stat().st_size:
+                    break
+                time.sleep(.1)
+            check(ctx, b'"type":' in delivered and log.exists() and log.stat().st_size > 0
+                  and session.process.poll() is None, name + ": trace events and diagnostics arrive live")
+            check(ctx, all(p.stat().st_mode & 0o777 == 0o600 and p.stat().st_uid == os.getuid()
+                           for p in (trace, log)), name + ": host owns private output files")
+            active.append((session, root, trace))
+
+        first, first_root, first_trace = active[0]
+        second, second_root, _ = active[1]
+        check(ctx, first.id != second.id, "concurrent sessions have distinct identities")
+        first.release()
+        first.wait()
+        trace_events(ctx, first_trace)
+        retained = first_trace.read_bytes()
+        check(ctx, not (first_root / "runtime").exists() and (second_root / "runtime").is_dir()
+              and second.process.poll() is None, "cleanup removes only the completed session's runtime")
+        second.release()
+        second.wait()
+        check(ctx, first_trace.read_bytes() == retained, "later cleanup preserves earlier output")
+        for session, root, trace in active:
+            cleaned(ctx, session)
+            check(ctx, not (root / "runtime").exists(), "completed runtime removed")
+            path = root / "logs" / ("membrane-handler-" + session.id + ".log.gz")
+            with gzip.open(path, "rt") as stream:
+                check(ctx, bool(stream.read()), "handler diagnostics retain their gzip text format")
+            check(ctx, path.stat().st_mode & 0o777 == 0o600, "compressed diagnostics remain private")
+
+    for name, options in (("no-trace", ["--no-trace"]),
+                          ("explicit-trace", ["--trace-log=chosen.jsonl.gz"])):
+        directory = ctx.workdir / name
+        directory.mkdir()
+        with Session(ctx, directory, ["true"], options=options) as session:
+            session.wait()
+            root = state / "sessions" / session.id
+            check(ctx, list((root / "logs").glob("*.log.gz"))
+                  and not list((root / "logs").glob("*.jsonl.gz"))
+                  and not (root / "runtime").exists(), name + ": diagnostics retained without a default trace")
+            if name == "explicit-trace":
+                trace_events(ctx, directory / "chosen.jsonl.gz")
+            else:
+                check(ctx, not (directory / "chosen.jsonl.gz").exists(), "no trace output when disabled")
+            cleaned(ctx, session)
+    check(ctx, not (state / "tmp").exists() and not (state / "trace").exists()
+          and all(p.name.startswith("build-") for p in (state / "logs").glob("*")),
+          "only installation build logs may use the shared log directory")
+
+
+def group_41(ctx):
+    # Actual concurrent agents must have independent private homes even in the
+    # same workspace. Nested live mounts must win without copy/chown writeback.
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    template = state / 'agent-root'
+    home = template / 'home/agent'
+    home.mkdir(parents=True)
+    workspace = ctx.workdir / 'workspace'
+    workspace.mkdir()
+    source = ctx.workdir / 'external template source'
+    source.mkdir()
+    (source / 'seed').write_text('first')
+    (source / 'tool').write_text('#!/bin/sh\nprintf template-tool')
+    (source / 'tool').chmod(0o750)
+    (home / 'imported').symlink_to(source, target_is_directory=True)
+    (home / 'empty').mkdir(mode=0o750)
+    extra = template / 'opt/template-fixture'
+    extra.mkdir(parents=True)
+    (extra / 'config').write_text('outside home')
+    # These tools are not invoked by trusted startup: mkdir/dirname are build
+    # helpers, and the other names are unused aliases of absolute invocations.
+    # Replacements must be copied successfully and run only as workload code.
+    custom_tools = ('/usr/bin/mkdir', '/usr/bin/dirname', '/usr/sbin/python3',
+                    '/usr/bin/capsh', '/usr/bin/gosu', '/usr/sbin/crun')
+    for name in custom_tools:
+        tool = template / name.lstrip('/')
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text('#!/bin/sh\nif [ "$(id -u)" = 0 ]; then\n'
+                        '  echo intercepted > /startup-tool-intercepted\n  exit 97\nfi\n'
+                        'printf workload-only-customization')
+        tool.chmod(0o755)
+    # ldconfig inputs are inert until the workload invokes ldconfig; startup
+    # must continue using the image's protected loader cache and preload file.
+    for name in ('etc/ld.so.conf', 'etc/ld.so.conf.d/membrane-fixture.conf'):
+        file = template / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('/opt/template-fixture\n')
+    # Dangling legacy paths would abort startup if any old implicit read remained.
+    for name in ('home', 'AGENTS.md'):
+        (state / name).symlink_to('unused-legacy-' + name)
+    shared = ctx.workdir / 'shared'
+    shared.mkdir()
+    (shared / 'readonly').mkdir()
+    (shared / 'marker').write_text('host shared')
+    readonly = ctx.workdir / 'readonly'
+    readonly.mkdir()
+    (readonly / 'marker').write_text('host readonly')
+    host_file = ctx.workdir / 'host-file'
+    host_file.write_text('host file')
+    codex = ctx.workdir / 'explicit-codex'
+    codex.mkdir()
+    (codex / 'AGENTS.md').write_text('explicit Codex')
+    guidance = ctx.workdir / 'explicit-guidance'
+    guidance.mkdir()
+    (guidance / 'AGENTS.md').write_text('explicit guidance')
+    for name in ('shared/marker', 'shared/not-on-host', 'shared/readonly/marker',
+                 'mounted-file', '.codex/AGENTS.md'):
+        file = home / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('masked template')
+    args = ['--mount', f'type=bind,src={shared},dst=/home/agent/shared',
+            '--mount', f'type=bind,src={readonly},dst=/home/agent/shared/readonly,readonly',
+            '-v', f'{host_file}:/home/agent/mounted-file:ro',
+            '--volume', f'{codex}:/home/agent/.codex:ro',
+            '--mount', f'type=bind,src={guidance},dst=/etc/membrane,readonly']
+    (workspace / '.membrane.yaml').write_text(json.dumps({'args': args}))
+    originals = {}
+    for root in (shared, readonly, host_file, codex, guidance):
+        for file in [root, *(root.rglob('*') if root.is_dir() else [])]:
+            stat = file.stat()
+            originals[file] = (stat.st_uid, stat.st_gid, stat.st_mode,
+                               file.read_bytes() if file.is_file() else None)
+    command = ['/usr/bin/python3', '-c', r'''import errno, os, subprocess, sys, time
+from pathlib import Path
+name, revision, tools = sys.argv[1:]
+home = Path('/home/agent')
+assert os.getuid() != 0
+assert (home / 'imported/seed').read_text() == revision
+assert not (home / 'imported').is_symlink()
+assert (home / 'empty').stat().st_mode & 0o777 == 0o750
+assert (home / 'imported/tool').stat().st_mode & 0o777 == 0o750
+assert subprocess.check_output([str(home / 'imported/tool')]) == b'template-tool'
+assert Path('/opt/template-fixture/config').read_text() == 'outside home'
+assert not Path('/startup-tool-intercepted').exists(), 'custom tool intercepted trusted startup'
+for tool in tools.split():
+    assert subprocess.check_output([tool]) == b'workload-only-customization'
+for config_path in ('/etc/ld.so.conf', '/etc/ld.so.conf.d/membrane-fixture.conf'):
+    assert Path(config_path).read_text() == '/opt/template-fixture\n'
+private = home / 'session-private'
+assert not private.exists(), 'state leaked from another session'
+private.write_text(name)
+assert private.stat().st_uid == os.getuid()
+(home / 'imported/seed').write_text(name)
+assert (home / '.codex/AGENTS.md').read_text() == 'explicit Codex'
+assert Path('/etc/membrane/AGENTS.md').read_text() == 'explicit guidance'
+assert not (home / 'shared/not-on-host').exists()
+assert (home / 'shared/marker').read_text() == 'host shared'
+for file, expected in ((home / 'mounted-file', 'host file'),
+                       (home / 'shared/readonly/marker', 'host readonly')):
+    assert file.read_text() == expected
+    try:
+        file.write_text('must fail')
+    except OSError as error:
+        assert error.errno == errno.EROFS, error
+    else:
+        raise AssertionError('readonly mount accepted a write')
+(home / ('shared/' + name)).write_text(name)
+Path(name + '-ready').touch()
+while not Path(name + '-continue').exists():
+    time.sleep(.02)
+assert private.read_text() == name
+assert (home / 'imported/seed').read_text() == name
+if name == 'a':
+    assert (home / 'shared/b').read_text() == 'b'
+if name == 'b':
+    assert (home / 'shared/a').read_text() == 'a'
+Path(name + '-completed').touch()
+''']
+    with ExitStack() as stack:
+        sessions = []
+        for name in ('a', 'b'):
+            session = stack.enter_context(Session(ctx, workspace, [*command, name, 'first', ' '.join(custom_tools)],
+                                                  name=name, options=['--no-trace']))
+            session.wait_for(name + '-ready')
+            agent = inspect(ctx, 'membrane-agent-' + session.id)
+            check(ctx, not agent['HostConfig']['AutoRemove']
+                  and all(m['Destination'] != '/home/agent' for m in agent['Mounts']),
+                  name + ': private home and explicit container removal')
+            check(ctx, all(m['Source'] not in (str(template), str(state / 'home'), str(state / 'AGENTS.md'))
+                           for m in agent['Mounts']), name + ': no template or legacy mount')
+            check(ctx, 'legacy ~/.membrane/' not in session.output(), name + ': no legacy migration notice')
+            check(ctx, 'Built membrane-agent' not in session.output(), name + ': no forced image rebuild')
+            sessions.append(session)
+
+        # An unmapped bind can report nobody's UID. Account adjustment must not
+        # create duplicate identities and break sudo. A private fixture workdir
+        # makes the occupied/free/root UID cases deterministic on either host.
+        ca = next(m['Name'] for m in agent['Mounts'] if m['Destination'] == '/membrane-ca')
+        for uid in (65534, 23456, 0):
+            result = run(ctx, ['docker', 'run', '--rm', '--network=none',
+                              '--mount', f'type=volume,src={ca},dst=/membrane-ca,readonly',
+                              '-e', 'MEMBRANE_GATEWAY=127.0.0.1', '--entrypoint=/bin/bash',
+                              'membrane-agent', '-ec', '''
+image_uid=$(id -u agent)
+mkdir /identity-workspace
+chown "$1:$1" /identity-workspace
+cd /identity-workspace
+shift
+exec /usr/local/bin/entrypoint.sh "$@" "$image_uid"
+''', 'identity-check', str(uid), 'python3', '-c', '''import grp, os, pwd, subprocess, sys
+from pathlib import Path
+requested, original = map(int, sys.argv[1:])
+expected = original if requested in (0, 65534) else requested
+assert os.getuid() == expected, (os.getuid(), expected)
+assert pwd.getpwuid(os.getuid()).pw_name == 'agent'
+assert grp.getgrgid(os.getgid()).gr_name == 'agent'
+assert Path.home() == Path('/home/agent')
+Path.home().joinpath('ordinary-write').write_text('private')
+assert subprocess.check_output(['sudo', '-n', 'id', '-u'], text=True).strip() == '0'
+print('identity-and-sudo-ok')
+''', str(uid)])
+            check(ctx, 'identity-and-sudo-ok' in result.stdout,
+                  f'workspace UID {uid}: unique agent identity, writable home and passwordless sudo')
+        (source / 'seed').write_text('later')
+        for name, session in zip(('a', 'b'), sessions):
+            session.release(name + '-continue')
+            session.wait()
+            check(ctx, (workspace / (name + '-completed')).exists(),
+                  name + ': private changes isolated; workspace and shared writes live')
+            cleaned(ctx, session)
+    with Session(ctx, workspace, [*command, 'later', 'later', ' '.join(custom_tools)],
+                 name='later', options=['--no-trace']) as session:
+        session.wait_for('later-ready')
+        session.release('later-continue')
+        session.wait()
+        cleaned(ctx, session)
+    for file, expected in originals.items():
+        stat = file.stat()
+        check(ctx, (stat.st_uid, stat.st_gid, stat.st_mode,
+                    file.read_bytes() if file.is_file() else None) == expected,
+              'copy and private ownership leave host object unchanged: ' + file.name)
+    check(ctx, (source / 'seed').read_text() == 'later' and (home / 'imported').is_symlink()
+          and not (home / 'session-private').exists() and not (shared / 'not-on-host').exists(),
+          'no private writes reach template, link target or masked host tree')
+    check(ctx, all(os.readlink(state / name) == 'unused-legacy-' + name for name in ('home', 'AGENTS.md')),
+          'legacy originals untouched and unread')
+    check(ctx, True, 'build-only helpers, unused executable aliases and ldconfig inputs can be customized')
+
+    # Destination rejection must happen before the user command, and teardown
+    # must remove a created agent even though automatic removal is disabled.
+    # Negative controls retain the actual executables used by CA setup, private
+    # ownership adjustment, capability dropping, user switching and nested Docker.
+    for name in ('bin/membrane-copy-sentinel', 'etc/passwd', 'usr/bin/cp',
+                 'usr/bin/python3', 'usr/sbin/capsh', 'usr/sbin/gosu', 'usr/bin/crun', 'etc/ld.so.preload'):
+        bad = template / name
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text('must not install')
+        directory = ctx.workdir / ('failed-copy-' + bad.name)
+        directory.mkdir()
+        try:
+            with Session(ctx, directory, ['touch', 'workload-started'], options=['--no-trace']) as session:
+                output = session.wait(expected=1)
+                check(ctx, 'prepare agent filesystem' in output and not (directory / 'workload-started').exists(),
+                      name + ': failed copy never starts workload')
+                if not name.startswith('bin/'):
+                    check(ctx, '/' + name in output and 'reserved for Membrane startup' in output,
+                          name + ': reports requested destination and reservation')
+                cleaned(ctx, session)
+        finally:
+            bad.unlink()
+            # Remove the empty /bin overlay before the next collision case.
+            if name.startswith('bin/'):
+                bad.parent.rmdir()
+    # Raw mounts must not hide startup tools or their manifest, including an
+    # ancestor mount of the manifest. Existing copy tests cover image aliases.
+    for destination, protected in (('/usr/sbin/cp', '/usr/sbin/cp'),
+                                   ('/usr/local/share/membrane', '/usr/local/share/membrane/startup-paths')):
+        directory = ctx.workdir / ('failed-mount-' + Path(destination).name)
+        directory.mkdir()
+        (directory / '.membrane.yaml').write_text(json.dumps({'args': ['--tmpfs', destination]}))
+        with Session(ctx, directory, ['touch', 'workload-started'], options=['--no-trace']) as session:
+            output = session.wait(expected=1)
+            check(ctx, destination in output and protected in output and 'reserved Membrane startup path' in output
+                  and not (directory / 'workload-started').exists(), 'startup mount collision: ' + destination)
+            cleaned(ctx, session)
+    check(ctx, not list((state / 'sessions').glob('*/runtime')), 'all private preparation state cleaned up')
+
+
+# Export must be checked on Sysbox itself: ordinary Docker's volume behavior is
+# insufficient evidence for sealed host data or nested Docker descendants. The
+# shim scans the raw stream before Membrane filters it, without saving a root tar.
+def group_42(ctx):
+    build_trace_workload(ctx)
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    marker = 'HOST-ONLY-ARCHIVE-MARKER-' + os.urandom(16).hex()
+    shared, nested = ctx.workdir / 'shared', ctx.workdir / 'nested'
+    shared.mkdir()
+    nested.mkdir()
+    (shared / 'child').mkdir()
+    (shared / 'host-marker').write_text(marker)
+    (nested / 'nested-marker').write_text(marker)
+    hostfile = ctx.workdir / 'host-file'
+    hostfile.write_text(marker)
+    template = state / 'agent-root/home/agent'
+    (template / 'project').mkdir(parents=True)
+    (template / 'project/hidden-template').write_text('must not retain masked template')
+    wrapper = ctx.workdir / 'archive-bin'
+    wrapper.mkdir()
+    shim = wrapper / 'docker'
+    shim.write_text(f'''#!{sys.executable}
+import json, os, subprocess, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+if args[0] != 'export' or not os.getenv('ARCHIVE_GATE'):
+    os.execv({shutil.which('docker')!r}, ['docker'] + args)
+gate = Path(os.environ['ARCHIVE_GATE'])
+(gate / 'before-export').touch()
+deadline = time.monotonic() + 90
+while not (gate / 'export').exists():
+    if time.monotonic() > deadline:
+        sys.exit('test export gate timed out')
+    time.sleep(.02)
+started = time.monotonic()
+producer = subprocess.Popen([{shutil.which('docker')!r}, *args], stdout=subprocess.PIPE)
+needle = os.environ['ARCHIVE_HOST_MARKER'].encode()
+total, tail, leaked = 0, b'', False
+try:
+    while True:
+        chunk = producer.stdout.read(65536)
+        if not chunk: break
+        total += len(chunk)
+        leaked = leaked or needle in tail + chunk
+        tail = chunk[-len(needle):]
+        sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
+    code = producer.wait()
+finally:
+    if producer.poll() is None:
+        producer.kill()
+        producer.wait()
+with (gate / 'export-metrics.jsonl').open('a') as log:
+    log.write(json.dumps(dict(bytes=total, seconds=time.monotonic()-started, leaked=leaked)) + '\\n')
+sys.exit(code or int(leaked))
+''')
+    shim.chmod(0o755)
+    selections = ['/home/agent/tool dir', '/home/agent/tool dir/literal [*] file',
+                  '/opt/archive-file', '/missing', '/home/agent/private-link/literal [*] file',
+                  '/home/agent/project/host-marker']
+    cases = [('default', 'normal', None), ('narrow', 'docker-stop', selections),
+             ('cancel', 'signal', ['/home/agent/tool dir']),
+             ('disabled', 'normal', []), ('missing', 'normal', ['/missing'])]
+    for label, stop, paths in cases:
+        directory = ctx.workdir / label
+        directory.mkdir()
+        (directory / 'sealed-marker').write_text(marker)
+        shutil.copy2(REPO_ROOT / 'scripts/testdata/archive-workload.py', directory)
+        shutil.copy2(ctx.workdir / 'trace-workload', directory)
+        cfg = {'sealed': ['sealed-marker'], 'args': [
+            '--mount', f'type=bind,src={shared},dst=/home/agent/project',
+            '--mount', f'type=bind,src={nested},dst=/home/agent/project/child,readonly',
+            # .bashrc has underlying image contents: both it and host bytes must
+            # be absent, even though raw Docker export can include the former.
+            '--mount', f'type=bind,src={hostfile},dst=/home/agent/.bashrc,readonly']}
+        if paths is not None:
+            cfg['archive_paths'] = paths
+        (directory / '.membrane.yaml').write_text(json.dumps(cfg))
+        env = dict(ctx.environment, PATH=str(wrapper) + os.pathsep + ctx.environment['PATH'],
+                   ARCHIVE_GATE=str(directory), ARCHIVE_HOST_MARKER=marker)
+        command = ['python3', 'archive-workload.py', 'full' if label == 'default' else 'basic',
+                   '37' if label == 'default' else '0']
+        if label in ('disabled', 'missing'):
+            command = ['sh', '-c', 'touch ready; while [ ! -e continue ]; do sleep .05; done']
+        with Session(ctx, directory, command, options=['--no-trace'], env=env) as session:
+            session.wait_for('ready')
+            agent = 'membrane-agent-' + session.id
+            cgroup = workload_cgroup(ctx, session)
+            if label not in ('disabled', 'missing'):
+                # Show both descendant writers are live before any stop signal.
+                size = run(ctx, ['docker', 'exec', agent, 'stat', '-c', '%s', '/home/agent/tool dir/live.sqlite-wal']).stdout
+                check(ctx, int(size) > 0, label + ': SQLite descendant has live WAL state')
+            if label == 'default':
+                check(ctx, run(ctx, ['docker', 'exec', agent, 'docker', 'inspect', '-f',
+                                    '{{.State.Running}}', 'archive-writer']).stdout.strip() == 'true',
+                      'DinD descendant is running before shutdown')
+            if stop == 'normal':
+                session.release()
+            elif stop == 'docker-stop':
+                run(ctx, ['docker', 'stop', '-t', '2', agent])
+            else:
+                session.process.send_signal(signal.SIGTERM)
+            if paths != []:
+                session.wait_for('before-export', timeout=120)
+                source = inspect(ctx, agent)
+                handler = inspect(ctx, 'membrane-handler-' + session.id)
+                check(ctx, source['State']['Status'] == 'exited' and not source['HostConfig']['AutoRemove'],
+                      label + ': stopped source retained until export')
+                events = run(ctx, [*host_root(), 'cat', cgroup + '/cgroup.events']).stdout
+                check(ctx, 'populated 0' in events and handler['State']['Running'],
+                      label + ': descendants drained while handler remains active')
+                processes = run(ctx, ['docker', 'top', 'membrane-handler-' + session.id, '-eo', 'pid,comm']).stdout.splitlines()[1:]
+                commands = {line.split(maxsplit=1)[1].strip() for line in processes}
+                check(ctx, 'tracer' in commands, label + ': filesystem enforcement retained through collection')
+                session.release('export')
+            output = session.wait(expected=37 if label == 'default' else (0 if stop == 'normal' else None), timeout=300)
+            if stop != 'normal':
+                check(ctx, session.process.returncode != 0, label + ': controlled stop remains nonzero')
+            cleaned(ctx, session)
+            archive_path = state / 'sessions' / session.id / 'artifacts.tar.gz'
+            check(ctx, not archive_path.with_suffix('.gz.partial').exists(), label + ': no partial after completion')
+            if paths == []:
+                check(ctx, not archive_path.exists() and not (directory / 'before-export').exists(),
+                      'disabled collection performs no export and creates no archive')
+                continue
+            metrics = [json.loads(line) for line in (directory / 'export-metrics.jsonl').read_text().splitlines()]
+            check(ctx, all(not item['leaked'] for item in metrics),
+                  label + ': raw backend export excludes host, sealed, nested and alias contents')
+            ctx.output.append(f'MEASURE {label}: export {sum(m["bytes"] for m in metrics)} bytes in '
+                              f'{sum(m["seconds"] for m in metrics):.3f}s; archive {archive_path.stat().st_size} bytes')
+            check(ctx, archive_path.stat().st_mode & 0o777 == 0o600, label + ': private archive permissions')
+            members, data = {}, {}
+            verification = directory / 'database-check'
+            verification.mkdir()
+            with gzip.open(archive_path, 'rb') as compressed:
+                with tarfile.open(fileobj=compressed, mode='r|') as archive:
+                    for member in archive:
+                        name = member.name.rstrip('/')
+                        assert not name.startswith('/') and '..' not in name.split('/') and name not in members, name
+                        members[name] = member
+                        assert not any(name == mount or name.startswith(mount + '/') for mount in
+                                       ('home/agent/project', 'home/agent/.bashrc')), name
+                        assert not name.startswith('home/agent/workload-alias/'), name
+                        if member.isfile():
+                            content = archive.extractfile(member).read()
+                            assert marker.encode() not in content, name
+                            if (name.startswith('home/agent/tool dir/') or name == 'opt/archive-file'
+                                    or name == 'home/agent/codex-report.json' or '/archived_sessions/' in name):
+                                data[name] = content
+                            # Only SQLite files from this disposable fixture are
+                            # copied for integrity checks; never extract links.
+                            if re.search(r'\.sqlite(?:-wal|-shm)?$', name):
+                                target = verification / name
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                target.write_bytes(content)
+                while compressed.read(65536):
+                    pass  # Read through gzip's CRC/trailer as well as tar EOF.
+            if label == 'missing':
+                check(ctx, not members and 'archive missing "/missing"' in output,
+                      'missing selection produces a valid empty archive and diagnostic')
+                continue
+            check(ctx, data['home/agent/tool dir/literal [*] file'] == b'private selected bytes'
+                  and members['home/agent/tool dir/literal [*] file'].mode == 0o750,
+                  label + ': literal names, selected contents and modes preserved')
+            check(ctx, not any(m.isfifo() or m.isdev() for m in members.values())
+                  and 'archive skipped special file' in output, label + ': special files skipped and reported')
+            databases = list(verification.rglob('*.sqlite'))
+            check(ctx, bool(databases), label + ': SQLite database and WAL retained')
+            for dbfile in databases:
+                with sqlite3.connect(dbfile) as db:
+                    check(ctx, db.execute('pragma integrity_check').fetchall() == [('ok',)],
+                          label + ': SQLite integrity: ' + dbfile.name)
+                    if dbfile.name == 'live.sqlite':
+                        check(ctx, db.execute('select value from state').fetchone()[0] > 0,
+                              label + ': committed descendant WAL recovered')
+            if label == 'default':
+                check(ctx, members['home/agent/host-link'].issym()
+                      and members['home/agent/private-link'].issym(), 'symlinks archived without traversal')
+                report = json.loads(data['home/agent/codex-report.json'])
+                history = data['home/agent/' + report['history']]
+                check(ctx, hashlib.sha256(history).hexdigest() == report['sha256']
+                      and report['thread'].encode() in history, 'offline Codex history retained: ' + report['version'])
+                state_db = next(verification.rglob('state_*.sqlite'))
+                with sqlite3.connect(state_db) as db:
+                    check(ctx, db.execute('select id from threads where id = ?', (report['thread'],)).fetchone()
+                          == (report['thread'],), 'offline Codex thread present in recovered state database')
+                check(ctx, bool(data['home/agent/tool dir/dind-writer']), 'DinD descendant writes archived')
+            else:
+                check(ctx, 'home/agent/unselected' not in members, label + ': narrow selection excludes other private files')
+            if label == 'narrow':
+                check(ctx, data['opt/archive-file'] == b'selected outside home'
+                      and 'symlink ancestor' in output and 'archive missing "/missing"' in output
+                      and 'archive skipped mount "/home/agent/project"' in output,
+                      'selected file, missing path, symlink ancestor and explicit mounted selection')
+
+
+# Exercise failed recovery with a real survivor in the same project. Producer
+# faults are deterministic; resource teardown, enforcement and isolation use
+# the real backend. Keep earlier records to catch cross-session cleanup/restore.
+def group_43(ctx):
+    state = Path(ctx.environment['HOME']) / '.membrane'
+    template = state / 'agent-root/home/agent'
+    template.mkdir(parents=True)
+    workspace = ctx.workdir / 'workspace'
+    workspace.mkdir()
+    (workspace / 'protected').write_text('sealed host fixture')
+    (workspace / '.membrane.yaml').write_text(json.dumps({
+        'archive_paths': ['/home/agent/private'], 'sealed': ['protected'],
+    }))
+    wrapper = ctx.workdir / 'fault-bin'
+    wrapper.mkdir()
+    shim = wrapper / 'docker'
+    shutil.copy2(REPO_ROOT / 'scripts/testdata/archive-fault-docker.py', shim)
+    shim.chmod(0o755)
+    limited = wrapper / 'membrane-limited'
+    limited.write_text(f'''#!{sys.executable}
+import os, resource, signal, sys
+# This limit affects only this disposable CLI and its children, not the host's
+# disk or other sessions. Setup inputs/logs are small; the archive exceeds it.
+resource.setrlimit(resource.RLIMIT_FSIZE, (262144, 262144))
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+os.execv({ctx.membrane_cmd!r}, [{ctx.membrane_cmd!r}, *sys.argv[1:]])
+''')
+    limited.chmod(0o755)
+    command = ['python3', '-c', r'''import os, sys, time
+from pathlib import Path
+name, status, large = sys.argv[1:]
+private = Path.home() / 'private'
+assert not private.exists(), 'private state restored from another session'
+private.mkdir()
+(private / 'owner').write_text(name)
+if large == 'true':
+    (private / 'payload').write_bytes(os.urandom(1024 * 1024))
+if name == 'cancel':
+    for i in range(3000):
+        Path('/tmp/archive-fault-event-' + str(i)).touch()
+Path(name + '-alive').write_text(str(time.monotonic_ns()))
+Path(name + '-ready').touch()
+while not Path(name + '-continue').exists():
+    assert (private / 'owner').read_text() == name
+    Path(name + '-alive').write_text(str(time.monotonic_ns()))
+    time.sleep(.02)
+Path(name + '-completed').touch()
+sys.exit(int(status))
+''']
+
+    def session_for(name, mode='', *, status=0):
+        gate = ctx.workdir / ('gate-' + name)
+        gate.mkdir()
+        env = dict(ctx.environment, PATH=str(wrapper) + os.pathsep + ctx.environment['PATH'],
+                   ARCHIVE_TEST_DIR=str(gate), ARCHIVE_TEST_MODE=mode,
+                   ARCHIVE_TEST_DOCKER=shutil.which('docker'))
+        session = Session(ctx, workspace, [*command, name, str(status), str(mode == 'write-error').lower()],
+                          options=[] if name == 'cancel' else ['--no-trace'], env=env, name=name)
+        if mode == 'write-error':
+            session.args[0] = str(limited)
+        return session, gate
+
+    retained = {}
+    survivor, survivor_gate = session_for('survivor')
+    with survivor:
+        survivor.wait_for('survivor-ready')
+        survivor_root = state / 'sessions' / survivor.id
+
+        def check_survivor(label):
+            before = (workspace / 'survivor-alive').read_bytes()
+            time.sleep(.1)
+            check(ctx, survivor.process.poll() is None and (survivor_root / 'runtime').is_dir()
+                  and (workspace / 'survivor-alive').read_bytes() != before,
+                  label + ': survivor and its private state remain live')
+            denied = run(ctx, ['docker', 'exec', 'membrane-agent-' + survivor.id,
+                              'cat', str(workspace / 'protected')], expected=None)
+            check(ctx, denied.returncode != 0 and 'Permission denied' in denied.stderr,
+                  label + ': survivor enforcement remains attached')
+        # Preparation must fail without touching a concurrent invocation's
+        # staged files or starting a workload, even in exactly the same project.
+        before = set((state / 'sessions').iterdir())
+        broken = template / 'broken'
+        broken.symlink_to('missing-target')
+        try:
+            result = membrane(ctx, ['touch', 'invalid-workload-started'], cwd=workspace, expected=1)
+            check(ctx, str(broken) in result.stderr and not (workspace / 'invalid-workload-started').exists(),
+                  'invalid template reports its path before workload execution')
+            failed_roots = set((state / 'sessions').iterdir()) - before
+            check(ctx, len(failed_roots) == 1 and all(not (root / 'runtime').exists()
+                      and not list(root.glob('artifacts*')) for root in failed_roots),
+                  'failed preparation removes only its disposable state')
+        finally:
+            broken.unlink()
+        check_survivor('invalid template')
+
+        # Go tests cover producer/status permutations. Here each fault exercises
+        # a distinct cleanup path against an actual concurrent session.
+        cases = [('first', '', 0), ('broken', 'broken', 37), ('missing-source', 'missing-source', 37),
+                 ('runtime-error', 'runtime-error', 0), ('write-error', 'write-error', 0),
+                 ('cancel', 'cancel', 0), ('service', '', 0), ('later', '', 0)]
+        for name, mode, status in cases:
+            session, gate = session_for(name, mode, status=status)
+            with session:
+                session.wait_for(name + '-ready')
+                root = state / 'sessions' / session.id
+                if mode == 'cancel':
+                    # Only this interruption checks delivered prefixes; group 40
+                    # covers normal live delivery, and 41 covers template/mounts.
+                    log = root / 'logs' / ('membrane-handler-' + session.id + '.log')
+                    trace = root / 'logs' / ('membrane-agent-' + session.id + '.jsonl.gz')
+                    delivered = b''
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if trace.exists():
+                            delivered = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(trace.read_bytes())
+                        if b'"type":' in delivered and log.exists() and log.stat().st_size:
+                            break
+                        time.sleep(.05)
+                    live_log = log.read_bytes()
+                    check(ctx, bool(live_log) and b'"type":' in delivered and session.process.poll() is None,
+                          'cancel: diagnostics and trace prefix delivered before interruption')
+                if name == 'service':
+                    run(ctx, ['docker', 'exec', 'membrane-handler-' + session.id,
+                              'python3', '-c', """import os, signal
+from pathlib import Path
+pids = [pid for pid in Path('/proc/1/task/1/children').read_text().split()
+        if Path('/proc/' + pid + '/comm').read_text().strip() == 'dns-proxy']
+assert len(pids) == 1, pids
+os.kill(int(pids[0]), signal.SIGKILL)
+"""])
+                elif mode == 'cancel':
+                    session.process.send_signal(signal.SIGTERM)
+                else:
+                    session.release(name + '-continue')
+                if mode != 'runtime-error':
+                    session.wait_for(gate / 'before-export', timeout=120)
+                    agent = 'membrane-agent-' + session.id
+                    if name in ('cancel', 'service'):
+                        check(ctx, inspect(ctx, agent)['State']['Status'] == 'exited', name + ': source stopped before recovery')
+                        cgroup = workload_cgroup(ctx, session)
+                        check(ctx, 'populated 0' in run(ctx, [*host_root(), 'cat', cgroup + '/cgroup.events']).stdout,
+                              name + ': no workload writers during recovery')
+                    if mode == 'missing-source':
+                        run(ctx, ['docker', 'rm', '-f', agent])
+                    (gate / 'export').touch()
+                if mode == 'cancel':
+                    session.wait_for(gate / 'producer-pid')
+                    partial = root / 'artifacts.tar.gz.partial'
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and (not partial.exists() or partial.stat().st_size < 65536):
+                        time.sleep(.02)
+                    check(ctx, partial.exists() and partial.stat().st_size >= 65536 and session.process.poll() is None,
+                          'selected bytes stream to disk before producer EOF')
+                    session.process.send_signal(signal.SIGTERM)
+                    session.wait_for(gate / 'cleanup-started')
+                    # Further signals during cleanup must not discard the
+                    # partial file or prevent teardown of owned resources.
+                    session.process.send_signal(signal.SIGHUP)
+                    (gate / 'cleanup-release').touch()
+                expected = None if name in ('cancel', 'service') else (status or (1 if mode else 0))
+                output = session.wait(expected=expected, timeout=180)
+                if expected is None:
+                    check(ctx, session.process.returncode != 0, name + ': original failure remains nonzero')
+                archive = root / 'artifacts.tar.gz'
+                partial = root / 'artifacts.tar.gz.partial'
+                if mode:
+                    check(ctx, 'archive failed:' in output and not archive.exists()
+                          and 'archive saved to' not in output, name + ': failed collection never published')
+                    if mode != 'runtime-error':
+                        check(ctx, partial.exists() and partial.stat().st_mode & 0o777 == 0o600
+                              and 'incomplete archive retained' in output, name + ': private partial retained and reported')
+                    else:
+                        check(ctx, not partial.exists(), 'unavailable runtime creates no misleading archive')
+                    diagnostic = {'broken': 'injected archive producer failure',
+                                  'missing-source': 'No such container', 'runtime-error': 'injected archive runtime transport failure',
+                                  'write-error': 'file too large', 'cancel': 'context canceled'}[mode]
+                    check(ctx, diagnostic.lower() in output.lower(), name + ': collection failure cause retained')
+                else:
+                    with tarfile.open(archive, 'r:gz') as content:
+                        check(ctx, content.extractfile('home/agent/private/owner').read().decode() == name,
+                              name + ': archive retains this session private marker')
+                if name == 'service':
+                    check(ctx, 'dns-proxy' in output and 'handler' in output
+                          and not (workspace / 'service-completed').exists(),
+                          'required-service failure stays visible; workload is never resumed')
+                if mode == 'cancel':
+                    try:
+                        os.kill(int((gate / 'producer-pid').read_text()), 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        raise TestFailure('cancelled export producer survived cleanup')
+                    check(ctx, True, 'cancelled producer reaped before resource cleanup')
+                calls = [json.loads(line) for line in (gate / 'calls.jsonl').read_text().splitlines()]
+                check(ctx, sum(args[0] == 'start' for args in calls) == 1,
+                      name + ': no workload restart during recovery')
+                cleaned(ctx, session)
+                check(ctx, not (root / 'runtime').exists(), name + ': disposable inputs removed')
+                if mode == 'cancel':
+                    log = log.with_suffix('.log.gz')
+                    with gzip.open(log, 'rb') as stream:
+                        check(ctx, stream.read().startswith(live_log), 'cancel: delivered diagnostics retained')
+                    recovered = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(trace.read_bytes())
+                    check(ctx, recovered.startswith(delivered), 'cancel: delivered trace prefix retained')
+                    for path in (log, trace):
+                        retained[path] = hashlib.sha256(path.read_bytes()).digest()
+                check_survivor(name)
+                if name in ('first', 'broken'):
+                    path = archive if name == 'first' else partial
+                    retained[path] = hashlib.sha256(path.read_bytes()).digest()
+                if name == 'first':
+                    # A malformed retained artifact would break an eager restore
+                    # path; later launches must ignore historical archive input.
+                    old = state / 'sessions/0000000000000000/artifacts.tar.gz'
+                    old.parent.mkdir(mode=0o700)
+                    old.write_bytes(b'not an input archive')
+                    old.chmod(0o600)
+                    retained[old] = hashlib.sha256(old.read_bytes()).digest()
+        survivor.release('survivor-continue')
+        survivor.wait_for(survivor_gate / 'before-export')
+        (survivor_gate / 'export').touch()
+        survivor.wait(timeout=180)
+        cleaned(ctx, survivor)
+        with tarfile.open(survivor_root / 'artifacts.tar.gz', 'r:gz') as content:
+            check(ctx, content.extractfile('home/agent/private/owner').read() == b'survivor',
+                  'survivor retains its own private changes after concurrent failures')
+        check(ctx, all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in retained.items()),
+              'failure sequence and last cleanup preserve earlier archive, partial, log and trace')
+    check(ctx, not list((state / 'sessions').glob('*/runtime')), 'all disposable state removed')
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -2245,6 +3090,10 @@ GROUPS = {
     37: TestGroup("additional directory mounts, configuration and readonly roots", group_37),
     38: TestGroup("mount overlaps, selector inheritance and linked worktrees", group_38),
     39: TestGroup("workspace configuration trust, persistence and strict parsing", group_39),
+    40: TestGroup("private session outputs, live delivery and runtime cleanup", group_40),
+    41: TestGroup("private agent state, nested mount precedence and failed-copy cleanup", group_41),
+    42: TestGroup("selected private archives, stopped writers and backend mount exclusion", group_42),
+    43: TestGroup("archive failures, cancellation and concurrent private-state isolation", group_43),
 }
 
 
@@ -2271,7 +3120,7 @@ def run_group(number, membrane_cmd, environment, artifacts, keep_artifacts):
                     if not session_id:
                         continue
                     log = next(directory.rglob(f"membrane-handler-{session_id}.log*"),
-                               Path.home() / ".membrane/logs" / f"membrane-handler-{session_id}.log")
+                               Path.home() / ".membrane/sessions" / session_id / "logs" / f"membrane-handler-{session_id}.log")
                     if not log.exists():
                         log = log.with_suffix(".log.gz")
                     if log.exists():

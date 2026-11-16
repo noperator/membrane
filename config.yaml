@@ -12,6 +12,11 @@
 # `rw`.
 mounts: []
 
+# `archive_paths` lists agent directories that should be saved at shutdown to
+# sessions/<id>/artifacts.tar.gz. Mounts are excluded.
+archive_paths:
+  - /home/agent
+
 # `dns_resolver` is the upstream DNS resolver used by the handler's dns-proxy.
 # Defaults to 1.1.1.1 if not set.
 dns_resolver:

@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -15,14 +17,15 @@ import (
 )
 
 type config struct {
-	DNSResolver string           `yaml:"dns_resolver"`
-	SSLInsecure bool             `yaml:"ssl_insecure"`
-	Sealed      []string         `yaml:"sealed"`
-	Readonly    []string         `yaml:"readonly"`
-	Mounts      []directoryMount `yaml:"mounts"`
-	Args        []string         `yaml:"args"`
-	Allow       []NetworkRule    `yaml:"allow"`
-	Deny        []NetworkRule    `yaml:"deny"`
+	DNSResolver  string           `yaml:"dns_resolver"`
+	SSLInsecure  bool             `yaml:"ssl_insecure"`
+	Sealed       []string         `yaml:"sealed"`
+	Readonly     []string         `yaml:"readonly"`
+	Mounts       []directoryMount `yaml:"mounts"`
+	ArchivePaths []string         `yaml:"archive_paths"`
+	Args         []string         `yaml:"args"`
+	Allow        []NetworkRule    `yaml:"allow"`
+	Deny         []NetworkRule    `yaml:"deny"`
 }
 
 type directoryMount struct {
@@ -254,7 +257,8 @@ func ParseAllowEntry(raw string) (NetworkRule, error) {
 }
 
 // loadConfig loads and merges local (~/.membrane/config.yaml) and workspace
-// (.membrane.yaml) configs. Trusted workspace lists are appended to local lists.
+// (.membrane.yaml) configs. Trusted workspace lists are appended to local lists,
+// except archive_paths: a present list replaces the inherited selection.
 // When skipGlobal is true, only the global config is skipped; trust still applies.
 func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 	home, err := os.UserHomeDir()
@@ -304,9 +308,15 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 			base.Args = append(base.Args, workspace.Args...)
 			base.Allow = append(base.Allow, workspace.Allow...)
 			base.Deny = append(base.Deny, workspace.Deny...)
+			if workspace.ArchivePaths != nil {
+				base.ArchivePaths = workspace.ArchivePaths
+			}
 		}
 	}
 
+	if base.ArchivePaths == nil {
+		base.ArchivePaths = []string{"/home/agent"}
+	}
 	expandArgs(base.Args)
 	return &base, nil
 }
@@ -319,28 +329,62 @@ func loadConfigFile(path string) (*config, error) {
 	return parseConfig(path, data)
 }
 
-func parseConfig(path string, data []byte) (*config, error) {
+func parseConfig(filename string, data []byte) (*config, error) {
 	cfg := &config{}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(cfg); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse %s: %w", filename, err)
 	}
 	// Pointer entries retain YAML nulls that []NetworkRule would silently skip.
 	// Validate denies separately so existing allow parsing stays unchanged.
 	// Mount nodes preserve key presence and distinguish strings from nulls.
 	var entries struct {
-		Deny   []*NetworkRule         `yaml:"deny"`
-		Mounts []map[string]yaml.Node `yaml:"mounts"`
+		Deny         []*NetworkRule         `yaml:"deny"`
+		Mounts       []map[string]yaml.Node `yaml:"mounts"`
+		ArchivePaths yaml.Node              `yaml:"archive_paths"`
 	}
 	if err := yaml.Unmarshal(data, &entries); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse %s: %w", filename, err)
+	}
+	if node := entries.ArchivePaths; node.Kind != 0 {
+		if node.Kind != yaml.SequenceNode {
+			return nil, fmt.Errorf("parse %s: archive_paths must be a list (use [] to disable collection)", filename)
+		}
+		for i, value := range node.Content {
+			name := value.Value
+			if value.ShortTag() != "!!str" || !path.IsAbs(name) || strings.ContainsRune(name, 0) {
+				return nil, fmt.Errorf("parse %s: archive_paths[%d] must be a literal absolute path without NUL bytes", filename, i)
+			}
+			// Cleaning '..' could hide a symlink ancestor that collection must not
+			// traverse. Require an unambiguous selection before any workload starts.
+			for _, component := range strings.Split(name, "/") {
+				if component == ".." {
+					return nil, fmt.Errorf("parse %s: archive_paths[%d] must not contain '..'", filename, i)
+				}
+			}
+			cfg.ArchivePaths[i] = path.Clean(name)
+		}
+		// Parents precede descendants. Drop duplicates and covered selections so
+		// each private object is collected only once, with component boundaries.
+		sort.Strings(cfg.ArchivePaths)
+		selections := cfg.ArchivePaths[:0]
+	selection:
+		for _, name := range cfg.ArchivePaths {
+			for _, parent := range selections {
+				if name == parent || strings.HasPrefix(name, strings.TrimSuffix(parent, "/")+"/") {
+					continue selection
+				}
+			}
+			selections = append(selections, name)
+		}
+		cfg.ArchivePaths = selections
 	}
 	for i, entry := range entries.Mounts {
 		_, hasPath := entry["path"]
 		_, hasType := entry["type"]
 		if hasPath == hasType {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: specify exactly one of path or type", path, i)
+			return nil, fmt.Errorf("parse %s: mounts[%d]: specify exactly one of path or type", filename, i)
 		}
 		mount := &cfg.Mounts[i]
 		field, value := "path", mount.Path
@@ -349,38 +393,38 @@ func parseConfig(path string, data []byte) (*config, error) {
 		}
 		node := entry[field]
 		if node.ShortTag() != "!!str" || value == "" {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: %s must be a nonempty string", path, i, field)
+			return nil, fmt.Errorf("parse %s: mounts[%d]: %s must be a nonempty string", filename, i, field)
 		}
 		if hasType && mount.Type != "git-root" && mount.Type != "git-meta" {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: unsupported type %q: must be git-root or git-meta", path, i, mount.Type)
+			return nil, fmt.Errorf("parse %s: mounts[%d]: unsupported type %q: must be git-root or git-meta", filename, i, mount.Type)
 		}
 		mode, present := entry["mode"]
 		if !present {
 			mount.Mode = "rw"
 		} else if mode.ShortTag() != "!!str" || (mount.Mode != "ro" && mount.Mode != "rw") {
-			return nil, fmt.Errorf("parse %s: mounts[%d]: invalid mode %q: must be ro or rw", path, i, mount.Mode)
+			return nil, fmt.Errorf("parse %s: mounts[%d]: invalid mode %q: must be ro or rw", filename, i, mount.Mode)
 		}
 	}
 	for i, rule := range entries.Deny {
 		if rule == nil || rule.Type == "" || (rule.Type != "any" && rule.CIDR == "" && rule.Host == "") {
-			return nil, fmt.Errorf("parse %s: deny[%d]: missing destination", path, i)
+			return nil, fmt.Errorf("parse %s: deny[%d]: missing destination", filename, i)
 		}
 		for _, http := range rule.HTTP {
 			for _, method := range http.Methods {
 				if method == "" {
-					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP method", path, i)
+					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP method", filename, i)
 				}
 			}
 			for _, prefix := range http.Paths {
 				if prefix.Path == "" {
-					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP path", path, i)
+					return nil, fmt.Errorf("parse %s: deny[%d]: empty HTTP path", filename, i)
 				}
 			}
 		}
 		if len(rule.HTTP) > 0 || strings.TrimRight(rule.Path, "/") != "" {
 			for _, port := range rule.Ports {
 				if port.Proto == "udp" {
-					return nil, fmt.Errorf("parse %s: deny[%d]: UDP ports cannot be combined with HTTP or path constraints", path, i)
+					return nil, fmt.Errorf("parse %s: deny[%d]: UDP ports cannot be combined with HTTP or path constraints", filename, i)
 				}
 			}
 		}

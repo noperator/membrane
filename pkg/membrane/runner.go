@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,27 +28,20 @@ import (
 
 // writeNetworkRulesFile serialises allow and deny rules to a temp file and returns its path.
 // The caller is responsible for removing the file when done.
-func writeNetworkRulesFile(allow, deny []NetworkRule) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("get home dir: %w", err)
-	}
-	dir := filepath.Join(home, ".membrane", "tmp")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("create tmp dir: %w", err)
-	}
+func writeNetworkRulesFile(dir string, allow, deny []NetworkRule) (string, error) {
 	f, err := os.CreateTemp(dir, "membrane-network-rules-*.json")
 	if err != nil {
 		return "", fmt.Errorf("create network rules file: %w", err)
 	}
-	defer f.Close()
 	if allow == nil {
 		allow = []NetworkRule{}
 	}
 	if deny == nil {
 		deny = []NetworkRule{}
 	}
-	if err := json.NewEncoder(f).Encode(map[string][]NetworkRule{"allow": allow, "deny": deny}); err != nil {
+	err = json.NewEncoder(f).Encode(map[string][]NetworkRule{"allow": allow, "deny": deny})
+	err = errors.Join(err, f.Close())
+	if err != nil {
 		os.Remove(f.Name())
 		return "", fmt.Errorf("write network rules file: %w", err)
 	}
@@ -71,11 +65,17 @@ type sessionNames struct {
 	internalNetwork  string
 	externalNetwork  string
 	caVolume         string
+	dir              string
+	logsDir          string
+	runtimeDir       string
 
-	agentFileMounts []string
+	agentFileMounts []agentFileMount
 	directoryMounts []directoryMount
 	policyRoots     map[int]string
+	archivePaths    []string
 }
+
+type agentFileMount struct{ source, destination string }
 
 // --mount refuses missing bind sources, unlike -v which can create them. CSV
 // encoding preserves source and destination paths as individual fields.
@@ -137,11 +137,13 @@ func createSessionCgroup(ctx context.Context, s *sessionNames) (func() error, er
 	return cleanup, nil
 }
 
-func newSessionNames() sessionNames {
+func newSession(membraneDir string) (sessionNames, error) {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return sessionNames{}, fmt.Errorf("generate session ID: %w", err)
+	}
 	id := hex.EncodeToString(b[:])
-	return sessionNames{
+	s := sessionNames{
 		id:               id,
 		agentContainer:   "membrane-agent-" + id,
 		handlerContainer: "membrane-handler-" + id,
@@ -149,6 +151,23 @@ func newSessionNames() sessionNames {
 		externalNetwork:  "membrane-external-" + id,
 		caVolume:         "membrane-ca-" + id,
 	}
+	parent := filepath.Join(membraneDir, "sessions")
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return s, fmt.Errorf("create sessions directory: %w", err)
+	}
+	s.dir = filepath.Join(parent, id)
+	s.logsDir = filepath.Join(s.dir, "logs")
+	s.runtimeDir = filepath.Join(s.dir, "runtime")
+	// Exclusive creation establishes ownership: never reuse an existing session.
+	if err := os.Mkdir(s.dir, 0700); err != nil {
+		return s, fmt.Errorf("create session directory: %w", err)
+	}
+	for _, dir := range []string{s.logsDir, s.runtimeDir} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			return s, fmt.Errorf("create session subdirectory: %w", err)
+		}
+	}
+	return s, nil
 }
 
 // brNetfilterLoaded reports whether the br_netfilter kernel module is
@@ -204,9 +223,12 @@ func removeDockerUserRule(bridge string) {
 // startSession creates per-session networks, starts the handler container,
 // waits for it to signal ready, and returns a cleanup func and the handler's
 // IP on the internal network.
-func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, policyFile string) (func() error, string, error) {
+func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool, traceLogFile, policyFile string) (cleanup func() error, gatewayIP string, retErr error) {
+	// Teardown owns processes, mounts and an open log. Repeated calls return the
+	// original result without acting on released resources or recompressing logs.
+	defer func() { cleanup = sync.OnceValue(cleanup) }()
 	cleanupCgroup, cgroupErr := createSessionCgroup(ctx, s)
-	cleanup := func() error {
+	cleanup = func() error {
 		// Remove all workload processes before detaching BPF, including DinD.
 		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
 		if err := stopWorkload(*s); err != nil {
@@ -265,7 +287,7 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		return err
 	}
 
-	networkRulesFile, err := writeNetworkRulesFile(cfg.Allow, cfg.Deny)
+	networkRulesFile, err := writeNetworkRulesFile(s.runtimeDir, cfg.Allow, cfg.Deny)
 	if err != nil {
 		return cleanup, "", fmt.Errorf("write network rules file: %w", err)
 	}
@@ -297,8 +319,18 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 	}
 	if trace {
 		traceDir := filepath.Dir(traceLogFile)
-		if err := os.MkdirAll(traceDir, 0755); err != nil {
+		if err := os.MkdirAll(traceDir, 0700); err != nil {
 			return cleanup, "", err
+		}
+		// Create as the host user so the handler can write private diagnostics
+		// without leaving a root-owned 0600 file unreadable on native Linux.
+		f, err := os.OpenFile(traceLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return cleanup, "", fmt.Errorf("create trace file: %w", err)
+		}
+		err = errors.Join(f.Chmod(0600), f.Close())
+		if err != nil {
+			return cleanup, "", fmt.Errorf("prepare trace file: %w", err)
 		}
 		handlerArgs = append(handlerArgs,
 			"-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
@@ -326,6 +358,38 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		return cleanup, "", fmt.Errorf("start handler: %s: %w", out, err)
 	}
 
+	// Keep handler logs readable during the session; gzip them on cleanup.
+	logPath := filepath.Join(s.logsDir, s.handlerContainer+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
+	}
+	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
+	logCmd.Stdout = logFile
+	logCmd.Stderr = logFile
+	if err := logCmd.Start(); err != nil {
+		logFile.Close()
+		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
+	}
+
+	prevCleanup2 := cleanup
+	cleanup = func() error {
+		err := prevCleanup2()
+		_ = logCmd.Process.Kill()
+		_ = logCmd.Wait()
+		logErr := logFile.Close()
+		if logErr == nil {
+			logErr = gzipFile(logPath + ".gz")
+		}
+		if logErr == nil {
+			logErr = os.Remove(logPath)
+		}
+		if logErr != nil {
+			err = errors.Join(err, fmt.Errorf("retain handler log %s: %w", logPath, logErr))
+		}
+		return err
+	}
+
 	if out, err := exec.CommandContext(ctx, "docker", "network", "connect",
 		s.internalNetwork, s.handlerContainer).CombinedOutput(); err != nil {
 		return cleanup, "", fmt.Errorf("connect handler to internal network: %s: %w", out, err)
@@ -350,40 +414,6 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 		time.Sleep(time.Second)
 	}
 
-	// Keep handler logs readable during the session; gzip them on cleanup.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return cleanup, "", fmt.Errorf("get home dir: %w", err)
-	}
-	logDir := filepath.Join(home, ".membrane", "logs")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return cleanup, "", fmt.Errorf("create handler log dir: %w", err)
-	}
-	logPath := filepath.Join(logDir, s.handlerContainer+".log")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return cleanup, "", fmt.Errorf("create handler log file: %w", err)
-	}
-	logCmd := exec.Command("docker", "logs", "-f", s.handlerContainer)
-	logCmd.Stdout = logFile
-	logCmd.Stderr = logFile
-	if err := logCmd.Start(); err != nil {
-		logFile.Close()
-		return cleanup, "", fmt.Errorf("start handler log capture: %w", err)
-	}
-
-	prevCleanup2 := cleanup
-	cleanup = func() error {
-		err := prevCleanup2()
-		_ = logCmd.Process.Kill()
-		_ = logCmd.Wait()
-		logFile.Close()
-		if err := gzipFile(logPath + ".gz"); err == nil {
-			os.Remove(logPath)
-		}
-		return err
-	}
-
 	out, err = exec.Command("docker", "inspect", "-f",
 		fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}",
 			s.internalNetwork),
@@ -391,7 +421,7 @@ func startSession(ctx context.Context, s *sessionNames, cfg *config, trace bool,
 	if err != nil {
 		return cleanup, "", fmt.Errorf("inspect handler IP: %w", err)
 	}
-	gatewayIP := strings.TrimSpace(string(out))
+	gatewayIP = strings.TrimSpace(string(out))
 	if gatewayIP == "" {
 		return cleanup, "", fmt.Errorf("handler has no IP on %s", s.internalNetwork)
 	}
@@ -405,7 +435,7 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 	if s.cgroupParent == "" {
 		return nil, errors.New("workload requires a pre-created session cgroup")
 	}
-	args := []string{"create", "-it", "--rm", "--init", "--name", s.agentContainer}
+	args := []string{"create", "-it", "--init", "--name", s.agentContainer}
 
 	if sysbox {
 		args = append(args, "--runtime=sysbox-runc", "-e", "MEMBRANE_DIND=1")
@@ -424,15 +454,6 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		args = append(args, "--mount", directoryBind(mount.Path, mount.Path, mount.Mode == "ro"))
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-	agentHome := filepath.Join(home, ".membrane", "home")
-	if err := os.MkdirAll(agentHome, 0755); err != nil {
-		return nil, fmt.Errorf("create agent home dir: %w", err)
-	}
-	args = append(args, "-v", agentHome+":/home/agent")
 	args = append(args, "-v", s.caVolume+":/membrane-ca:ro")
 	args = append(args,
 		// CA trust for runtimes that don't use the system store by default
@@ -443,11 +464,77 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 		"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
 	)
 
-	args = append(args, s.agentFileMounts...)
+	// Explicit live mounts also mask generated instruction/config files. Docker
+	// otherwise mounts our more-specific file through a user-mounted parent.
+	var destinations []string
+	for _, mount := range s.directoryMounts {
+		destinations = append(destinations, mount.Path)
+	}
+	for i := 0; i < len(cfg.Args); i++ {
+		arg, value, kind := cfg.Args[i], "", ""
+		for _, flag := range []string{"--mount", "--volume", "--volumes-from", "--tmpfs", "-v"} {
+			if arg == flag {
+				if i+1 == len(cfg.Args) {
+					return nil, fmt.Errorf("%s requires a mount value", flag)
+				}
+				i++
+				kind, value = flag, cfg.Args[i]
+				break
+			}
+			if strings.HasPrefix(arg, flag+"=") {
+				kind, value = flag, strings.TrimPrefix(arg, flag+"=")
+				break
+			}
+		}
+		if kind == "" && strings.HasPrefix(arg, "-v") && len(arg) > 2 {
+			kind, value = "-v", arg[2:]
+		}
+		if kind == "--volumes-from" {
+			container, _, _ := strings.Cut(value, ":")
+			out, err := exec.Command("docker", "inspect", "-f", "{{json .Mounts}}", container).Output()
+			if err != nil {
+				return nil, fmt.Errorf("inspect inherited mounts from %s: %w", container, err)
+			}
+			var mounts []struct{ Destination string }
+			if err := json.Unmarshal(out, &mounts); err != nil {
+				return nil, fmt.Errorf("decode inherited mounts from %s: %w", container, err)
+			}
+			for _, mount := range mounts {
+				destinations = append(destinations, filepath.Clean(mount.Destination))
+			}
+		} else if kind == "--mount" {
+			fields, err := csv.NewReader(strings.NewReader(value)).Read()
+			if err != nil {
+				return nil, fmt.Errorf("parse --mount: %w", err)
+			}
+			for _, field := range fields {
+				key, val, _ := strings.Cut(field, "=")
+				if key = strings.ToLower(key); key == "dst" || key == "destination" || key == "target" {
+					destinations = append(destinations, filepath.Clean(val))
+				}
+			}
+		} else if kind != "" {
+			fields := strings.Split(value, ":")
+			destination := fields[0]
+			if kind != "--tmpfs" && len(fields) > 1 {
+				destination = fields[1]
+			}
+			destinations = append(destinations, filepath.Clean(destination))
+		}
+	}
+files:
+	for _, file := range s.agentFileMounts {
+		for _, destination := range destinations {
+			if file.destination == destination || strings.HasPrefix(file.destination, strings.TrimSuffix(destination, "/")+"/") {
+				continue files
+			}
+		}
+		args = append(args, "--mount", directoryBind(file.source, file.destination, true))
+	}
 	// Extra args from config.
 	args = append(args, cfg.Args...)
 	// Session identity takes precedence over a configured Docker parent.
-	args = append(args, "--cgroup-parent="+s.cgroupParent)
+	args = append(args, "--cgroup-parent="+s.cgroupParent, "--rm=false")
 
 	if title := os.Getenv("MEMBRANE_TITLE"); title != "" {
 		args = append(args, "-e", "MEMBRANE_TITLE="+title)
@@ -463,29 +550,64 @@ func buildAgentArgs(workspaceDir string, cfg *config, passthrough []string, s se
 }
 
 // gzipFile compresses a closed handler log, independently of eBPF trace output.
-func gzipFile(dst string) error {
+func gzipFile(dst string) (retErr error) {
 	in, err := os.Open(strings.TrimSuffix(dst, ".gz"))
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.Create(dst)
+	defer func() { retErr = errors.Join(retErr, in.Close()) }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { retErr = errors.Join(retErr, out.Close()) }()
 	gz := gzip.NewWriter(out)
-	defer gz.Close()
+	defer func() { retErr = errors.Join(retErr, gz.Close()) }()
 	_, err = io.Copy(gz, in)
 	return err
 }
 
 // runAgent keeps the existing terminal proxy for start/attach and stops the
 // workload if its handler exits. Creation never executes image code.
-func runAgent(ctx context.Context, s sessionNames, args []string) error {
+func runAgent(ctx context.Context, s sessionNames, args []string) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Watch required services throughout preparation, which can take longer
+	// than container creation. A failed handler must cancel copy-in too.
+	setupCtx, cancelSetup := context.WithCancel(ctx)
+	defer cancelSetup()
+	waitCtx, cancel := context.WithCancel(context.Background())
+	handlerDone := make(chan error, 1)
+	waitFinished := make(chan struct{})
+	var handlerErr error
+	defer func() {
+		cancel()
+		<-waitFinished
+		if handlerErr == nil {
+			select {
+			case handlerErr = <-handlerDone:
+			default:
+			}
+		}
+		if handlerErr != nil {
+			logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
+			handlerErr = fmt.Errorf("%w\nHandler logs:\n%s", handlerErr, logs)
+			// ExitError keeps the workload status at the CLI. Report the service
+			// failure separately so that a concurrent exit cannot hide its cause.
+			fmt.Fprintf(os.Stderr, "membrane: %v\n", handlerErr)
+			retErr = errors.Join(retErr, handlerErr)
+		}
+	}()
+	go func() {
+		defer close(waitFinished)
+		out, err := exec.CommandContext(waitCtx, "docker", "wait", s.handlerContainer).CombinedOutput()
+		if waitCtx.Err() == nil {
+			handlerDone <- fmt.Errorf("handler exited during session: %s (%v)", strings.TrimSpace(string(out)), err)
+			cancelSetup()
+		}
+	}()
+	var archiveExclusions []string
 	if args[0] == "create" {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			for i, arg := range args {
@@ -494,48 +616,54 @@ func runAgent(ctx context.Context, s sessionNames, args []string) error {
 				}
 			}
 		}
-		if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(setupCtx, "docker", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("create agent: %s: %w", out, err)
+		}
+		// The bundled agent starts as UID/GID 1000. Its entrypoint then adjusts
+		// only private home objects to the workspace's container-side identity.
+		var err error
+		archiveExclusions, err = copyAgentRoot(setupCtx, filepath.Join(s.runtimeDir, "agent-root"), s.agentContainer, 1000, 1000)
+		if err != nil {
+			return fmt.Errorf("prepare agent filesystem: %w", err)
 		}
 		args = []string{"start", "--attach", "--interactive", s.agentContainer}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := setupCtx.Err(); err != nil {
 		return err
 	}
-	// Cancellation is handled by the select below. Canceling docker wait at
-	// the same time would incorrectly report an intentional stop as failure.
-	waitCtx, cancel := context.WithCancel(context.Background())
-	handlerDone := make(chan error, 1)
-	waitFinished := make(chan struct{})
-	defer func() {
-		cancel()
-		<-waitFinished
-	}()
-	go func() {
-		defer close(waitFinished)
-		out, err := exec.CommandContext(waitCtx, "docker", "wait", s.handlerContainer).CombinedOutput()
-		handlerDone <- fmt.Errorf("handler exited during session: %s (%v)", strings.TrimSpace(string(out)), err)
-	}()
+	if len(s.archivePaths) != 0 {
+		defer func() {
+			// An earlier workload cancellation must not cancel orderly collection;
+			// another signal abandons the export and lets owned cleanup continue.
+			archiveCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+			defer stop()
+			if err := archiveAgent(archiveCtx, s, archiveExclusions); err != nil {
+				// The CLI preserves ExitError's status. Report collection separately
+				// so that doing so cannot hide a second failure.
+				fmt.Fprintf(os.Stderr, "membrane: archive failed: %v\n", err)
+				retErr = errors.Join(retErr, fmt.Errorf("archive agent files: %w", err))
+			}
+		}()
+	}
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- execDocker(args) }()
 	select {
 	case err := <-agentDone:
 		running, inspectErr := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", s.handlerContainer).Output()
 		if inspectErr != nil || strings.TrimSpace(string(running)) != "true" {
-			logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
-			return fmt.Errorf("handler failed during session\nHandler logs:\n%s", logs)
+			handlerErr = errors.New("handler failed during session")
 		}
 		return err
 	case err := <-handlerDone:
-		_ = exec.Command("docker", "rm", "-f", s.agentContainer).Run()
-		err = errors.Join(err, stopWorkload(s))
+		handlerErr = err
+		_ = exec.Command("docker", "kill", s.agentContainer).Run()
+		err = stopWorkload(s)
 		select {
-		case <-agentDone:
+		case agentErr := <-agentDone:
+			return errors.Join(agentErr, err)
 		case <-time.After(30 * time.Second):
-			return fmt.Errorf("%w; timed out waiting for workload attachment to exit", err)
+			return errors.Join(err, errors.New("timed out waiting for workload attachment to exit"))
 		}
-		logs, _ := exec.Command("docker", "logs", s.handlerContainer).CombinedOutput()
-		return fmt.Errorf("%w\nHandler logs:\n%s", err, logs)
 	case <-ctx.Done():
 		_ = exec.Command("docker", "stop", "-t", "2", s.agentContainer).Run()
 		err := <-agentDone

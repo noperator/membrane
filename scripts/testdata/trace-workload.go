@@ -53,6 +53,14 @@ func connect(family, port int, loopback bool) bool {
 }
 
 func main() {
+	// Archive acceptance leaves a real DinD writer alive until the outer session
+	// stops; a completed inner command cannot prove descendant-writer draining.
+	if len(os.Args) == 3 && os.Args[1] == "archive-writer" {
+		for {
+			must(os.WriteFile(os.Args[2], []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o600))
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 	token := os.Args[1]
 	port, err := strconv.Atoi(os.Args[2])
 	must(err)
