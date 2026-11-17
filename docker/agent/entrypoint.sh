@@ -69,7 +69,7 @@ for filename, fields in (('/etc/passwd', {2: uid, 3: gid}), ('/etc/group', {2: g
         stream.writelines(lines)
 
 home = '/home/agent'
-if not mounted(home):
+if (uid, gid) != (account.pw_uid, account.pw_gid) and not mounted(home):
     os.chown(home, uid, gid, follow_symlinks=False)
     for root, dirs, files in os.walk(home, followlinks=False):
         for name in list(dirs) + files:
