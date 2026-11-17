@@ -349,6 +349,17 @@ def normalize_path(path):
 
 
 def request(flow: mhttp.HTTPFlow) -> None:
+    # Transparent mode preserves the target authority through this hook.
+    # HTTP/2 also reports "absolute" for its ordinary :authority header.
+    if (flow.request.http_version.startswith("HTTP/1.") and
+            flow.request.first_line_format == "absolute"):
+        flow.response = mhttp.Response.make(
+            400,
+            b"Blocked by Membrane: absolute-form HTTP/1 request targets are unsupported. "
+            b"Use an origin-form target such as /items.\n",
+            {"Content-Type": "text/plain; charset=utf-8"})
+        return
+
     host = flow.request.pretty_host.lower() if flow.request.pretty_host else ""
     # Split the raw target before decoding: query data cannot change the path.
     path = normalize_path(flow.request.path.partition("?")[0])
@@ -364,19 +375,25 @@ def request(flow: mhttp.HTTPFlow) -> None:
     denied = _collect_denies(host, addr or destination,
                             destination[1] if destination else None)
     if _matches_sources(denied, method, path):
-        flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+        flow.response = mhttp.Response.make(
+            403, b"Blocked by Membrane: request matched a deny rule.\n",
+            {"Content-Type": "text/plain; charset=utf-8"})
         return
 
     matched = _collect_matching_sources(host, addr)
 
     if not matched:
-        flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+        flow.response = mhttp.Response.make(
+            403, b"Blocked by Membrane: no allow rule matched the destination.\n",
+            {"Content-Type": "text/plain; charset=utf-8"})
         return
 
     if _matches_sources(matched, method, path):
         return
 
-    flow.response = mhttp.Response.make(403, b"", {"Content-Type": "text/plain"})
+    flow.response = mhttp.Response.make(
+        403, b"Blocked by Membrane: request method or path is not permitted.\n",
+        {"Content-Type": "text/plain; charset=utf-8"})
 
 
 def _matches_sources(matched, method, path):
