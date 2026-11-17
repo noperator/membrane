@@ -410,6 +410,11 @@ def _matches_sources(matched, method, path):
     return False
 
 
+def responseheaders(flow: mhttp.HTTPFlow) -> None:
+    """Forward response bodies without buffering them."""
+    flow.response.stream = True
+
+
 # Signal to entrypoint.sh that the addon has fully loaded.
 # Must come at the bottom of the module — anything after this line
 # would not be initialized when the file appears.
