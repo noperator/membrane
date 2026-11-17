@@ -272,8 +272,9 @@ func TestLoadConfigSealed(t *testing.T) {
 
 // Archive selection must replace (including []) rather than append; otherwise
 // a workspace cannot narrow retained secrets or disable collection. Untrusted
-// workspace values must not change what is retained.
-func TestArchiveConfigPrecedence(t *testing.T) {
+// workspace values must not change what is retained. Resolver cases guard
+// trusted overrides, empty inheritance, and operation without global config.
+func TestConfigPrecedence(t *testing.T) {
 	stdin, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
@@ -285,15 +286,20 @@ func TestArchiveConfigPrecedence(t *testing.T) {
 		name, global, workspace string
 		skipGlobal, untrusted   bool
 		want                    []string
+		wantResolver            string
 	}{
-		{"default", "", "", false, false, []string{"/home/agent"}},
-		{"inherit", "archive_paths: [/etc/tool.conf]", "", false, false, []string{"/etc/tool.conf"}},
-		{"replace", "archive_paths: [/home/agent]", "archive_paths: [/home/agent/.codex]", false, false, []string{"/home/agent/.codex"}},
-		{"disable", "archive_paths: [/home/agent]", "archive_paths: []", false, false, []string{}},
-		{"inherit-disabled", "archive_paths: []", "", false, false, []string{}},
-		{"skip-global", "archive_paths: []", "", true, false, []string{"/home/agent"}},
-		{"skip-global-replace", "archive_paths: [/etc/tool.conf]", "archive_paths: []", true, false, []string{}},
-		{"untrusted", "archive_paths: [/etc/tool.conf]", "archive_paths: []", false, true, []string{"/etc/tool.conf"}},
+		{"default", "", "", false, false, []string{"/home/agent"}, ""},
+		{"inherit", "archive_paths: [/etc/tool.conf]", "", false, false, []string{"/etc/tool.conf"}, ""},
+		{"replace", "archive_paths: [/home/agent]", "archive_paths: [/home/agent/.codex]", false, false, []string{"/home/agent/.codex"}, ""},
+		{"disable", "archive_paths: [/home/agent]", "archive_paths: []", false, false, []string{}, ""},
+		{"inherit-disabled", "archive_paths: []", "", false, false, []string{}, ""},
+		{"skip-global", "archive_paths: []", "", true, false, []string{"/home/agent"}, ""},
+		{"skip-global-replace", "archive_paths: [/etc/tool.conf]", "archive_paths: []", true, false, []string{}, ""},
+		{"untrusted", "archive_paths: [/etc/tool.conf]", "archive_paths: []", false, true, []string{"/etc/tool.conf"}, ""},
+		{"resolver-override", "dns_resolver: 9.9.9.9", "dns_resolver: 192.168.1.1", false, false, []string{"/home/agent"}, "192.168.1.1"},
+		{"resolver-inherit", "dns_resolver: 9.9.9.9", "dns_resolver: ''", false, false, []string{"/home/agent"}, "9.9.9.9"},
+		{"resolver-skip-global", "dns_resolver: 9.9.9.9", "dns_resolver: 192.168.1.1", true, false, []string{"/home/agent"}, "192.168.1.1"},
+		{"resolver-untrusted", "dns_resolver: 9.9.9.9", "dns_resolver: 192.168.1.1", false, true, []string{"/home/agent"}, "9.9.9.9"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home, workspace := t.TempDir(), t.TempDir()
@@ -315,6 +321,9 @@ func TestArchiveConfigPrecedence(t *testing.T) {
 			cfg, err := loadConfig(workspace, test.skipGlobal)
 			if err != nil || !reflect.DeepEqual(cfg.ArchivePaths, test.want) {
 				t.Fatalf("archive configuration: %+v, want %v (%v)", cfg, test.want, err)
+			}
+			if test.wantResolver != "" && cfg.dnsResolver() != test.wantResolver {
+				t.Fatalf("DNS resolver = %q, want %q", cfg.dnsResolver(), test.wantResolver)
 			}
 		})
 	}

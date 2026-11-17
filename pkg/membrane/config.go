@@ -302,6 +302,9 @@ func loadConfig(workspaceDir string, skipGlobal bool) (*config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("load workspace config: %w", err)
 			}
+			if workspace.DNSResolver != "" {
+				base.DNSResolver = workspace.DNSResolver
+			}
 			base.Sealed = append(base.Sealed, workspace.Sealed...)
 			base.Readonly = append(base.Readonly, workspace.Readonly...)
 			base.Mounts = append(base.Mounts, workspace.Mounts...)

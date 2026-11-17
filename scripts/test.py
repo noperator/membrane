@@ -3044,6 +3044,84 @@ os.kill(int(pids[0]), signal.SIGKILL)
     check(ctx, not list((state / 'sessions').glob('*/runtime')), 'all disposable state removed')
 
 
+def group_44(ctx):
+    # Absolute targets can route to a different virtual host downstream. Cover
+    # the wire formats through the real handler, even when both hosts agree.
+    config(ctx, 'allow: [httpbin.org]\n')
+    result = membrane(ctx, ['python3', '-c', r'''
+import http.client, socket, ssl
+count = 0
+for secure in (False, True):
+    for version in ('1.0', '1.1'):
+        for scheme in ('http', 'https'):
+            for authority, host in (('httpbin.org', 'httpbin.org'),
+                                    ('blocked.example', 'httpbin.org'),
+                                    ('httpbin.org:80', 'httpbin.org'),
+                                    ('blocked.example:443', 'httpbin.org'),
+                                    ('httpbin.org', 'blocked.example'),
+                                    ('blocked.example', 'blocked.example')):
+                with socket.create_connection(('httpbin.org', 443 if secure else 80), timeout=10) as raw:
+                    conn = ssl.create_default_context().wrap_socket(raw, server_hostname='httpbin.org') if secure else raw
+                    with conn:
+                        target = scheme + '://' + authority + '/anything'
+                        conn.sendall(('GET ' + target + ' HTTP/' + version + '\r\n'
+                                      'Host: ' + host + '\r\nConnection: close\r\n\r\n').encode())
+                        response = http.client.HTTPResponse(conn)
+                        response.begin()
+                        body = response.read().decode()
+                        assert response.status == 400, (secure, version, target, response.status, body)
+                        assert response.getheader('Content-Type') == 'text/plain; charset=utf-8'
+                        assert 'Membrane' in body and 'absolute-form' in body, body
+                        count += 1
+print(count)
+'''], timeout=180)
+    check(ctx, result.stdout.strip() == '48', '44 absolute-form HTTP/1 rejected over plaintext and TLS')
+
+    # Check actual negotiated versions, not just curl's HTTP/2 preference, and
+    # inspect the upstream JSON to detect accidental replacement of responses.
+    for transport in ('http', 'https'):
+        versions = (('--http1.0', '1.0'), ('--http1.1', '1.1'))
+        if transport == 'https':
+            versions += (('--http2', '2'),)
+        for flag, version in versions:
+            result = membrane(ctx, ['curl', '-sS', '-m', '15', flag,
+                                   '-w', '\n%{http_version} %{http_code}',
+                                   transport + '://httpbin.org/anything?url=https://blocked.example/items'])
+            payload, status = result.stdout.rsplit('\n', 1)
+            body = json.loads(payload)
+            # HTTP/1 response versions may differ from the request version;
+            # curl reports HTTP/1.0 as "1". HTTP/2 must actually negotiate.
+            expected_statuses = ('2 200',) if version == '2' else ('1 200', '1.1 200')
+            check(ctx, status in expected_statuses
+                  and body['args']['url'] == 'https://blocked.example/items',
+                  f'44 origin-form HTTP/{version} over {transport} preserves URL query and upstream body')
+    result = membrane(ctx, ['curl', '-sS', '-m', '15', '-w', '\n%{http_code}',
+                           'https://httpbin.org/status/418'])
+    payload, status = result.stdout.rsplit('\n', 1)
+    check(ctx, status == '418' and 'teapot' in payload and 'Membrane' not in payload,
+          '44 upstream error status and body remain intact')
+
+    # Connect to an allowed destination but vary Host to exercise the HTTP
+    # destination rejection rather than the earlier DNS/transport filter.
+    for policy, extra, reason in (
+        ('allow: [httpbin.org]\ndeny: [{dest: httpbin.org, http: [{methods: [GET]}]}]\n',
+         [], 'matched a deny rule'),
+        ('allow: [httpbin.org]\n', ['-H', 'Host: blocked.example'], 'no allow rule matched'),
+        ('allow: [{dest: httpbin.org, http: [{methods: [POST]}]}]\n',
+         [], 'method or path is not permitted'),
+        ('allow: [https://httpbin.org/anything/permitted]\n',
+         [], 'method or path is not permitted'),
+    ):
+        config(ctx, policy)
+        result = membrane(ctx, ['curl', '-sS', '-m', '15', '--http1.1', '-D', '-',
+                               *extra, 'https://httpbin.org/anything'])
+        headers, body = result.stdout.split('\n\n', 1)
+        check(ctx, headers.splitlines()[0].endswith('403 Forbidden')
+              and 'content-type: text/plain; charset=utf-8' in headers.lower()
+              and 'Blocked by Membrane:' in body and reason in body,
+              '44 explanatory HTTP 403: ' + reason)
+
+
 @dataclass(frozen=True)
 class TestGroup:
     description: str
@@ -3094,6 +3172,7 @@ GROUPS = {
     41: TestGroup("private agent state, nested mount precedence and failed-copy cleanup", group_41),
     42: TestGroup("selected private archives, stopped writers and backend mount exclusion", group_42),
     43: TestGroup("archive failures, cancellation and concurrent private-state isolation", group_43),
+    44: TestGroup("absolute-form HTTP/1 rejection and explanatory HTTP responses", group_44),
 }
 
 
