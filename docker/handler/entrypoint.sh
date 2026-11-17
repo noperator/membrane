@@ -268,6 +268,7 @@ done
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
     -keyout /tmp/ca.key -out /membrane-ca/ca.crt \
     -days "$((($(date -u -d '9999-12-31' +%s) - $(date +%s)) / 86400))" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -nodes -subj "/CN=membrane-ca" 2>/dev/null
 
 # Place CA into mitmproxy confdir
