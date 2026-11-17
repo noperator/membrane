@@ -23,7 +23,7 @@ error() {
 }
 
 enable_sysbox() {
-    # Sysbox CE 0.6.7 supplies these three enableable units. The wrapper binds
+    # Sysbox CE 0.7.1 supplies these three enableable units. The wrapper binds
     # both components and is WantedBy=multi-user.target; components are
     # WantedBy=sysbox.service. Inspect the installed units, never guess a fallback.
     local unit state
@@ -102,9 +102,19 @@ runtime_registered() {
 # -------------------------------------------------------
 # Sysbox
 # -------------------------------------------------------
-if [ -x /usr/bin/sysbox-runc ] && runtime_registered "sysbox-runc"; then
+SYSBOX_VER=0.7.1
+sysbox_adequate=0
+if [ -x /usr/bin/sysbox-runc ]; then
+    installed_version=$(/usr/bin/sysbox-runc --version) || error "Cannot determine installed Sysbox version."
+    installed_version=$(awk '$1 == "version:" {print $2}' <<<"$installed_version")
+    [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || error "Cannot determine installed Sysbox version; inspect sysbox-runc --version before retrying."
+    if dpkg --compare-versions "$installed_version" ge "$SYSBOX_VER"; then
+        sysbox_adequate=1
+    fi
+fi
+if [[ "$sysbox_adequate" == 1 ]] && runtime_registered "sysbox-runc"; then
     info "Sysbox already installed and registered — skipping install."
-elif [ -x /usr/bin/sysbox-runc ]; then
+elif [[ "$sysbox_adequate" == 1 ]]; then
     info "Sysbox binary present but not registered with Docker — merging /etc/docker/daemon.json..."
 
     command -v jq &>/dev/null || sudo apt-get install -y -qq jq
@@ -125,13 +135,13 @@ elif [ -x /usr/bin/sysbox-runc ]; then
     runtime_registered "sysbox-runc" || error "Sysbox binary present but not registered with Docker after daemon.json merge."
     info "Sysbox registered: $(sysbox-runc --version 2>&1 | head -1)"
 else
+    warn "Installing Sysbox $SYSBOX_VER requires stopping Docker and interrupts running containers."
     info "Updating apt cache..."
     sudo apt-get update -qq
 
     info "Installing Sysbox prerequisites..."
     sudo apt-get install -y -qq jq rsync wget
 
-    SYSBOX_VER=0.6.7
     SYSBOX_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VER}/sysbox-ce_${SYSBOX_VER}.linux_${ARCH}.deb"
 
     info "Downloading Sysbox..."
