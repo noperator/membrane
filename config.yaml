@@ -10,7 +10,9 @@
 # types can be configured together. For overlapping mount paths, the longest
 # (most specific) path wins. For exactly matching mount paths, `ro` wins over
 # `rw`.
-mounts: []
+mounts:
+  - type: git-meta
+    mode: ro
 
 # `archive_paths` lists agent directories that should be saved at shutdown to
 # sessions/<id>/artifacts.tar.gz. Mounts are excluded.
@@ -31,6 +33,7 @@ ssl_insecure: false
 sealed:
   - "*.bak"
   - "*.tmp"
+  - archive/
 
 # `readonly` paths may have their contents read, but cannot be modified.
 readonly:
@@ -154,6 +157,9 @@ allow:
     http:
       - methods: [GET, HEAD]
   - dest: https://goproxy.io
+    http:
+      - methods: [GET, HEAD]
+  - dest: https://storage.googleapis.com
     http:
       - methods: [GET, HEAD]
 
